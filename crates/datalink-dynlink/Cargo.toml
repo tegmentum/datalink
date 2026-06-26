@@ -1,0 +1,14 @@
+[package]
+name = "datalink-dynlink"
+version = "0.1.0"
+edition = "2021"
+description = "Shared, store-generic host machinery for the compose:dynlink/linker WIT package (runtime / dynamic component linking, 'dlopen for components') used by the ducklink and sqlink wasm-component hosts. The resolve/invoke resource-table bridge and the generated linker bindings are shared; the provider lifecycle is a ProviderBackend trait (a resident, instantiate-once-and-reuse backend ships here; fresh-per-invoke + built-in shims are additional backend impls on the consumer side)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[dependencies]
+# The component-model engine. Pinned to the version both hosts run (sqlink +
+# ducklink are on wasmtime 46.0.1) so the generated component bindings are
+# ABI-identical across the consumers (matches datalink-contract).
+wasmtime = { version = "46.0.1", features = ["component-model"] }
+wasmtime-wasi = "46.0.1"
