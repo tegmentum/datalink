@@ -5,8 +5,23 @@ Tier 1 of the `sqlink` + `ducklink` consolidation (see `../CONSOLIDATION.md`).
 `ducklink` (DuckDB→wasm, `duckdb:extension` components) was mirrored from `sqlink`
 (SQLite→wasm, `sqlite:extension` components). Their catalog tooling is a
 near-verbatim duplicate. This directory is the **single engine**, parameterized by
-a per-repo config, so each repo can later replace its mirrored scripts with a thin
+a per-repo config, so each repo can replace its mirrored scripts with a thin
 config + a dependency on datalink.
+
+It is packaged as the pip-installable **`datalink-tooling`** distribution (the
+`datalink_tooling/` package + `pyproject.toml`). Consume it via pip-from-git:
+
+```
+datalink-tooling @ git+https://github.com/tegmentum/datalink.git#subdirectory=tooling
+```
+
+Each module exposes `main(config=None, argv=None, **kw)` (so a repo's thin
+delegator calls e.g. `scaffold.main(config='tooling/datalink.config.json')`) and a
+matching `datalink-<name>` console script / `python -m datalink_tooling.<module>`.
+`verify` and `gen` additionally take an extensibility hook — `extra_checks=[...]` /
+`extra_outputs=[...]` — so a repo injects its repo-specific checks / generation
+(ducklink's CATALOG.md / source / workspace / orphan / prefix) while delegating the
+shared identity engine.
 
 ## What's lifted (this pass)
 
@@ -14,7 +29,7 @@ config + a dependency on datalink.
 | --- | --- | --- |
 | `scaffold.py` | generate a new extension crate from `templates/` + the compat-registry | package suffix, name regex, templates dir, WIT world+copy, the `worlds`→lib.rs map, registration ABI (manifest/imperative), workspace-member registration, build-check argv/cwd/target |
 | `smoke.py` | run `<ext>/smoke.sql` through the host CLI, diff vs `smoke.expected` (`~~`/`?`/`# ` wildcards), all-NULL warn, `--all -j N`, `--seed-expected`, `--list` | CLI argv template, host bin / cli component / required artifacts, prompt regex, SQL preamble (`.nullvalue`/`.mode csv`), null token, banner prefixes, panic markers, per-ext `--build`, network-grant env |
-| `t-status.py` | scan `lessons-learned.md` for `(T-N new)`/`(T-N closed)` markers | doc path only (the format is shared) |
+| `tstatus.py` | scan `lessons-learned.md` for `(T-N new)`/`(T-N closed)` markers (the consuming repo's delegator stays named `t-status.py`) | doc path only (the format is shared) |
 | `compat.py` | read/validate `compat-registry.json` (upstream-crate wasm32 status); `--list-broken`, `--check`, `--validate` | registry path only (the `_schema` is shared; per-crate data stays per-repo) |
 | `registry.py` | read/validate the catalog index **CORE** fields; `--list`, `--validate`, `--show` | index path + entries key (DB-specific fields are opaque pass-through) |
 | `identity.py` | the shared content-addressed identity: `witcanon_digest(cfg)` (contract/shape), `content_digest(artifact)` (byte), `imported_contract_{version,major}(artifact, package)` (the `@MAJOR` cross-check via `wasm-tools`) | `identity.{wit_source_dir, contract_package, contract_major, contract_version, artifacts_dir, wasm_tools_bin, exclude}` |
@@ -96,13 +111,20 @@ records `checksum` (an OCI artifact checksum) where ducklink records
 `content_digest` — is **not** reconciled here: this lift only proves the engine
 computes the right values for both (see "DEFERRED" below).
 
-### DEFERRED — the per-repo consume
+### The per-repo consume
 
-- ducklink's `gen-catalog.py` / `verify-catalog.py` delegating to this engine
-  (then deleting the mirrored copies), keeping their catalog-Markdown /
-  source / workspace / orphan checks.
+- **ducklink — DONE.** This `tooling/` directory is a pip-installable package
+  (`datalink-tooling`, the `datalink_tooling/` package + `pyproject.toml`);
+  ducklink depends on it via `pip-from-git`
+  (`git+https://github.com/tegmentum/datalink.git#subdirectory=tooling`). Its
+  `tooling/scaffold.py` / `smoke.py` / `t-status.py` are now THIN delegators
+  (`module.main(config='tooling/datalink.config.json')`); `gen-catalog.py` /
+  `verify-catalog.py` delegate the identity engine and inject their
+  repo-specific generation / checks via the `extra_outputs` / `extra_checks`
+  hooks (CATALOG.md / source / workspace / orphan / prefix). The duplicated
+  identity + engine logic was deleted from ducklink.
 - sqlink adopting the engine + aligning `checksum` → the shared `content_digest`
-  scheme + the sqlink `@0.1.0` → `@1.0.0` contract decision.
+  scheme + the sqlink `@0.1.0` → `@1.0.0` contract decision (NEXT).
 - the canonical shared `datalink-identity` Rust crate (per CONSOLIDATION.md
   Tier 1) if/when the host engine needs it (the Python tooling is the Tier-1
   surface).

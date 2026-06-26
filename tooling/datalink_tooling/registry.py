@@ -28,8 +28,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import dlconfig  # noqa: E402
+from . import dlconfig  # noqa: E402
 
 # The DB-agnostic CORE fields every catalog entry shares. (min_*_version,
 # oci_artifact/artifact, wit_contract, prefix/expansion, checksum/size_bytes
@@ -84,15 +83,15 @@ def validate_entry(entry: dict) -> list[str]:
     return errs
 
 
-def main() -> None:
+def main(config: str | None = None, argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    dlconfig.add_config_arg(p)
+    dlconfig.add_config_arg(p, default=config)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--list", action="store_true")
     g.add_argument("--validate", action="store_true")
     g.add_argument("--show", metavar="NAME")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     cfg = dlconfig.load(args.config)
     entries = load_entries(cfg)

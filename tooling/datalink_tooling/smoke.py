@@ -34,8 +34,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import dlconfig  # noqa: E402
+from . import dlconfig  # noqa: E402
 
 
 def _suffix(cfg) -> str:
@@ -284,10 +283,10 @@ def seed_expected(cfg, name: str, timeout: int) -> None:
     print(f"wrote {len(rows)} lines to {cfg.rel(expected)}")
 
 
-def main() -> None:
+def main(config: str | None = None, argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    dlconfig.add_config_arg(p)
+    dlconfig.add_config_arg(p, default=config)
     p.add_argument("name", nargs="?")
     p.add_argument("--all", action="store_true")
     p.add_argument("--build", action="store_true",
@@ -298,7 +297,7 @@ def main() -> None:
     p.add_argument("--timeout", type=int, default=60)
     p.add_argument("-j", "--jobs", type=int, default=1)
     p.add_argument("--seed-expected", metavar="NAME")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     cfg = dlconfig.load(args.config)
 

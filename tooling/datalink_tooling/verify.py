@@ -41,14 +41,26 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import dlconfig  # noqa: E402
-import identity  # noqa: E402
-import registry  # noqa: E402
+from . import dlconfig  # noqa: E402
+from . import identity  # noqa: E402
+from . import registry  # noqa: E402
 
 
-def verify(cfg, verify_content: bool = False, no_artifacts: bool = False) -> int:
-    entries = registry.load_entries(cfg)
+def verify(cfg, verify_content: bool = False, no_artifacts: bool = False,
+           extra_checks=None) -> int:
+    """Run the shared content-addressed identity checks, then each repo-specific
+    `extra_checks` callable.
+
+    `extra_checks` is the EXTENSIBILITY HOOK a consuming repo (ducklink's
+    verify-catalog) uses to keep its repo-specific checks (CATALOG.md / source /
+    workspace / orphan / prefix) while delegating the identity engine. Each
+    callable is invoked as `check(cfg, entries)` where `entries` is the FULL,
+    unfiltered registry entry list (the repo applies its own filtering, e.g.
+    dropping `sample_extension`). A check may return a list of issue strings (or a
+    single string, or None) and/or raise SystemExit; returned issues are merged
+    into the same failure report as the identity issues."""
+    all_entries = registry.load_entries(cfg)
+    entries = all_entries
     # Entries excluded from identity checks (parity with verify-catalog.py, which
     # filters `sample_extension` out of its `exts` before the digest loop). The
     # sample/template extension imports the legacy unversioned contract by design.
@@ -138,6 +150,22 @@ def verify(cfg, verify_content: bool = False, no_artifacts: bool = False) -> int
               + (f" · content verified: {content_checked}" if verify_content else
                  " · content check OFF (pass --verify-content to enforce)"))
 
+    # EXTENSIBILITY HOOK: run each repo-specific check over the FULL registry.
+    for check in (extra_checks or []):
+        try:
+            result = check(cfg, all_entries)
+        except SystemExit as ex:
+            msg = str(ex)
+            if msg:
+                issues.append(msg)
+            continue
+        if result is None:
+            continue
+        if isinstance(result, str):
+            issues.append(result)
+        else:
+            issues.extend(result)
+
     if issues:
         print(f"\nFAILED — {len(issues)} issue(s):")
         for i in issues:
@@ -149,21 +177,21 @@ def verify(cfg, verify_content: bool = False, no_artifacts: bool = False) -> int
     return 0
 
 
-def main() -> None:
+def main(config: str | None = None, argv=None, extra_checks=None) -> None:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    dlconfig.add_config_arg(p)
+    dlconfig.add_config_arg(p, default=config)
     p.add_argument("--verify-content", "--strict", action="store_true",
                    dest="verify_content",
                    help="also enforce content_digest == sha256(deployed artifact)")
     p.add_argument("--no-artifacts", action="store_true",
                    help="contract-only checks; skip everything needing a built .wasm")
-    args = p.parse_args()
+    args = p.parse_args(argv)
     cfg = dlconfig.load(args.config)
     sys.exit(verify(cfg, verify_content=args.verify_content,
-                     no_artifacts=args.no_artifacts))
+                     no_artifacts=args.no_artifacts, extra_checks=extra_checks))
 
 
 if __name__ == "__main__":

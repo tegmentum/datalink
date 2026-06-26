@@ -29,10 +29,9 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import dlconfig  # noqa: E402
-import identity  # noqa: E402
-import registry  # noqa: E402
+from . import dlconfig  # noqa: E402
+from . import identity  # noqa: E402
+from . import registry  # noqa: E402
 
 
 def _index_path(cfg) -> Path:
@@ -51,7 +50,15 @@ def _entries(data, cfg):
     return data if isinstance(data, list) else []
 
 
-def stamp(cfg, check: bool = False) -> int:
+def stamp(cfg, check: bool = False, extra_outputs=None) -> int:
+    """Stamp the content-addressed identity, then run each repo-specific
+    `extra_outputs` callable.
+
+    `extra_outputs` is the EXTENSIBILITY HOOK a consuming repo (ducklink's
+    gen-catalog) uses to keep its repo-specific generation (e.g. CATALOG.md)
+    while delegating the identity stamping. Each callable is invoked as
+    `produce(cfg, data)` where `data` is the registry dict AFTER stamping. In
+    `--check` mode the extra outputs are skipped (drift-report only)."""
     path = _index_path(cfg)
     if not path.is_file():
         raise SystemExit(f"error: catalog index not found: {path}")
@@ -104,20 +111,25 @@ def stamp(cfg, check: bool = False) -> int:
     else:
         print(f"unchanged — contract {digest[:12]}…, "
               f"{stamped_content} content_digest(s) already current")
+
+    # EXTENSIBILITY HOOK: repo-specific generation (e.g. CATALOG.md) over the
+    # just-stamped registry data.
+    for produce in (extra_outputs or []):
+        produce(cfg, data)
     return 0
 
 
-def main() -> None:
+def main(config: str | None = None, argv=None, extra_outputs=None) -> None:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    dlconfig.add_config_arg(p)
+    dlconfig.add_config_arg(p, default=config)
     p.add_argument("--check", action="store_true",
                    help="report drift without writing (exit 1 if anything would change)")
-    args = p.parse_args()
+    args = p.parse_args(argv)
     cfg = dlconfig.load(args.config)
-    sys.exit(stamp(cfg, check=args.check))
+    sys.exit(stamp(cfg, check=args.check, extra_outputs=extra_outputs))
 
 
 if __name__ == "__main__":

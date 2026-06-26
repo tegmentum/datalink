@@ -18,8 +18,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import dlconfig  # noqa: E402
+from . import dlconfig  # noqa: E402
 
 
 def load_registry(cfg: dlconfig.Config) -> dict:
@@ -74,15 +73,15 @@ def validate(registry: dict) -> list[str]:
     return errs
 
 
-def main() -> None:
+def main(config: str | None = None, argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    dlconfig.add_config_arg(p)
+    dlconfig.add_config_arg(p, default=config)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--list-broken", action="store_true")
     g.add_argument("--check", metavar="NAME")
     g.add_argument("--validate", action="store_true")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     cfg = dlconfig.load(args.config)
     registry = load_registry(cfg)

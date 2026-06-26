@@ -107,11 +107,17 @@ def load(explicit: str | None = None) -> Config:
     return Config(data, path.resolve())
 
 
-def add_config_arg(parser) -> None:
-    """Register the standard --config argument on an argparse parser."""
+def add_config_arg(parser, default: str | None = None) -> None:
+    """Register the standard --config argument on an argparse parser.
+
+    `default` is the fallback config path a consuming repo's thin delegator
+    injects (e.g. `tooling/datalink.config.json`). An explicit `--config` on the
+    command line always overrides it; if neither is given the loader falls back
+    to its own discovery (env / cwd walk)."""
     parser.add_argument(
         "--config",
         metavar="PATH",
+        default=default,
         help="path to a datalink config (config.schema.json). "
              "Defaults to $DATALINK_CONFIG or a discovered "
              "tooling/datalink.config.json.",

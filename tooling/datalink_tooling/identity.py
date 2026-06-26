@@ -191,22 +191,20 @@ def artifact_path(cfg, name: str) -> Path:
     return artifacts_dir(cfg) / f"{name}.wasm"
 
 
-if __name__ == "__main__":
+def main(config: str | None = None, argv=None) -> None:
     import argparse
-    import sys
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import dlconfig  # noqa: E402
+    from . import dlconfig  # noqa: E402
 
     p = argparse.ArgumentParser(
         description="Print the witcanon contract digest (and optionally a content "
                     "digest) for a repo, from its datalink config.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    dlconfig.add_config_arg(p)
+    dlconfig.add_config_arg(p, default=config)
     p.add_argument("--content", metavar="ARTIFACT",
                    help="also print content_digest(ARTIFACT) (sha256 of the .wasm)")
-    args = p.parse_args()
+    args = p.parse_args(argv)
     cfg = dlconfig.load(args.config)
     print(f"witcanon_digest({contract_package(cfg)}) = {witcanon_digest(cfg)}")
     if args.content:
@@ -214,3 +212,7 @@ if __name__ == "__main__":
         if not ap.is_absolute():
             ap = cfg.path(args.content)
         print(f"content_digest({ap.name}) = {content_digest(ap)}")
+
+
+if __name__ == "__main__":
+    main()

@@ -29,9 +29,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import dlconfig  # noqa: E402
-import compat  # noqa: E402
+from . import dlconfig  # noqa: E402
+from . import compat  # noqa: E402
 
 
 def _default_world(worlds: dict) -> str:
@@ -242,10 +241,10 @@ def _build_argv(bc: dict, package: str, name: str) -> list[str]:
     return out
 
 
-def main() -> None:
+def main(config: str | None = None, argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    dlconfig.add_config_arg(p)
+    dlconfig.add_config_arg(p, default=config)
     p.add_argument("name", nargs="?", help="extension name (bare)")
     p.add_argument("--crate", default="", help="comma-separated upstream crates; '@x.y' to pin")
     p.add_argument("--description", default="")
@@ -254,7 +253,7 @@ def main() -> None:
                    help="resolve + print the DB-specific scaffold parameters; write nothing")
     p.add_argument("--list-broken", action="store_true")
     p.add_argument("--list-worlds", action="store_true")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     cfg = dlconfig.load(args.config)
 

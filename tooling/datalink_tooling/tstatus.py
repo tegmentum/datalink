@@ -23,8 +23,7 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import dlconfig  # noqa: E402
+from . import dlconfig  # noqa: E402
 
 T_OPEN = re.compile(r"\(T-(\d+)\s+new\)", re.IGNORECASE)
 T_CLOSED = re.compile(r"\(T-(\d+)[^)]*closed[^)]*\)", re.IGNORECASE)
@@ -53,13 +52,13 @@ def scan(doc: Path) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, st
     return opens, closes
 
 
-def main() -> None:
+def main(config: str | None = None, argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    dlconfig.add_config_arg(p)
+    dlconfig.add_config_arg(p, default=config)
     p.add_argument("which", nargs="?", default="all",
                    choices=("all", "open", "closed"))
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     cfg = dlconfig.load(args.config)
     doc_rel = cfg.get("feedback", "lessons_doc", default="tooling/lessons-learned.md")

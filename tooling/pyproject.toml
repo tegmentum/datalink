@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datalink-tooling"
+version = "0.1.0"
+description = "Shared, DB-agnostic catalog tooling engine for the sqlink + ducklink (wasm component) consolidation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "tegmentum" }]
+keywords = ["wasm", "component", "catalog", "tooling", "duckdb", "sqlite"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Build Tools",
+]
+
+# stdlib only — no runtime dependencies (the engine shells out to wasm-tools /
+# cargo / the host CLI, which the consuming repo provides on PATH).
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/tegmentum/datalink"
+Repository = "https://github.com/tegmentum/datalink.git"
+
+# Console entry points: each mirrors the `module.main()` CLI so the engine stays
+# runnable standalone (e.g. `datalink-verify --config tooling/datalink.config.json`)
+# in addition to a repo's thin `tooling/*.py` delegators and `python -m`.
+[project.scripts]
+datalink-scaffold = "datalink_tooling.scaffold:main"
+datalink-smoke = "datalink_tooling.smoke:main"
+datalink-t-status = "datalink_tooling.tstatus:main"
+datalink-compat = "datalink_tooling.compat:main"
+datalink-registry = "datalink_tooling.registry:main"
+datalink-identity = "datalink_tooling.identity:main"
+datalink-gen = "datalink_tooling.gen:main"
+datalink-verify = "datalink_tooling.verify:main"
+
+[tool.setuptools]
+packages = ["datalink_tooling"]
+
+[tool.setuptools.package-data]
+datalink_tooling = ["config.schema.json"]
