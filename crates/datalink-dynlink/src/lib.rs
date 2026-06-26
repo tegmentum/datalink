@@ -460,18 +460,30 @@ impl<B: AsyncProviderBackend + Sync> AsyncDynLinkBridge<B> {
 /// into a distinct table field). The bridge's routing methods then take the
 /// table as a parameter.
 ///
-/// Usage:
+/// Usage (the view type's generics, if any, go in a leading `<...>` group so
+/// the generated `impl` headers carry them):
 /// ```ignore
 /// // `$ty` exposes `fn split(&mut self) -> (&AsyncDynLinkBridge<B>, &mut ResourceTable)`.
-/// impl_datalink_dynlink_async_host!(MyView<'a>, MyBackend, split);
+/// impl_datalink_dynlink_async_host!(MyView, MyBackend, split);          // no generics
+/// impl_datalink_dynlink_async_host!(<'a> MyView<'a>, MyBackend, split); // borrowed view
 /// ```
 #[macro_export]
 macro_rules! impl_datalink_dynlink_async_host {
+    // Entry: no generics on the view type.
     ($ty:ty, $backend:ty, $split:ident) => {
-        impl $crate::async_bindings::sys::compose::types::Host for $ty {}
+        $crate::impl_datalink_dynlink_async_host!(@imp [] $ty, $backend, $split);
+    };
+    // Entry: the view type carries generics (e.g. a borrow lifetime). The
+    // `<$($g)*>` group is forwarded to every generated `impl` header.
+    (<$($g:tt)*> $ty:ty, $backend:ty, $split:ident) => {
+        $crate::impl_datalink_dynlink_async_host!(@imp [<$($g)*>] $ty, $backend, $split);
+    };
+    // Internal: `[$($gen:tt)*]` is either empty or `<...>`.
+    (@imp [$($gen:tt)*] $ty:ty, $backend:ty, $split:ident) => {
+        impl $($gen)* $crate::async_bindings::sys::compose::types::Host for $ty {}
 
         #[$crate::async_trait_reexport::async_trait]
-        impl $crate::async_bindings::compose::dynlink::linker::Host for $ty {
+        impl $($gen)* $crate::async_bindings::compose::dynlink::linker::Host for $ty {
             async fn resolve_by_id(
                 &mut self,
                 id: ::std::string::String,
@@ -496,7 +508,7 @@ macro_rules! impl_datalink_dynlink_async_host {
         }
 
         #[$crate::async_trait_reexport::async_trait]
-        impl $crate::async_bindings::compose::dynlink::linker::HostInstance for $ty {
+        impl $($gen)* $crate::async_bindings::compose::dynlink::linker::HostInstance for $ty {
             async fn invoke(
                 &mut self,
                 self_: ::wasmtime::component::Resource<$crate::AsyncInstance>,
