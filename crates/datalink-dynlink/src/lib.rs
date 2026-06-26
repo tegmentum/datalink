@@ -63,8 +63,26 @@ pub mod provider {
     });
 }
 
+/// Async-flavor bindings for the guest-facing `compose:dynlink/linker`
+/// import. Identical WIT and world to [`bindings`], but bindgen generates
+/// `async fn` Host methods (`imports: { default: async }`) so an async host
+/// (sqlink — tokio/hickory/reqwest) can satisfy the import without blocking.
+/// Additive: the sync [`bindings`] above are untouched.
+pub mod async_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit/compose-dynlink",
+        world: "dynlink-guest",
+        imports: { default: async },
+    });
+}
+
 pub use bindings::compose::dynlink::linker::Instance;
 pub use bindings::sys::compose::types::{Error, ErrorCode};
+
+/// The async-flavor opaque `instance` resource handle. A distinct generated
+/// type from the sync [`Instance`] (it lives in [`async_bindings`]); the async
+/// bridge/macro use this one.
+pub use async_bindings::compose::dynlink::linker::Instance as AsyncInstance;
 
 /// Build a host `Error` with the given code and message.
 pub fn err(code: ErrorCode, message: impl Into<String>) -> Error {
@@ -102,9 +120,11 @@ fn as_backing<H: 'static>(r: &Resource<Instance>) -> Resource<H> {
 /// resolve/invoke/drop through the backend.
 ///
 /// The bridge is `&mut`-driven from a guest call, which is synchronous in the
-/// framework + ducklink hosts; this trait is correspondingly synchronous. An
-/// async host (sqlink) keeps its own async linker Host today — see the crate
-/// docs and `CONSOLIDATION.md` for the async-seam follow-up.
+/// framework + ducklink hosts; this trait is correspondingly synchronous. A
+/// fully-async host (sqlink) uses the additive async flavor below —
+/// [`AsyncProviderBackend`] + [`AsyncDynLinkBridge`] +
+/// [`impl_datalink_dynlink_async_host`] + [`add_to_linker_async`] — which also
+/// supports keeping the `instance` resource table in the consumer's Store.
 pub trait ProviderBackend {
     /// What a resolved `instance` handle remembers so `invoke`/`drop` can
     /// reach the provider. Cheap to clone (it is stored in the bridge's
@@ -282,6 +302,243 @@ where
 {
     bindings::DynlinkGuest::add_to_linker::<_, HasSelf<T>>(linker, |s| s)
         .map_err(|e| wasmtime::Error::msg(format!("add compose:dynlink/linker to linker: {e:?}")))
+}
+
+// ===========================================================================
+// ASYNC FLAVOR — additive. Mirrors the sync bridge for a fully-async host
+// (sqlink). NONE of the sync types above change; ducklink (sync) is unaffected.
+//
+// Two things differ from the sync flavor, both demanded by sqlink's host:
+//
+//   1. The Host methods are `async fn` (sqlink's bindgen is `default: async`),
+//      so the backend trait is async too. We use `async-trait` to get
+//      boxed-`Send` futures — wasmtime's async host calls require `Send`
+//      futures, and a generic backend whose `invoke` crosses `.await`s (CAS
+//      lookups, a wasm instantiate, the SqliteRuntime shim) needs them boxed.
+//
+//   2. The `instance` resource table lives in the CONSUMER'S STORE, not in the
+//      bridge. ducklink's sync bridge owns its table; sqlink keeps the table
+//      on its per-Store state (`State.resources` / `RunState.resources`) so it
+//      can share one table with WASI. The async bridge therefore takes the
+//      table as a `&mut ResourceTable` PARAMETER on every routed call — the
+//      macro threads it in from the store. The bridge owns only the backend.
+// ===========================================================================
+
+/// Async retype of a guest-facing `Resource<AsyncInstance>` to a host backing
+/// type `Resource<H>`. Same rep, host-side compile-time tag only — see the
+/// sync [`as_backing`].
+fn as_backing_async<H: 'static>(r: &Resource<AsyncInstance>) -> Resource<H> {
+    Resource::new_own(r.rep())
+}
+
+/// Async-flavor [`ProviderBackend`]. Same routing contract (resolve by
+/// id/digest -> a cheap clonable `Handle`; `invoke`/`on_drop` over it), but
+/// every method is `async`. This is where a consumer pushes its host-specific
+/// policy: sqlink's trust gate, CAS-digest resolution, multi-tenant scoping,
+/// fresh-store-per-invoke instantiation, and the built-in SqliteRuntime shim
+/// all live in the consumer's `AsyncProviderBackend` impl(s) — the shared
+/// bridge just routes to them.
+///
+/// `async-trait` boxes the returned futures as `Send` so they satisfy
+/// wasmtime's async host-call requirement uniformly across backends.
+#[async_trait::async_trait]
+pub trait AsyncProviderBackend {
+    /// What a resolved `instance` handle remembers so `invoke`/`on_drop` can
+    /// reach the provider. Must be `Send + Sync + 'static` (it is parked in the
+    /// store's resource table and read across `.await`).
+    type Handle: Clone + Send + Sync + 'static;
+
+    /// Resolve a provider by registry id (with any per-resolve work the
+    /// backend's lifecycle needs), returning the handle to remember.
+    async fn resolve_by_id(&self, id: &str) -> Result<Self::Handle, Error>;
+
+    /// Resolve a provider by content digest. Backends that don't support it
+    /// return `ErrorCode::NotImplemented`.
+    async fn resolve_by_digest(&self, digest: &[u8]) -> Result<Self::Handle, Error>;
+
+    /// Forward an opaque message to the provider behind `handle`.
+    async fn invoke(
+        &self,
+        handle: &Self::Handle,
+        method: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Error>;
+
+    /// Notification that a resolved handle was dropped by the guest. Default:
+    /// no-op.
+    async fn on_drop(&self, _handle: &Self::Handle) {}
+}
+
+/// The async per-component dynlink bridge: an [`AsyncProviderBackend`] only.
+/// Unlike the sync [`DynLinkBridge`], it does NOT own the resource table — the
+/// consumer keeps it on its Store and threads it in. The bridge holds the
+/// backend and routes resolve/invoke/drop against a caller-supplied table.
+pub struct AsyncDynLinkBridge<B: AsyncProviderBackend> {
+    backend: B,
+}
+
+impl<B: AsyncProviderBackend + Sync> AsyncDynLinkBridge<B> {
+    pub fn new(backend: B) -> Self {
+        Self { backend }
+    }
+
+    /// Access the underlying backend.
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Resolve by id: ask the backend for a handle, then mint an opaque
+    /// resource in the CALLER'S table.
+    pub async fn resolve_by_id(
+        &self,
+        table: &mut ResourceTable,
+        id: String,
+    ) -> Result<Resource<AsyncInstance>, Error> {
+        let handle = self.backend.resolve_by_id(&id).await?;
+        Self::push_handle(table, handle)
+    }
+
+    /// Resolve by digest: same, via the backend's digest path.
+    pub async fn resolve_by_digest(
+        &self,
+        table: &mut ResourceTable,
+        d: Vec<u8>,
+    ) -> Result<Resource<AsyncInstance>, Error> {
+        let handle = self.backend.resolve_by_digest(&d).await?;
+        Self::push_handle(table, handle)
+    }
+
+    fn push_handle(
+        table: &mut ResourceTable,
+        handle: B::Handle,
+    ) -> Result<Resource<AsyncInstance>, Error> {
+        let backing = table
+            .push(handle)
+            .map_err(|e| err(ErrorCode::InternalError, format!("table push: {e:?}")))?;
+        Ok(Resource::new_own(backing.rep()))
+    }
+
+    /// Forward `method`/`payload` verbatim to the backend behind the handle
+    /// (looked up in the caller's table).
+    pub async fn invoke(
+        &self,
+        table: &mut ResourceTable,
+        self_: Resource<AsyncInstance>,
+        method: String,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, Error> {
+        let handle = table
+            .get(&as_backing_async::<B::Handle>(&self_))
+            .map_err(|e| err(ErrorCode::InternalError, format!("unknown dynlink handle: {e:?}")))?
+            .clone();
+        self.backend.invoke(&handle, &method, &payload).await
+    }
+
+    /// Release an `instance` handle (from the caller's table) and notify the
+    /// backend.
+    pub async fn drop_handle(
+        &self,
+        table: &mut ResourceTable,
+        rep: Resource<AsyncInstance>,
+    ) -> wasmtime::Result<()> {
+        let handle = table.delete(as_backing_async::<B::Handle>(&rep))?;
+        self.backend.on_drop(&handle).await;
+        Ok(())
+    }
+}
+
+/// Implement the async `compose:dynlink/linker` Host + HostInstance traits for
+/// a store-state view type that can split itself, in ONE call, into BOTH a
+/// `&AsyncDynLinkBridge<B>` (the routing + backend) AND a `&mut ResourceTable`
+/// (the store-owned handle table). This is the seam that lets sqlink keep its
+/// resource table in the Store while reusing the shared bridge.
+///
+/// The single-accessor `$split(&mut self) -> (&AsyncDynLinkBridge<B>, &mut
+/// ResourceTable)` is what makes this borrow-check cleanly with no `unsafe`:
+/// the CONSUMER produces the two non-aliasing references (typically: the
+/// bridge is an `Arc`-shared field whose `&` doesn't conflict with a `&mut`
+/// into a distinct table field). The bridge's routing methods then take the
+/// table as a parameter.
+///
+/// Usage:
+/// ```ignore
+/// // `$ty` exposes `fn split(&mut self) -> (&AsyncDynLinkBridge<B>, &mut ResourceTable)`.
+/// impl_datalink_dynlink_async_host!(MyView<'a>, MyBackend, split);
+/// ```
+#[macro_export]
+macro_rules! impl_datalink_dynlink_async_host {
+    ($ty:ty, $backend:ty, $split:ident) => {
+        impl $crate::async_bindings::sys::compose::types::Host for $ty {}
+
+        #[$crate::async_trait_reexport::async_trait]
+        impl $crate::async_bindings::compose::dynlink::linker::Host for $ty {
+            async fn resolve_by_id(
+                &mut self,
+                id: ::std::string::String,
+            ) -> ::core::result::Result<
+                ::wasmtime::component::Resource<$crate::AsyncInstance>,
+                $crate::Error,
+            > {
+                let (bridge, table) = self.$split();
+                bridge.resolve_by_id(table, id).await
+            }
+
+            async fn resolve_by_digest(
+                &mut self,
+                d: ::std::vec::Vec<u8>,
+            ) -> ::core::result::Result<
+                ::wasmtime::component::Resource<$crate::AsyncInstance>,
+                $crate::Error,
+            > {
+                let (bridge, table) = self.$split();
+                bridge.resolve_by_digest(table, d).await
+            }
+        }
+
+        #[$crate::async_trait_reexport::async_trait]
+        impl $crate::async_bindings::compose::dynlink::linker::HostInstance for $ty {
+            async fn invoke(
+                &mut self,
+                self_: ::wasmtime::component::Resource<$crate::AsyncInstance>,
+                method: ::std::string::String,
+                payload: ::std::vec::Vec<u8>,
+            ) -> ::core::result::Result<::std::vec::Vec<u8>, $crate::Error> {
+                let (bridge, table) = self.$split();
+                bridge.invoke(table, self_, method, payload).await
+            }
+
+            async fn drop(
+                &mut self,
+                rep: ::wasmtime::component::Resource<$crate::AsyncInstance>,
+            ) -> ::wasmtime::Result<()> {
+                let (bridge, table) = self.$split();
+                bridge.drop_handle(table, rep).await
+            }
+        }
+    };
+}
+
+/// Re-export `async-trait` so the [`impl_datalink_dynlink_async_host`] macro
+/// can reference it without the consumer adding the dependency.
+#[doc(hidden)]
+pub mod async_trait_reexport {
+    pub use async_trait::async_trait;
+}
+
+/// Add the async `compose:dynlink/linker` host import to a guest linker over
+/// any store type `T` that implements the async linker Host traits (via
+/// [`impl_datalink_dynlink_async_host`]). WASI must be added separately.
+pub fn add_to_linker_async<T>(linker: &mut Linker<T>) -> wasmtime::Result<()>
+where
+    T: async_bindings::compose::dynlink::linker::Host
+        + async_bindings::compose::dynlink::linker::HostInstance
+        + async_bindings::sys::compose::types::Host
+        + Send
+        + 'static,
+{
+    async_bindings::DynlinkGuest::add_to_linker::<_, HasSelf<T>>(linker, |s| s).map_err(|e| {
+        wasmtime::Error::msg(format!("add async compose:dynlink/linker to linker: {e:?}"))
+    })
 }
 
 // ===========================================================================
@@ -663,6 +920,110 @@ mod tests {
 
         bridge.drop_handle(handle).expect("drop");
         assert_eq!(live.load(Ordering::SeqCst), 0, "handle released on drop");
+    }
+
+    // --- async flavor ---
+
+    /// In-process async backend mirroring `EchoBackend`, exercising the
+    /// `AsyncDynLinkBridge` routing with a CONSUMER-OWNED resource table (the
+    /// store-resource-table seam sqlink relies on). No wasm involved.
+    #[derive(Clone, Default)]
+    struct AsyncEchoBackend {
+        live: Arc<AtomicU64>,
+    }
+
+    #[derive(Clone)]
+    struct AsyncEchoHandle {
+        id: String,
+        live: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncProviderBackend for AsyncEchoBackend {
+        type Handle = AsyncEchoHandle;
+
+        async fn resolve_by_id(&self, id: &str) -> Result<Self::Handle, Error> {
+            self.live.fetch_add(1, Ordering::SeqCst);
+            Ok(AsyncEchoHandle {
+                id: id.to_string(),
+                live: self.live.clone(),
+            })
+        }
+
+        async fn resolve_by_digest(&self, _d: &[u8]) -> Result<Self::Handle, Error> {
+            Err(err(ErrorCode::NotImplemented, "no digest map"))
+        }
+
+        async fn invoke(
+            &self,
+            handle: &Self::Handle,
+            method: &str,
+            payload: &[u8],
+        ) -> Result<Vec<u8>, Error> {
+            match method {
+                "upper" => Ok(String::from_utf8_lossy(payload).to_uppercase().into_bytes()),
+                "id" => Ok(handle.id.clone().into_bytes()),
+                other => Err(err(ErrorCode::InvalidInput, format!("unknown method {other}"))),
+            }
+        }
+
+        async fn on_drop(&self, handle: &Self::Handle) {
+            handle.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn async_bridge_routes_resolve_invoke_drop_with_store_table() {
+        let backend = AsyncEchoBackend::default();
+        let live = backend.live.clone();
+        let bridge = AsyncDynLinkBridge::new(backend);
+        // The table lives "in the store" (here just a local), threaded into
+        // every routed call — exactly sqlink's seam.
+        let mut table = ResourceTable::new();
+
+        let handle = bridge
+            .resolve_by_id(&mut table, "prov".to_string())
+            .await
+            .expect("resolve");
+        assert_eq!(live.load(Ordering::SeqCst), 1, "one live handle after resolve");
+
+        let upper = bridge
+            .invoke(
+                &mut table,
+                Resource::new_own(handle.rep()),
+                "upper".to_string(),
+                b"hello from async dlopen".to_vec(),
+            )
+            .await
+            .expect("invoke upper");
+        assert_eq!(upper, b"HELLO FROM ASYNC DLOPEN");
+
+        let id = bridge
+            .invoke(
+                &mut table,
+                Resource::new_own(handle.rep()),
+                "id".to_string(),
+                Vec::new(),
+            )
+            .await
+            .expect("invoke id");
+        assert_eq!(id, b"prov");
+
+        bridge
+            .drop_handle(&mut table, handle)
+            .await
+            .expect("drop");
+        assert_eq!(live.load(Ordering::SeqCst), 0, "handle released on drop");
+    }
+
+    #[tokio::test]
+    async fn async_bridge_digest_unmapped_is_not_implemented() {
+        let bridge = AsyncDynLinkBridge::new(AsyncEchoBackend::default());
+        let mut table = ResourceTable::new();
+        match bridge.resolve_by_digest(&mut table, vec![0u8; 32]).await {
+            Err(e) => assert!(matches!(e.code, ErrorCode::NotImplemented)),
+            Ok(_) => panic!("unmapped digest must not resolve"),
+        }
     }
 
     #[test]
