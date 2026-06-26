@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tegmentum/datalink/tooling/config.schema.json",
+  "title": "datalink tooling per-repo config",
+  "description": "Per-repo parameters that drive the shared, DB-agnostic catalog tooling engine in datalink/tooling. Each consuming repo (sqlink, ducklink) ships one of these (as tooling/datalink.config.json or passed via --config) plus its own templates/, compat-registry.json data, lessons-learned.md, and registry index. The engine scripts (scaffold, smoke, t-status, compat, registry) read this file to resolve every DB-specific bit. Paths are relative to repo_root unless absolute.",
+  "type": "object",
+  "required": [
+    "db_name",
+    "registration_abi",
+    "scaffold",
+    "smoke"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "db_name": {
+      "type": "string",
+      "description": "The target engine: 'duckdb' or 'sqlite'. Drives default messages and is the discriminator for behaviour the other fields don't fully capture.",
+      "enum": ["duckdb", "sqlite"]
+    },
+    "registration_abi": {
+      "type": "string",
+      "description": "How an extension registers with the host. 'manifest' = a static describe() manifest (sqlite-wasm). 'imperative' = registers in load() against the host capability registry (ducklink). Selects scaffold template semantics and is recorded for downstream tooling.",
+      "enum": ["manifest", "imperative"]
+    },
+    "repo_root": {
+      "type": "string",
+      "description": "Repo root. Defaults to the parent of the directory containing the config file when omitted; when the config lives in <repo>/tooling/ this resolves to <repo>. May be absolute or relative to the config file."
+    },
+    "wit": {
+      "type": "object",
+      "description": "WIT package / world coordinates and the per-extension WIT source to copy. Pure-manifest repos (sqlite-wasm) may omit this entirely.",
+      "additionalProperties": false,
+      "properties": {
+        "package": {
+          "type": "string",
+          "description": "WIT package id, e.g. 'duckdb:extension' or 'sqlite:extension'."
+        },
+        "world": {
+          "type": "string",
+          "description": "Fully-qualified world, e.g. 'duckdb:extension/duckdb-extension'."
+        },
+        "source_dir": {
+          "type": "string",
+          "description": "Directory whose wit/ tree is copied into each scaffolded extension (relative to repo_root). Omit if extensions do not carry a per-crate WIT copy."
+        }
+      }
+    },
+    "scaffold": {
+      "type": "object",
+      "description": "Parameters for scaffold.py.",
+      "required": ["extensions_dir", "package_suffix", "templates_dir", "build_check"],
+      "additionalProperties": false,
+      "properties": {
+        "extensions_dir": {
+          "type": "string",
+          "description": "Directory (relative to repo_root) under which extension crates live, e.g. 'extensions'."
+        },
+        "package_suffix": {
+          "type": "string",
+          "default": "",
+          "description": "Appended to the bare name to form the crate/dir name. sqlink: '' (dir == name). ducklink: '-component'."
+        },
+        "name_pattern": {
+          "type": "string",
+          "default": "^[a-z][a-z0-9-]*$",
+          "description": "Regex the bare extension name must match. sqlink is lowercase-only; ducklink allows uppercase."
+        },
+        "templates_dir": {
+          "type": "string",
+          "description": "Directory (relative to repo_root) holding the *.tmpl files. Each repo keeps its own templates/."
+        },
+        "worlds": {
+          "type": "object",
+          "description": "Map of world-name -> [lib.rs template filename, one-line focus hint]. Drives scaffold's --world flag. A single-world repo uses one entry (e.g. {'default': ['lib.rs.tmpl', 'scalar functions']}); the default world is the first key or 'minimal'/'default' if present.",
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "type": "string" }
+          }
+        },
+        "lib_template_vars": {
+          "type": "array",
+          "description": "Which template variables the selected lib.rs template expects. The engine always supplies NAME, NAME_UNDERSCORE, DESCRIPTION_SHORT; list the subset actually used so the renderer can pass exactly those (sqlite minimal uses NAME+DESCRIPTION_SHORT; ducklink uses NAME+NAME_UNDERSCORE+DESCRIPTION_SHORT).",
+          "items": { "type": "string" },
+          "default": ["NAME", "NAME_UNDERSCORE", "DESCRIPTION_SHORT"]
+        },
+        "register_workspace_member": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, insert 'extensions/<pkg>' into the root Cargo.toml [workspace].members array (ducklink). If false, the scaffolded Cargo.toml carries its own inline [workspace] and no root edit happens (sqlink)."
+        },
+        "build_check": {
+          "type": "object",
+          "description": "The post-scaffold cargo build-check used to confirm the skeleton compiles.",
+          "required": ["argv"],
+          "additionalProperties": false,
+          "properties": {
+            "argv": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Argv template. Tokens {PKG}, {NAME}, {TARGET} are substituted. e.g. sqlink ['cargo','check','--release','--target','{TARGET}'] run in the crate dir; ducklink ['cargo','check','-p','{PKG}','--target','{TARGET}','--release'] run in repo_root."
+            },
+            "cwd": {
+              "type": "string",
+              "enum": ["crate", "repo_root"],
+              "default": "crate",
+              "description": "Where to run the build-check: in the new crate dir ('crate', sqlink) or at repo_root ('repo_root', ducklink)."
+            },
+            "target": {
+              "type": "string",
+              "default": "wasm32-wasip2",
+              "description": "The rustc target triple for {TARGET}."
+            },
+            "shared_target_dir": {
+              "type": "string",
+              "description": "If set, CARGO_TARGET_DIR is pointed here (relative to repo_root) so common deps don't recompile per scaffold (sqlink uses extensions/_shared-target)."
+            }
+          }
+        }
+      }
+    },
+    "smoke": {
+      "type": "object",
+      "description": "Parameters for smoke.py.",
+      "required": ["argv", "prompt_pattern", "panic_markers"],
+      "additionalProperties": false,
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Argv template for the smoke CLI invocation. Tokens substituted: {HOST_BIN}, {CLI_COMPONENT}, {EXTENSIONS_DIR}, {NAME} (bare), {DB}. The SQL is piped on stdin. sqlink: ['{HOST_BIN}','{CLI_COMPONENT}','--db','{DB}']. ducklink: ['{HOST_BIN}','--extensions-dir','{EXTENSIONS_DIR}','--','{DB}','--load-extension','{NAME}']."
+        },
+        "host_bin": {
+          "type": "string",
+          "description": "Path (relative to repo_root) to the host runner binary for {HOST_BIN}. sqlink target/release/sqlink; ducklink target/release/ducklink."
+        },
+        "cli_component": {
+          "type": "string",
+          "description": "Path (relative to repo_root) to the CLI wasm component for {CLI_COMPONENT}, when the argv uses it (sqlink)."
+        },
+        "required_artifacts": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Extra files (relative to repo_root) that must exist before a smoke can run; reported as a friendly 'not built' message otherwise. e.g. ducklink core+cli components."
+        },
+        "extensions_dir": {
+          "type": "string",
+          "description": "Directory (relative to repo_root) the host resolves <name>.wasm artifacts from, for {EXTENSIONS_DIR} (ducklink artifacts/extensions). Also where --build copies built artifacts."
+        },
+        "package_suffix": {
+          "type": "string",
+          "default": "",
+          "description": "Same suffix as scaffold.package_suffix; used to map a bare name to its extensions/<name><suffix>/ directory holding smoke.sql / smoke.expected."
+        },
+        "db": {
+          "type": "string",
+          "default": ":memory:",
+          "description": "Default db argument for {DB}."
+        },
+        "prompt_pattern": {
+          "type": "string",
+          "description": "Regex (anchored at line start) stripping the REPL prompts from output. sqlink '^(sqlite>\\s*|\\s*\\.\\.\\.>\\s*)+'; ducklink '^(D>\\s*|\\.\\.\\.>\\s*)+'."
+        },
+        "sql_preamble": {
+          "type": "string",
+          "default": "",
+          "description": "Prepended to the smoke SQL before piping. sqlink '.nullvalue <NULL>\\n' (so NULL renders literally); ducklink '.mode csv\\n'."
+        },
+        "null_token": {
+          "type": "string",
+          "default": "NULL",
+          "description": "The literal a NULL renders as in parsed output. Used by the all-NULL heuristic. sqlink '<NULL>'; ducklink 'NULL'."
+        },
+        "banner_prefixes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Output lines starting with any of these are dropped during parsing (load banners). sqlink ['Loaded extension:']."
+        },
+        "panic_markers": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Substrings in combined stdout+stderr that signal a load/panic failure."
+        },
+        "comment_prefix": {
+          "type": "string",
+          "default": "--",
+          "description": "Line-comment prefix stripped from smoke.sql before piping (so multi-line comments don't fuse onto the next statement). SQL uses '--'."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra environment for the smoke subprocess. Values may contain {NAME}. ducklink {'DUCKLINK_NETWORK_GRANT': '{NAME}'}."
+        },
+        "supports_build": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, --build is available: cargo component build the crate and copy its artifact into extensions_dir before smoking (ducklink). sqlink loads the per-crate component directly via .load in smoke.sql and has no separate build step."
+        },
+        "build_argv": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Argv template for --build (when supports_build). Tokens {PKG}, {TARGET}. ducklink ['cargo','component','build','-p','{PKG}','--target','{TARGET}','--release']."
+        },
+        "build_output": {
+          "type": "string",
+          "description": "Built wasm path (relative to repo_root) produced by build_argv, tokens {UNDERSCORE},{TARGET_DIR}. Copied to <extensions_dir>/<name>.wasm. ducklink target/wasm32-wasip2/release/{UNDERSCORE}_component.wasm."
+        },
+        "build_target": {
+          "type": "string",
+          "default": "wasm32-wasip2",
+          "description": "The rustc target triple used for {TARGET} in build_argv and for locating the build output's target/<triple>/release dir."
+        },
+        "all_null_min_rows": {
+          "type": "integer",
+          "default": 5,
+          "description": "Minimum parsed rows before the all-NULL heuristic fires."
+        }
+      }
+    },
+    "feedback": {
+      "type": "object",
+      "description": "Parameters for t-status.py (the lessons-learned / T-N feedback system). The format is shared (see spec/lessons-learned.spec.md); only the doc path is per-repo.",
+      "additionalProperties": false,
+      "properties": {
+        "lessons_doc": {
+          "type": "string",
+          "default": "tooling/lessons-learned.md",
+          "description": "Path (relative to repo_root) to the lessons-learned.md scanned for (T-N new)/(T-N closed) markers."
+        }
+      }
+    },
+    "compat_registry": {
+      "type": "object",
+      "description": "Parameters for compat.py / scaffold's crate-compat lookups.",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "default": "tooling/compat-registry.json",
+          "description": "Path (relative to repo_root) to the per-repo compat-registry.json. The _schema + reader are shared; the crate data is per-repo."
+        }
+      }
+    },
+    "registry": {
+      "type": "object",
+      "description": "Parameters for registry.py (the catalog index reader/validator for COMMON fields only; identity/digest verification is the DEFERRED identity module, not implemented here).",
+      "additionalProperties": false,
+      "properties": {
+        "index_path": {
+          "type": "string",
+          "description": "Path (relative to repo_root) to the catalog index. sqlink registry/index.json (entries under 'extensions'); ducklink registry/index.json. NOTE: ducklink's index is owned by the Phase 1 identity work; registry.py reads it read-only for common-field validation only."
+        },
+        "entries_key": {
+          "type": "string",
+          "default": "extensions",
+          "description": "Top-level key holding the array of entries, or '' if the index is itself a list/map of entries."
+        }
+      }
+    },
+    "type_map": {
+      "type": "object",
+      "description": "PLACEHOLDER for the Tier-2 ValueModel/TypeMap difference (DuckDB rich logical types vs SQLite five storage classes). The current tooling does not consume this beyond recording it; it marks where deeper (host-engine) tooling will branch. Left as a free-form pass-through.",
+      "additionalProperties": true
+    }
+  }
+}

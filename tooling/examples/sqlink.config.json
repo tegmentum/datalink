@@ -1,0 +1,61 @@
+{
+  "$comment": "Concrete datalink tooling config for sqlink (SQLite -> wasm, sqlite:extension components, static describe() manifest ABI). Filled from ~/git/sqlink/tooling/*.py. To consume in-repo, drop this at sqlink/tooling/datalink.config.json (with repo_root removed so it auto-discovers) and depend on datalink/tooling.",
+  "db_name": "sqlite",
+  "registration_abi": "manifest",
+  "repo_root": "/Users/zacharywhitley/git/sqlink",
+  "scaffold": {
+    "extensions_dir": "extensions",
+    "package_suffix": "",
+    "name_pattern": "^[a-z][a-z0-9-]*$",
+    "templates_dir": "tooling/templates",
+    "worlds": {
+      "minimal": ["lib.rs.minimal.tmpl", "scalar functions"],
+      "collating": ["lib.rs.collating.tmpl", "custom collation"],
+      "tabular": ["lib.rs.tabular.tmpl", "virtual table"],
+      "stateful": ["lib.rs.stateful.tmpl", "aggregate function"],
+      "authorizing": ["lib.rs.authorizing.tmpl", "authorizer callback"]
+    },
+    "lib_template_vars": ["NAME", "DESCRIPTION_SHORT"],
+    "register_workspace_member": false,
+    "build_check": {
+      "argv": ["cargo", "check", "--release", "--target", "{TARGET}"],
+      "cwd": "crate",
+      "target": "wasm32-wasip2",
+      "shared_target_dir": "extensions/_shared-target"
+    }
+  },
+  "smoke": {
+    "argv": ["{HOST_BIN}", "{CLI_COMPONENT}", "--db", "{DB}"],
+    "host_bin": "target/release/sqlink",
+    "cli_component": "target/wasm32-wasip2/release/sqlite_cli.component.wasm",
+    "package_suffix": "",
+    "db": ":memory:",
+    "prompt_pattern": "^(sqlite>\\s*|\\s*\\.\\.\\.>\\s*)+",
+    "sql_preamble": ".nullvalue <NULL>\n",
+    "null_token": "<NULL>",
+    "banner_prefixes": ["Loaded extension:"],
+    "panic_markers": [
+      "Error loading",
+      "no such function",
+      "panicked",
+      "instantiate loaded ext"
+    ],
+    "comment_prefix": "--",
+    "supports_build": false,
+    "all_null_min_rows": 5
+  },
+  "feedback": {
+    "lessons_doc": "tooling/lessons-learned.md"
+  },
+  "compat_registry": {
+    "path": "tooling/compat-registry.json"
+  },
+  "registry": {
+    "index_path": "registry/index.json",
+    "entries_key": "extensions"
+  },
+  "type_map": {
+    "$comment": "DEFERRED (Tier 2): SQLite's five fixed storage classes (NULL, INTEGER, REAL, TEXT, BLOB). Recorded here as the placeholder where ValueModel-aware tooling will branch; the current Tier-1 engine does not consume it.",
+    "kind": "storage-classes"
+  }
+}
