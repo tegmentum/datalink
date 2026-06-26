@@ -54,7 +54,33 @@ component_blob_cache, cache, policy, vtab, s3}.rs` ↔ ducklink
 compile cache, the network-grant policy, the storage/s3 path). Shared concerns:
 - **component loading + capability injection** into a wasmtime `Linker`;
 - **`compose:dynlink/linker`** host (resident shared providers) — *both mirror the
-  same framework*, `compose_provider.rs` ≈ `compose_dynlink.rs`;
+  same framework*, `compose_provider.rs` ≈ `compose_dynlink.rs`.
+  **STATUS: partially landed → `crates/datalink-dynlink`.** The store-generic
+  linker-host machinery (the resolve/invoke resource-table bridge
+  `DynLinkBridge`, the generated `compose:dynlink` bindings, `add_to_linker` /
+  `imports_linker`) plus a `ProviderBackend` trait now live in
+  `datalink-dynlink`, with the `ResidentBackend` (instantiate-once-and-reuse +
+  preopens) shipped. **ducklink consumes it** (its `compose_dynlink.rs` is a
+  97-line adapter, down from 541; proofs green: dlopen + pylon ml_kmeans +
+  smoke 182). **sqlink is DEFERRED**, because its linker host differs on two
+  axes the shared sync bridge can't span in one pass:
+  1. *async* — sqlink's bindgen is `imports/exports: { default: async }`, so its
+     `linker::Host` methods are `async fn`; the shared bridge + `ProviderBackend`
+     are sync (matching the framework + ducklink). Unifying needs an *async*
+     variant of the bridge/trait (an `async fn` `ProviderBackend` + an
+     `add_to_linker` that registers async host fns) — a NEW shared API, not a
+     migration.
+  2. *resource-table location + trust coupling + dual hosts* — sqlink keeps the
+     `instance` table in the **Store** (`HostWrap.resources` / `RunHostWrap`),
+     not in the bridge; has TWO host impls (`HostWrap` for the CLI,
+     `RunHostWrap` for `.run`); resolves-by-digest inline against a CAS cache +
+     `TrustPolicy` (Ed25519 sidecars); and is multi-tenant
+     (`TenantedProviders = HashMap<tenant, HashMap<id, ProviderHandle>>`).
+  The next slice: add an `async` flavor of `DynLinkBridge`/`ProviderBackend` to
+  `datalink-dynlink` (or a `mode: async` cargo feature on the bindgen), then
+  land sqlink's `FreshStoreProvider` + `SqliteRuntime` as backend impls, with
+  the resource table threaded from the Store via a bridge-accessor that returns
+  `Option<&mut ResourceTable>` (sqlink's `self.resources.as_deref_mut()` shape).
 - **prefix registry** (the `prefix__name` SPARQL-style dual registration);
 - **blob/compile cache** (component-compile-cache);
 - **capability policy** (network grants / `policy.rs`);
