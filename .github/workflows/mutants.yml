@@ -1,0 +1,78 @@
+# Reusable workflow: nightly cargo-mutants over a matrix of crates.
+#
+# Lifted from tegmentum/sqlink's mutants-nightly.yml (Tier 4). Callers supply
+# the crate matrix; per-night budget keeps each crate within a few hours.
+#
+# NOTE: ducklink's mutants.sh mutates a single --file with a sample-artifact
+# rebuild prelude + --no-default-features/--features bundled; that variant is
+# materially different and is NOT covered here (it stays a repo script). This
+# reusable workflow covers the package-matrix shape (sqlink) plus a couple of
+# common knobs.
+on:
+  workflow_call:
+    inputs:
+      crates:
+        description: 'JSON array of crate (package) names to mutate.'
+        type: string
+        required: true
+      mutants_args:
+        description: >-
+          Extra args appended to `cargo mutants` (e.g. feature flags). The
+          base invocation already passes --package/--in-place/--no-shuffle/
+          --output/--jobs.
+        type: string
+        default: ''
+      jobs:
+        description: 'cargo-mutants --jobs value (parallel mutant builds).'
+        type: string
+        default: '1'
+      timeout_minutes:
+        description: 'Per-crate job timeout, in minutes.'
+        type: number
+        default: 360
+      submodules:
+        description: 'Checkout submodules.'
+        type: string
+        default: 'recursive'
+
+jobs:
+  mutate:
+    name: mutants/${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: ${{ fromJSON(inputs.crates) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules }}
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install cargo-mutants
+        run: cargo install --locked cargo-mutants
+
+      - name: cache target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants-${{ matrix.crate }}
+
+      - name: run mutants for ${{ matrix.crate }}
+        run: |
+          cargo mutants \
+            --package ${{ matrix.crate }} \
+            --in-place \
+            --no-shuffle \
+            --output mutants-out \
+            --jobs ${{ inputs.jobs }} ${{ inputs.mutants_args }}
+
+      - name: upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-${{ matrix.crate }}
+          path: mutants-out
+          if-no-files-found: warn

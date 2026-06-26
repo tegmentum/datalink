@@ -1,0 +1,76 @@
+# Reusable workflow: build a Docusaurus site and push it to the gh-pages branch.
+#
+# Lifted from the (near-identical) docs-deploy.yml in tegmentum/ducklink and
+# tegmentum/sqlink (Tier 4 of the consolidation sweep). The only per-repo
+# divergence was sqlink's "sync docs/plans into website" pre-build step; that is
+# parameterized below via `pre_build_run`.
+#
+# Callers keep their own triggers (on: push/workflow_dispatch with their paths)
+# and pass `permissions` + `secrets: inherit` so the gh-pages push has the
+# GITHUB_TOKEN with contents:write.
+on:
+  workflow_call:
+    inputs:
+      website_dir:
+        description: 'Directory holding the Docusaurus project (package.json + build).'
+        type: string
+        default: 'website'
+      node_version:
+        description: 'Node.js version for the Docusaurus build.'
+        type: string
+        default: '20'
+      pre_build_run:
+        description: >-
+          Optional shell snippet run from the repo root BEFORE the Docusaurus
+          build (e.g. syncing extra docs into the website). Empty = skipped.
+        type: string
+        default: ''
+      publish_branch:
+        description: 'Branch peaceiris/actions-gh-pages publishes to.'
+        type: string
+        default: 'gh-pages'
+      submodules:
+        description: 'Checkout submodules (the docs build usually needs none).'
+        type: string
+        default: 'false'
+
+jobs:
+  build-and-deploy:
+    name: Build Docusaurus + push to gh-pages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules }}
+
+      - name: Pre-build sync
+        if: inputs.pre_build_run != ''
+        run: ${{ inputs.pre_build_run }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+          cache-dependency-path: '${{ inputs.website_dir }}/package-lock.json'
+
+      - name: Install website deps
+        working-directory: ${{ inputs.website_dir }}
+        run: npm ci
+
+      - name: Build site
+        working-directory: ${{ inputs.website_dir }}
+        run: npm run build
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./${{ inputs.website_dir }}/build
+          # First-deploy note: after this workflow's first successful run, set
+          # Settings -> Pages -> Source = the publish branch in repo settings.
+          # Subsequent runs auto-deploy without intervention.
+          publish_branch: ${{ inputs.publish_branch }}
+          force_orphan: true
+          commit_message: 'docs: deploy ${{ github.sha }}'

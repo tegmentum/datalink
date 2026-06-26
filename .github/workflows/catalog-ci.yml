@@ -1,0 +1,74 @@
+# Reusable workflow: lightweight, act-friendly catalog CI.
+#
+# Lifted from tegmentum/ducklink's ci.yml (Tier 4). It validates only what is
+# self-contained in a catalog repo: install the shared datalink-tooling engine
+# (pip-from-git, no token -- datalink is PUBLIC), then run the catalog verifier
+# plus an optional registry-schema check. No cargo, no sibling repos, no
+# prebuilt .wasm artifacts -- it runs in a stock `act` container in seconds.
+#
+# Callers keep their own triggers (push/pull_request/workflow_dispatch) and pass
+# the per-repo verify command + the registry path.
+on:
+  workflow_call:
+    inputs:
+      install_run:
+        description: 'Command that installs the shared datalink-tooling engine.'
+        type: string
+        default: 'pip install -r requirements-dev.txt'
+      verify_run:
+        description: 'Command that validates the extension catalog.'
+        type: string
+        default: 'python3 tooling/verify-catalog.py --no-artifacts'
+      registry_path:
+        description: >-
+          Path to the registry JSON validated by the schema check. Empty =
+          skip the schema-validation step.
+        type: string
+        default: 'registry/index.json'
+      registry_required_fields:
+        description: 'Space-separated fields every registry entry must have.'
+        type: string
+        default: 'name artifact exports prefix expansion'
+      submodules:
+        description: 'Checkout submodules.'
+        type: string
+        default: 'false'
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules }}
+
+      # The tooling delegators (tooling/verify-catalog.py etc.) import the shared
+      # datalink_tooling engine. datalink is PUBLIC, so no token is needed.
+      - name: Install the shared datalink tooling
+        run: ${{ inputs.install_run }}
+
+      # registry<->source<->workspace<->prefix consistency, minus the built-.wasm
+      # artifact-presence + orphan checks (artifacts are gitignored / absent in a
+      # fresh checkout).
+      - name: Validate the extension catalog
+        run: ${{ inputs.verify_run }}
+
+      - name: Validate registry JSON schema
+        if: inputs.registry_path != ''
+        env:
+          REGISTRY_PATH: ${{ inputs.registry_path }}
+          REQUIRED_FIELDS: ${{ inputs.registry_required_fields }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          path = os.environ["REGISTRY_PATH"]
+          fields = os.environ["REQUIRED_FIELDS"].split()
+          d = json.load(open(path))
+          exts = d["extensions"]
+          assert isinstance(exts, list) and len(exts) > 0, "registry has no extensions"
+          for e in exts:
+              for field in fields:
+                  assert e.get(field) is not None, f"{e.get('name','?')}: missing {field}"
+          print(f"registry OK: {len(exts)} extensions, all with {', '.join(fields)}")
+          PY

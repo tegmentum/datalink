@@ -1,0 +1,78 @@
+# Reusable workflow: time-bounded cargo-fuzz smoke over a matrix of targets.
+#
+# Lifted from tegmentum/sqlink's fuzz-smoke.yml (Tier 4). The contract under
+# test: NONE of the adversarial-input parsers may PANIC on any input. Callers
+# supply their fuzz-target list, the per-target time budget, and the directory
+# the fuzz crate lives in.
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: 'JSON array of cargo-fuzz target names, e.g. ["a","b"].'
+        type: string
+        required: true
+      fuzz_dir:
+        description: 'Working directory holding the cargo-fuzz crate.'
+        type: string
+        default: 'fuzz'
+      max_total_time:
+        description: 'Per-target fuzz time budget, in seconds.'
+        type: string
+        default: '300'
+      extra_args:
+        description: 'Extra libFuzzer args appended after the time budget.'
+        type: string
+        default: ''
+      cache_key:
+        description: 'Shared-key for the rust-cache of the fuzz workspace.'
+        type: string
+        default: 'fuzz-smoke-v1'
+      submodules:
+        description: 'Checkout submodules.'
+        type: string
+        default: 'recursive'
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules }}
+
+      - name: install nightly toolchain (for cargo-fuzz)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+
+      - name: cache fuzz target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ inputs.fuzz_dir }}
+          shared-key: ${{ inputs.cache_key }}
+
+      - name: restore corpus
+        uses: actions/cache@v4
+        with:
+          path: ${{ inputs.fuzz_dir }}/corpus/${{ matrix.target }}
+          key: corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            corpus-${{ matrix.target }}-
+
+      - name: run ${{ matrix.target }}
+        working-directory: ${{ inputs.fuzz_dir }}
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ inputs.max_total_time }} ${{ inputs.extra_args }}
+
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: ${{ inputs.fuzz_dir }}/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
