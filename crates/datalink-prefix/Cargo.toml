@@ -1,0 +1,13 @@
+[package]
+name = "datalink-prefix"
+version = "0.1.0"
+edition = "2021"
+description = "Database-agnostic function-prefix namespacing for the sqlink + ducklink wasm-component hosts: the `prefix__name` resolution algorithm (identifier sanitization, qualified-name construction, deprecation-window fallback) plus the collision/pin MODEL behind a `PrefixStore` storage trait. ducklink backs the store in-memory (registry/index.json); sqlink backs it with its `__sqlink_prefix*` SQLite tables. Intentionally dependency-light (std only): no DB runtime, no serde."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "datalink_prefix"
+path = "src/lib.rs"
+
+[dependencies]

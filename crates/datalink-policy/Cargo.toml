@@ -1,0 +1,13 @@
+[package]
+name = "datalink-policy"
+version = "0.1.0"
+edition = "2021"
+description = "Canonical, database-agnostic Rust types for per-extension capability grants used by the sqlink + ducklink wasm-component hosts. Capability allow-list, HTTP/DNS allowlists with wildcard suffixes, fuel/memory/epoch knobs, and policy-error variants. A single Policy value is portable across deployment modes and across hosts. Intentionally dependency-light (std only): no wasmtime, no bindgen, no DB runtime."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "datalink_policy"
+path = "src/lib.rs"
+
+[dependencies]
