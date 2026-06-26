@@ -486,12 +486,12 @@ impl<B: AsyncProviderBackend + Sync> AsyncDynLinkBridge<B> {
 /// into a distinct table field). The bridge's routing methods then take the
 /// table as a parameter.
 ///
-/// Usage (the view type's generics, if any, go in a leading `<...>` group so
-/// the generated `impl` headers carry them):
+/// Usage. A borrowed view names its lifetime up front (a `lifetime` fragment
+/// is unambiguous, unlike a `tt`-repetition generics group):
 /// ```ignore
 /// // `$ty` exposes `fn split(&mut self) -> (&AsyncDynLinkBridge<B>, &mut ResourceTable)`.
 /// impl_datalink_dynlink_async_host!(MyView, MyBackend, split);          // no generics
-/// impl_datalink_dynlink_async_host!(<'a> MyView<'a>, MyBackend, split); // borrowed view
+/// impl_datalink_dynlink_async_host!('a; MyView<'a>, MyBackend, split);  // borrowed view
 /// ```
 #[macro_export]
 macro_rules! impl_datalink_dynlink_async_host {
@@ -547,12 +547,11 @@ macro_rules! impl_datalink_dynlink_async_host {
             }
         }
     };
-    // Entry: the view type carries generics (e.g. a borrow lifetime). Matched
-    // BEFORE the no-generics arm so the leading `<` doesn't get committed to a
-    // `$ty:ty` parse (which would fail without backtracking). The `<$($g)*>`
-    // group is forwarded to every generated `impl` header.
-    (<$($g:tt)*> $ty:ty, $backend:ty, $split:ident) => {
-        $crate::impl_datalink_dynlink_async_host!(@imp [<$($g)*>] $ty, $backend, $split);
+    // Entry: a borrowed view, with its lifetime named up front as a
+    // `lifetime` fragment (unambiguous — no `tt`-repetition local ambiguity).
+    // Matched before the no-generics arm.
+    ($life:lifetime; $ty:ty, $backend:ty, $split:ident) => {
+        $crate::impl_datalink_dynlink_async_host!(@imp [<$life>] $ty, $backend, $split);
     };
     // Entry: no generics on the view type.
     ($ty:ty, $backend:ty, $split:ident) => {
