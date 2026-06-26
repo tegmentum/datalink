@@ -501,7 +501,11 @@ macro_rules! impl_datalink_dynlink_async_host {
     (@imp [$($gen:tt)*] $ty:ty, $backend:ty, $split:ident) => {
         impl $($gen)* $crate::async_bindings::sys::compose::types::Host for $ty {}
 
-        #[$crate::async_trait_reexport::async_trait]
+        // NOTE: wasmtime's `imports: { default: async }` generates the linker
+        // Host/HostInstance traits with NATIVE `async fn` methods (not
+        // async-trait boxing), so these impls use plain `async fn` — NOT
+        // `#[async_trait]`. (The consumer's `AsyncProviderBackend` IS
+        // async-trait, since it is a regular trait stored behind a generic.)
         impl $($gen)* $crate::async_bindings::compose::dynlink::linker::Host for $ty {
             async fn resolve_by_id(
                 &mut self,
@@ -526,7 +530,6 @@ macro_rules! impl_datalink_dynlink_async_host {
             }
         }
 
-        #[$crate::async_trait_reexport::async_trait]
         impl $($gen)* $crate::async_bindings::compose::dynlink::linker::HostInstance for $ty {
             async fn invoke(
                 &mut self,
