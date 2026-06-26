@@ -259,6 +259,44 @@
         }
       }
     },
+    "identity": {
+      "type": "object",
+      "description": "Parameters for the content-addressed identity engine (identity.py + gen.py + verify.py). Drives the TWO digest schemes lifted from ducklink's Phase 1 (both reimplemented byte-identically from compose-core::blobs): the witcanon CONTRACT digest (sha256(\"witcanon:1\" || canonical WIT bytes), always-enforced shape identity) and the content BYTE digest (sha256 of each .wasm, opt-in-enforced). All paths are relative to repo_root unless absolute.",
+      "additionalProperties": false,
+      "properties": {
+        "wit_source_dir": {
+          "type": "string",
+          "description": "The CANONICAL contract WIT directory whose top-level *.wit files (sorted by filename, concatenated) form the witcanon digest. This is the authoritative contract package dir, NOT necessarily the per-crate propagated copy in wit.source_dir. ducklink: 'wit/duckdb-extension' (16 files; deps.toml excluded by the *.wit glob). sqlink: 'wit'. If omitted, falls back to wit.source_dir."
+        },
+        "contract_package": {
+          "type": "string",
+          "description": "The WIT package id imported by a built artifact, parsed from `wasm-tools component wit` for the @MAJOR cross-check. ducklink 'duckdb:extension'; sqlink 'sqlink:wasm'. If omitted, falls back to wit.package."
+        },
+        "contract_major": {
+          "type": "string",
+          "description": "The contract MAJOR the catalog targets, matched against both wit_contract_version and the built artifact's imported <package>@MAJOR. ducklink '2'; sqlink '0' (sqlink:wasm@0.1.0). If omitted, derived from contract_version."
+        },
+        "contract_version": {
+          "type": "string",
+          "description": "The human-readable contract version stamped into each entry's wit_contract_version (the runtime-observable proxy). ducklink '2.0.0'; sqlink '0.1.0'."
+        },
+        "artifacts_dir": {
+          "type": "string",
+          "description": "Directory holding the deployed <name>.wasm artifacts whose content_digest is computed/verified. ducklink 'artifacts/extensions'. If omitted, falls back to smoke.extensions_dir."
+        },
+        "wasm_tools_bin": {
+          "type": "string",
+          "default": "wasm-tools",
+          "description": "The `wasm-tools` binary used for the imported-@MAJOR cross-check in verify.py."
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Entry names excluded from verify.py's identity checks (parity with ducklink's verify-catalog, which filters `sample_extension` -- the template extension importing the legacy unversioned contract by design -- out of its digest loop). ducklink ['sample_extension']."
+        }
+      }
+    },
     "type_map": {
       "type": "object",
       "description": "PLACEHOLDER for the Tier-2 ValueModel/TypeMap difference (DuckDB rich logical types vs SQLite five storage classes). The current tooling does not consume this beyond recording it; it marks where deeper (host-engine) tooling will branch. Left as a free-form pass-through.",

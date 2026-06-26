@@ -54,6 +54,15 @@
     "index_path": "registry/index.json",
     "entries_key": "extensions"
   },
+  "identity": {
+    "$comment": "sqlink's real values, for the identity engine's GENERALITY proof. sqlink's WIT package is sqlink:wasm@0.1.0 (major 0); wit_source_dir is the flat wit/ dir (top-level *.wit; wit/deps/ excluded by the non-recursive glob). NOTE: sqlink currently records `checksum` (an OCI artifact checksum, e.g. 'sha256:builtin'), NOT content_digest. Pointing sqlink's checksum at this shared content_digest scheme (+ the @0.1.0 -> @1.0.0 contract decision) is the DEFERRED per-repo consume, not this lift -- this config only proves the engine GENERATES the right witcanon + content digests for sqlink.",
+    "wit_source_dir": "wit",
+    "contract_package": "sqlink:wasm",
+    "contract_major": "0",
+    "contract_version": "0.1.0",
+    "artifacts_dir": "build/extensions",
+    "wasm_tools_bin": "wasm-tools"
+  },
   "type_map": {
     "$comment": "DEFERRED (Tier 2): SQLite's five fixed storage classes (NULL, INTEGER, REAL, TEXT, BLOB). Recorded here as the placeholder where ValueModel-aware tooling will branch; the current Tier-1 engine does not consume it.",
     "kind": "storage-classes"

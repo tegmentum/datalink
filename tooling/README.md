@@ -17,6 +17,9 @@ config + a dependency on datalink.
 | `t-status.py` | scan `lessons-learned.md` for `(T-N new)`/`(T-N closed)` markers | doc path only (the format is shared) |
 | `compat.py` | read/validate `compat-registry.json` (upstream-crate wasm32 status); `--list-broken`, `--check`, `--validate` | registry path only (the `_schema` is shared; per-crate data stays per-repo) |
 | `registry.py` | read/validate the catalog index **CORE** fields; `--list`, `--validate`, `--show` | index path + entries key (DB-specific fields are opaque pass-through) |
+| `identity.py` | the shared content-addressed identity: `witcanon_digest(cfg)` (contract/shape), `content_digest(artifact)` (byte), `imported_contract_{version,major}(artifact, package)` (the `@MAJOR` cross-check via `wasm-tools`) | `identity.{wit_source_dir, contract_package, contract_major, contract_version, artifacts_dir, wasm_tools_bin, exclude}` |
+| `gen.py` | stamp `wit_contract` + `wit_contract_version` + `content_digest` into every entry whose artifact is present (idempotent; preserves 2-space indent + trailing newline); `--check` reports drift without writing | identity params + registry path |
+| `verify.py` | enforce `wit_contract` == recomputed witcanon digest + the `@MAJOR` cross-check (**default**); `content_digest` == `sha256(artifact)` only under `--verify-content`/`--strict`; `--no-artifacts` for the toolchain-free subset | identity params + registry path |
 | `dlconfig.py` | shared config loader (discovery, repo_root + path resolution) | — |
 | `config.schema.json` | the per-repo config contract (JSON Schema) | — |
 | `spec/lessons-learned.spec.md` | the shared lessons-learned **format**/`(T-N …)` convention | entries stay per-repo |
@@ -61,21 +64,48 @@ branch.
   inline `[workspace]`, world-selected lib.rs).
 - `compat.py --validate` / `registry.py --validate` pass against each repo's data.
 
-## DEFERRED — the identity module (next step)
+## The identity engine (lifted — ducklink Phase 1)
 
-The **content-addressed identity** machinery is intentionally NOT lifted here, because
-a separate agent is doing ducklink's Phase 1 identity work right now (it owns
-`tooling/gen-catalog.py`, `tooling/verify-catalog.py`, and `registry/index.json`).
-Deferred to a follow-up once Phase 1 lands:
+The **content-addressed identity** machinery is now lifted (it was deferred until
+ducklink's Phase 1 finalized the scheme). `identity.py` + `gen.py` + `verify.py`
+are the shared, DB-agnostic, parameterized engine. TWO digest schemes, both
+reimplemented byte-identically from the orchestration framework's
+`compose-core::blobs`:
 
-- `witcanon:1` contract digest + the `content_digest` (sha256, `compose-core` scheme)
-- `gen-catalog.py` (index generation) and `verify-catalog.py` (digest verification)
-- pointing sqlink's `checksum` at the same shared scheme
-- the canonical shared `datalink-identity` (per CONSOLIDATION.md Tier 1 / quick wins)
+- **witcanon (contract/shape identity)** — `sha256(b"witcanon:1" || bytes)` where
+  `bytes` = the canonical contract WIT files (`config.identity.wit_source_dir`,
+  every top-level `*.wit` sorted by filename, concatenated). Hex. The
+  AUTHORITATIVE, always-enforced identity; mirrors ducklink's
+  `crates/ducklink-runtime/build.rs` const. Changes iff the WIT shape changes.
+- **content (byte identity)** — `sha256(bytes)` of each component's own `.wasm`.
+  Hex. Re-stamped per deploy; enforced only under `--verify-content`/`--strict`
+  because wasm builds are byte-reproducible within a fixed toolchain but **not**
+  across rustc / cargo-component versions.
 
-`registry.py` here deliberately validates **CORE fields only** and reads the index
-read-only; it does NOT verify any digest. Identity-specific fields
-(`content_digest`, `wit_contract`, `checksum`, …) are passed through untouched.
+`gen.py` stamps `wit_contract` + `wit_contract_version` + `content_digest` (the
+last only when the artifact is present) idempotently, preserving the index's
+2-space indent + trailing newline. `verify.py` enforces the witcanon digest + the
+`@MAJOR` cross-check (the built artifact's imported `<package>@MAJOR` via
+`wasm-tools component wit`) by default, and the content digest under the opt-in
+flag — mirroring ducklink's `verify-catalog.py` semantics exactly (`exclude`
+filters the template `sample_extension`, as verify-catalog does).
+
+`registry.py` still validates **CORE fields only** (read-only, no digest check);
+identity verification lives in `verify.py`. The DB-specific divergence — sqlink
+records `checksum` (an OCI artifact checksum) where ducklink records
+`content_digest` — is **not** reconciled here: this lift only proves the engine
+computes the right values for both (see "DEFERRED" below).
+
+### DEFERRED — the per-repo consume
+
+- ducklink's `gen-catalog.py` / `verify-catalog.py` delegating to this engine
+  (then deleting the mirrored copies), keeping their catalog-Markdown /
+  source / workspace / orphan checks.
+- sqlink adopting the engine + aligning `checksum` → the shared `content_digest`
+  scheme + the sqlink `@0.1.0` → `@1.0.0` contract decision.
+- the canonical shared `datalink-identity` Rust crate (per CONSOLIDATION.md
+  Tier 1) if/when the host engine needs it (the Python tooling is the Tier-1
+  surface).
 
 Other sqlink-only generic patterns noted as low-priority follow-ups: `plan-add.py`
 (plan-table row append — repo-doc-format-specific) and `next-fid.py` (max FID+1 — tied
@@ -83,8 +113,11 @@ to the manifest FID const convention). Generalize if/when needed.
 
 ## Follow-up sequencing
 
-1. **Identity lift** (after ducklink Phase 1): witcanon + content_digest + gen/verify
-   as `datalink-identity` + the registry digest verification in `registry.py`.
+1. **Identity lift** — DONE. `identity.py` + `gen.py` + `verify.py` (witcanon
+   contract digest + content_digest + the `@MAJOR` cross-check), parameterized by
+   `config.identity`. ducklink parity proven (witcanon `90fdc46a…`, content
+   digests match, default/`--verify-content`/perturbation behaviour mirrors
+   verify-catalog); sqlink generality proven read-only.
 2. **Per-repo consume-and-delete**: drop `tooling/datalink.config.json` into each repo,
    add the dep on `datalink/tooling`, delete the mirrored `scaffold.py` / `smoke.py` /
    `t-status.py` (keep each repo's `templates/`, `compat-registry.json` data,
