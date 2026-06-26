@@ -84,9 +84,25 @@ pub use bindings::sys::compose::types::{Error, ErrorCode};
 /// bridge/macro use this one.
 pub use async_bindings::compose::dynlink::linker::Instance as AsyncInstance;
 
+/// The async-flavor `Error`/`ErrorCode`. These are DISTINCT generated types
+/// from the sync [`Error`]/[`ErrorCode`] above — each `bindgen!` of the same
+/// WIT mints its own nominal Rust types — so the async trait, bridge, and the
+/// async host methods must all speak THESE. The shape is identical; only the
+/// nominal identity differs (which is what makes the sync flavor untouched).
+pub use async_bindings::sys::compose::types::{Error as AsyncError, ErrorCode as AsyncErrorCode};
+
 /// Build a host `Error` with the given code and message.
 pub fn err(code: ErrorCode, message: impl Into<String>) -> Error {
     Error {
+        code,
+        message: message.into(),
+        context: None,
+    }
+}
+
+/// Build an async-flavor host [`AsyncError`] with the given code and message.
+pub fn async_err(code: AsyncErrorCode, message: impl Into<String>) -> AsyncError {
+    AsyncError {
         code,
         message: message.into(),
         context: None,
@@ -350,11 +366,11 @@ pub trait AsyncProviderBackend {
 
     /// Resolve a provider by registry id (with any per-resolve work the
     /// backend's lifecycle needs), returning the handle to remember.
-    async fn resolve_by_id(&self, id: &str) -> Result<Self::Handle, Error>;
+    async fn resolve_by_id(&self, id: &str) -> Result<Self::Handle, AsyncError>;
 
     /// Resolve a provider by content digest. Backends that don't support it
-    /// return `ErrorCode::NotImplemented`.
-    async fn resolve_by_digest(&self, digest: &[u8]) -> Result<Self::Handle, Error>;
+    /// return `AsyncErrorCode::NotImplemented`.
+    async fn resolve_by_digest(&self, digest: &[u8]) -> Result<Self::Handle, AsyncError>;
 
     /// Forward an opaque message to the provider behind `handle`.
     async fn invoke(
@@ -362,7 +378,7 @@ pub trait AsyncProviderBackend {
         handle: &Self::Handle,
         method: &str,
         payload: &[u8],
-    ) -> Result<Vec<u8>, Error>;
+    ) -> Result<Vec<u8>, AsyncError>;
 
     /// Notification that a resolved handle was dropped by the guest. Default:
     /// no-op.
@@ -373,6 +389,11 @@ pub trait AsyncProviderBackend {
 /// Unlike the sync [`DynLinkBridge`], it does NOT own the resource table — the
 /// consumer keeps it on its Store and threads it in. The bridge holds the
 /// backend and routes resolve/invoke/drop against a caller-supplied table.
+///
+/// `Clone` when the backend is (the backend is the only field; consumers'
+/// backends are cheap `Arc`-shared clones), so a consumer that stores the
+/// bridge on a `#[derive(Clone)]` state can clone it freely.
+#[derive(Clone)]
 pub struct AsyncDynLinkBridge<B: AsyncProviderBackend> {
     backend: B,
 }
@@ -393,7 +414,7 @@ impl<B: AsyncProviderBackend + Sync> AsyncDynLinkBridge<B> {
         &self,
         table: &mut ResourceTable,
         id: String,
-    ) -> Result<Resource<AsyncInstance>, Error> {
+    ) -> Result<Resource<AsyncInstance>, AsyncError> {
         let handle = self.backend.resolve_by_id(&id).await?;
         Self::push_handle(table, handle)
     }
@@ -403,7 +424,7 @@ impl<B: AsyncProviderBackend + Sync> AsyncDynLinkBridge<B> {
         &self,
         table: &mut ResourceTable,
         d: Vec<u8>,
-    ) -> Result<Resource<AsyncInstance>, Error> {
+    ) -> Result<Resource<AsyncInstance>, AsyncError> {
         let handle = self.backend.resolve_by_digest(&d).await?;
         Self::push_handle(table, handle)
     }
@@ -411,10 +432,10 @@ impl<B: AsyncProviderBackend + Sync> AsyncDynLinkBridge<B> {
     fn push_handle(
         table: &mut ResourceTable,
         handle: B::Handle,
-    ) -> Result<Resource<AsyncInstance>, Error> {
+    ) -> Result<Resource<AsyncInstance>, AsyncError> {
         let backing = table
             .push(handle)
-            .map_err(|e| err(ErrorCode::InternalError, format!("table push: {e:?}")))?;
+            .map_err(|e| async_err(AsyncErrorCode::InternalError, format!("table push: {e:?}")))?;
         Ok(Resource::new_own(backing.rep()))
     }
 
@@ -426,10 +447,15 @@ impl<B: AsyncProviderBackend + Sync> AsyncDynLinkBridge<B> {
         self_: Resource<AsyncInstance>,
         method: String,
         payload: Vec<u8>,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Vec<u8>, AsyncError> {
         let handle = table
             .get(&as_backing_async::<B::Handle>(&self_))
-            .map_err(|e| err(ErrorCode::InternalError, format!("unknown dynlink handle: {e:?}")))?
+            .map_err(|e| {
+                async_err(
+                    AsyncErrorCode::InternalError,
+                    format!("unknown dynlink handle: {e:?}"),
+                )
+            })?
             .clone();
         self.backend.invoke(&handle, &method, &payload).await
     }
@@ -469,16 +495,9 @@ impl<B: AsyncProviderBackend + Sync> AsyncDynLinkBridge<B> {
 /// ```
 #[macro_export]
 macro_rules! impl_datalink_dynlink_async_host {
-    // Entry: no generics on the view type.
-    ($ty:ty, $backend:ty, $split:ident) => {
-        $crate::impl_datalink_dynlink_async_host!(@imp [] $ty, $backend, $split);
-    };
-    // Entry: the view type carries generics (e.g. a borrow lifetime). The
-    // `<$($g)*>` group is forwarded to every generated `impl` header.
-    (<$($g:tt)*> $ty:ty, $backend:ty, $split:ident) => {
-        $crate::impl_datalink_dynlink_async_host!(@imp [<$($g)*>] $ty, $backend, $split);
-    };
-    // Internal: `[$($gen:tt)*]` is either empty or `<...>`.
+    // Internal worker arm: matched first so the leading `@imp` token can't be
+    // mis-consumed by the `$ty:ty` fragment (a `ty` fragment commits on its
+    // first token and won't backtrack). `[$($gen:tt)*]` is empty or `<...>`.
     (@imp [$($gen:tt)*] $ty:ty, $backend:ty, $split:ident) => {
         impl $($gen)* $crate::async_bindings::sys::compose::types::Host for $ty {}
 
@@ -489,7 +508,7 @@ macro_rules! impl_datalink_dynlink_async_host {
                 id: ::std::string::String,
             ) -> ::core::result::Result<
                 ::wasmtime::component::Resource<$crate::AsyncInstance>,
-                $crate::Error,
+                $crate::AsyncError,
             > {
                 let (bridge, table) = self.$split();
                 bridge.resolve_by_id(table, id).await
@@ -500,7 +519,7 @@ macro_rules! impl_datalink_dynlink_async_host {
                 d: ::std::vec::Vec<u8>,
             ) -> ::core::result::Result<
                 ::wasmtime::component::Resource<$crate::AsyncInstance>,
-                $crate::Error,
+                $crate::AsyncError,
             > {
                 let (bridge, table) = self.$split();
                 bridge.resolve_by_digest(table, d).await
@@ -514,7 +533,7 @@ macro_rules! impl_datalink_dynlink_async_host {
                 self_: ::wasmtime::component::Resource<$crate::AsyncInstance>,
                 method: ::std::string::String,
                 payload: ::std::vec::Vec<u8>,
-            ) -> ::core::result::Result<::std::vec::Vec<u8>, $crate::Error> {
+            ) -> ::core::result::Result<::std::vec::Vec<u8>, $crate::AsyncError> {
                 let (bridge, table) = self.$split();
                 bridge.invoke(table, self_, method, payload).await
             }
@@ -527,6 +546,17 @@ macro_rules! impl_datalink_dynlink_async_host {
                 bridge.drop_handle(table, rep).await
             }
         }
+    };
+    // Entry: the view type carries generics (e.g. a borrow lifetime). Matched
+    // BEFORE the no-generics arm so the leading `<` doesn't get committed to a
+    // `$ty:ty` parse (which would fail without backtracking). The `<$($g)*>`
+    // group is forwarded to every generated `impl` header.
+    (<$($g:tt)*> $ty:ty, $backend:ty, $split:ident) => {
+        $crate::impl_datalink_dynlink_async_host!(@imp [<$($g)*>] $ty, $backend, $split);
+    };
+    // Entry: no generics on the view type.
+    ($ty:ty, $backend:ty, $split:ident) => {
+        $crate::impl_datalink_dynlink_async_host!(@imp [] $ty, $backend, $split);
     };
 }
 
@@ -954,7 +984,7 @@ mod tests {
     impl AsyncProviderBackend for AsyncEchoBackend {
         type Handle = AsyncEchoHandle;
 
-        async fn resolve_by_id(&self, id: &str) -> Result<Self::Handle, Error> {
+        async fn resolve_by_id(&self, id: &str) -> Result<Self::Handle, AsyncError> {
             self.live.fetch_add(1, Ordering::SeqCst);
             Ok(AsyncEchoHandle {
                 id: id.to_string(),
@@ -962,8 +992,8 @@ mod tests {
             })
         }
 
-        async fn resolve_by_digest(&self, _d: &[u8]) -> Result<Self::Handle, Error> {
-            Err(err(ErrorCode::NotImplemented, "no digest map"))
+        async fn resolve_by_digest(&self, _d: &[u8]) -> Result<Self::Handle, AsyncError> {
+            Err(async_err(AsyncErrorCode::NotImplemented, "no digest map"))
         }
 
         async fn invoke(
@@ -971,11 +1001,14 @@ mod tests {
             handle: &Self::Handle,
             method: &str,
             payload: &[u8],
-        ) -> Result<Vec<u8>, Error> {
+        ) -> Result<Vec<u8>, AsyncError> {
             match method {
                 "upper" => Ok(String::from_utf8_lossy(payload).to_uppercase().into_bytes()),
                 "id" => Ok(handle.id.clone().into_bytes()),
-                other => Err(err(ErrorCode::InvalidInput, format!("unknown method {other}"))),
+                other => Err(async_err(
+                    AsyncErrorCode::InvalidInput,
+                    format!("unknown method {other}"),
+                )),
             }
         }
 
@@ -1033,7 +1066,7 @@ mod tests {
         let bridge = AsyncDynLinkBridge::new(AsyncEchoBackend::default());
         let mut table = ResourceTable::new();
         match bridge.resolve_by_digest(&mut table, vec![0u8; 32]).await {
-            Err(e) => assert!(matches!(e.code, ErrorCode::NotImplemented)),
+            Err(e) => assert!(matches!(e.code, AsyncErrorCode::NotImplemented)),
             Ok(_) => panic!("unmapped digest must not resolve"),
         }
     }
