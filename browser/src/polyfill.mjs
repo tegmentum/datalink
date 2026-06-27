@@ -11,7 +11,7 @@
 import { Polyfill, AllowAllPolicy } from '@tegmentum/wasi-polyfill/wasip2'
 import * as cli from '@tegmentum/wasi-polyfill/wasip2/plugins/cli'
 import * as io from '@tegmentum/wasi-polyfill/wasip2/plugins/io'
-import * as fs from '@tegmentum/wasi-polyfill/wasip2/plugins/filesystem'
+import * as fsplugin from '@tegmentum/wasi-polyfill/wasip2/plugins/filesystem'
 import * as clocks from '@tegmentum/wasi-polyfill/wasip2/plugins/clocks'
 import * as random from '@tegmentum/wasi-polyfill/wasip2/plugins/random'
 import * as sockets from '@tegmentum/wasi-polyfill/wasip2/plugins/sockets'
@@ -28,6 +28,10 @@ import * as sockets from '@tegmentum/wasi-polyfill/wasip2/plugins/sockets'
  * @param {Record<string,string[]>} [opts.staticDnsMappings] static DNS name->addr mappings
  * @param {boolean} [opts.asyncReadYield]         yield a macrotask on empty reads (network tunnels)
  * @param {typeof AllowAllPolicy} [opts.PolicyBase]  policy base class (default dev AllowAllPolicy)
+ * @param {import('@tegmentum/wasi-polyfill/wasip2/plugins/filesystem').MemoryFileSystem} [opts.memfs]
+ *   a shared in-memory filesystem to seed the polyfill with (so the caller can
+ *   write files the guest sees, e.g. registerFileBuffer). When omitted, a fresh
+ *   isolated FS is created. Reachable afterwards as `polyfill.__memfs`.
  */
 export function configurePolyfill(opts = {}) {
   const {
@@ -38,7 +42,18 @@ export function configurePolyfill(opts = {}) {
     staticDnsMappings = { localhost: ['::1'] },
     asyncReadYield = true,
     PolicyBase = AllowAllPolicy,
+    memfs,
   } = opts
+
+  // A caller-controlled MemoryFileSystem so registerFile* can write files the
+  // guest resolves (FROM 'name.csv'). Seeded as prepopulatedFs for this polyfill
+  // context; the mkdirs are pre-created on it too. MemoryFileSystem comes from
+  // the same namespace import as the fs plugins (a separate named import of the
+  // filesystem module double-instantiates it under Vite and breaks the plugins).
+  const memFs = memfs || new fsplugin.MemoryFileSystem()
+  for (const dir of mkdirs) {
+    try { memFs.mkdirp(dir) } catch {}
+  }
 
   // On an empty read return a Promise that yields a macrotask then re-reads, so
   // a guest that busy-drains a socket (read_to_end) over a WebSocket tunnel
@@ -56,9 +71,10 @@ export function configurePolyfill(opts = {}) {
       const cfg = super.configure(iface)
       if (iface.package === 'wasi:filesystem') {
         // A writable in-memory FS with a `/` preopen + the engine's pre-created
-        // state dir (CreateDirectory is non-recursive in the engines).
+        // state dir (CreateDirectory is non-recursive in the engines). Seed the
+        // caller-controlled FS so registerFile* writes are visible to the guest.
         cfg.implementation = 'memory'
-        cfg.options = { ...(cfg.options || {}), preopens, mkdirs }
+        cfg.options = { ...(cfg.options || {}), preopens, mkdirs, prepopulatedFs: memFs }
       }
       if (iface.package === 'wasi:sockets' && network) {
         if (iface.name === 'ip-name-lookup') {
@@ -80,7 +96,7 @@ export function configurePolyfill(opts = {}) {
     cli.terminalInputPlugin, cli.terminalOutputPlugin, cli.terminalStdinPlugin,
     cli.terminalStdoutPlugin, cli.terminalStderrPlugin,
     io.streamsPlugin, io.pollPlugin, io.errorPlugin,
-    fs.filesystemTypesPlugin, fs.filesystemPreopensPlugin,
+    fsplugin.filesystemTypesPlugin, fsplugin.filesystemPreopensPlugin,
     clocks.monotonicClockPlugin, clocks.wallClockPlugin,
     random.randomPlugin, random.insecureRandomPlugin, random.insecureSeedPlugin,
     // Engines link socket-using extensions and import wasi:sockets
@@ -90,5 +106,7 @@ export function configurePolyfill(opts = {}) {
   ]) {
     polyfill.registerPlugin(p)
   }
+  // Expose the shared FS so the facade's registerFile* can write into it.
+  polyfill.__memfs = memFs
   return polyfill
 }

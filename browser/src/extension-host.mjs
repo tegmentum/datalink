@@ -37,7 +37,8 @@ export function createExtensionHost(opts) {
 
   // name -> { instance, pending, base }  (base = handle-window start for this ext)
   const loaded = new Map()
-  // global handle -> the extension record that owns it (for routing dispatch)
+  // global callback handle -> { rec, original }: routes a core dispatch (carrying
+  // the global handle) to the owning extension + its original (local) handle.
   const handleToExt = new Map()
   let nextBase = HANDLE_WINDOW
 
@@ -51,12 +52,19 @@ export function createExtensionHost(opts) {
   // callback handle routes uniquely to this instance.
   function buildExtensionImports(pending, base, registerHandle) {
     let nextLocal = 1
-    const id = () => {
-      const h = base + nextLocal++
-      registerHandle(h)
-      return h
+    const id = () => base + nextLocal++ // registration-handle ids (local to this ext)
+    const tableHandles = new Map() // function-registration handle -> function name
+
+    // Rewrite a callback handle (assigned by the extension, e.g. 1) to a GLOBAL
+    // value unique across all loaded extensions, and record the mapping so the
+    // core's later dispatch (which carries this global handle) routes to THIS
+    // extension instance and calls it with its ORIGINAL handle. Two extensions
+    // may both use handle 1 locally; the offset window disambiguates them.
+    const remap = (cbHandle) => {
+      const global = base + cbHandle
+      registerHandle(global, cbHandle)
+      return global
     }
-    const tableHandles = new Map() // global handle -> function name
 
     class ScalarCallback { constructor(h) { this.handle = h } }
     class TableCallback { constructor(h) { this.handle = h } }
@@ -66,26 +74,26 @@ export function createExtensionHost(opts) {
 
     class ScalarRegistry {
       register(name, args, returns, cb, options) {
-        pending.scalars.push({ name, arguments: args, returns, callbackHandle: cb.handle, options })
+        pending.scalars.push({ name, arguments: args, returns, callbackHandle: remap(cb.handle), options })
         return id()
       }
     }
     class TableRegistry {
       register(name, args, columns, cb, options) {
         const handle = id()
-        pending.tables.push({ name, arguments: args, columns, callbackHandle: cb.handle, options })
+        pending.tables.push({ name, arguments: args, columns, callbackHandle: remap(cb.handle), options })
         tableHandles.set(handle, name)
         return handle
       }
     }
     class AggregateRegistry {
       register(name, args, returns, cb, options) {
-        pending.aggregates.push({ name, arguments: args, returns, callbackHandle: cb.handle, options })
+        pending.aggregates.push({ name, arguments: args, returns, callbackHandle: remap(cb.handle), options })
         return id()
       }
     }
     class PragmaRegistry {
-      registerCall() { return id() }
+      registerCall(name, cb) { return remap(cb?.handle ?? id()) }
     }
     class MacroRegistry {
       registerScalar() { return true }
@@ -114,7 +122,7 @@ export function createExtensionHost(opts) {
         return id()
       },
       registerCast(spec, cb) {
-        pending.casts.push({ source: spec.from, target: spec.to, callbackHandle: cb.handle })
+        pending.casts.push({ source: spec.from, target: spec.to, callbackHandle: remap(cb.handle) })
       },
       registerMacro(def) {
         pending.macros.push({
@@ -159,7 +167,7 @@ export function createExtensionHost(opts) {
       const base = nextBase
       nextBase += HANDLE_WINDOW
       const rec = { instance: null, pending, base }
-      const registerHandle = (h) => handleToExt.set(h, rec)
+      const registerHandle = (global, original) => handleToExt.set(global, { rec, original })
 
       const polyfill = configurePolyfill()
       const bindgen = createRuntimeBindgen({
@@ -179,13 +187,17 @@ export function createExtensionHost(opts) {
     // Imports the CORE component needs (pass via its additionalImports). Routes
     // each callback to the extension that owns the handle (the multi-ext router).
     coreImports() {
+      // Resolve a core dispatch handle (global) to { instance, original }: the
+      // owning extension + the handle IT expects (its original local handle).
       const route = (handle) => {
-        const rec = handleToExt.get(handle)
-        if (!rec) throw new Error('no extension loaded for callback handle ' + handle)
-        return rec.instance
+        const entry = handleToExt.get(handle)
+        if (!entry) throw new Error('no extension loaded for callback handle ' + handle)
+        return { instance: entry.rec.instance, original: entry.original }
       }
-      const dispatch = (method) => (handle, ...rest) =>
-        route(handle).callbackDispatch[method](handle, ...rest)
+      const dispatch = (method) => (handle, ...rest) => {
+        const { instance, original } = route(handle)
+        return instance.callbackDispatch[method](original, ...rest)
+      }
 
       return {
         'duckdb:component/host-extension-loader': {
@@ -212,12 +224,12 @@ export function createExtensionHost(opts) {
           // (socket-using scalars suspend on async I/O), so await sequentially to
           // preserve row + connection-state ordering. Row i's index is base + i.
           callScalarBatch: async (handle, rows, ctx) => {
-            const ext = route(handle)
+            const { instance, original } = route(handle)
             const base = ctx.rowindex ?? 0n
             const out = []
             for (let i = 0; i < rows.length; i++) {
               out.push(
-                await ext.callbackDispatch.callScalar(handle, rows[i], {
+                await instance.callbackDispatch.callScalar(original, rows[i], {
                   rowindex: base + BigInt(i),
                   iswindow: ctx.iswindow,
                 }),
