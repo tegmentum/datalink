@@ -216,7 +216,10 @@ plumbing + drain, the routing table, load orchestration, compile cache, policy.
 4. sync-vs-async → already solved by dynlink's dual-flavor; mirror, don't unify.
 
 **Refined sequencing (replaces the Risks ordering for Tier 2):**
-1. GATE: bump sqlink wasmtime 45→46 (no shared wasmtime-bound crate compiles otherwise).
+1. GATE — **SATISFIED.** sqlink is already on wasmtime 46.0.1 (confirmed: no 45
+   remnants in toml/lock/submodules incl. tvm-wasm; `sqlink-host` builds clean on 46).
+   The @1.0.0 promotion work bumped it; the "sqlink on 45" note in Risks below is
+   stale. The engine lift (steps 2-4) is unblocked.
 2. Land `ValueModel` + `NeutralType` ALONE (pure data, no wasmtime) + retrofit both
    repos' edge glue onto it. Low risk, independently shippable, immediately useful
    to Tier-1 tooling (shared catalog/type descriptions). **Does NOT need the bump.**
