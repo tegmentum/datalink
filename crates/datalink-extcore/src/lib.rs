@@ -61,6 +61,34 @@ pub trait ExtCore {
     /// arguments, producing a neutral result (or an error message). The
     /// shim has already applied [`NullHandling`] before calling this.
     fn dispatch(idx: usize, args: &[NeutralValue]) -> Result<NeutralValue, String>;
+
+    /// Fold an aggregate group. `idx` is the [`Self::DECLS`] index of an
+    /// [`Aggregate`](datalink_valuemodel::CapabilityKind::Aggregate)
+    /// function; `rows` is the whole buffered group (each inner slice is
+    /// one row's neutral args). Returns the finalized neutral value.
+    ///
+    /// Because the `duckdb:extension` host buffers a group and makes a
+    /// single `call_aggregate`, the entire `init` → `step*` → `finalize`
+    /// fold runs here in one call: the neutral state stays a native Rust
+    /// value and never marshals across the WIT boundary. NULL/empty-group
+    /// handling lives in the core's `step`/`finalize` (the shim passes
+    /// every buffered row through verbatim, matching the hand-written
+    /// aggregates' per-row skip).
+    ///
+    /// The default returns an error so scalar-only cores need not
+    /// implement it; [`declare!`](crate::declare) overrides it for any
+    /// core that declares an `aggregate`.
+    fn dispatch_aggregate(
+        idx: usize,
+        rows: &[&[NeutralValue]],
+    ) -> Result<NeutralValue, String> {
+        let _ = rows;
+        Err(alloc::format!(
+            "{}: function index {} is not an aggregate",
+            Self::NAME,
+            idx
+        ))
+    }
 }
 
 /// Ergonomic neutral-argument extraction for use inside core logic
@@ -123,5 +151,6 @@ impl ArgExt for [NeutralValue] {
 
 mod declare;
 mod shim_duckdb;
+mod shim_duckdb_agg;
 mod shim_embed;
 mod shim_sqlite;

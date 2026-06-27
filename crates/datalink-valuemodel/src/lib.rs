@@ -135,6 +135,14 @@ pub enum NullHandling {
 pub enum CapabilityKind {
     /// A scalar function: N neutral args in, one neutral value out.
     Scalar,
+    /// An aggregate function: folds a group of rows (each row N neutral
+    /// args) into one neutral value. The core declares the fold as a
+    /// neutral `state` type plus `init` / `step` / `finalize`; the
+    /// generated shim composes them per the host's aggregate ABI. On the
+    /// `duckdb:extension` contract the host buffers a group's rows and
+    /// makes ONE `call_aggregate`, so the fold runs entirely in-guest and
+    /// the state never crosses the WIT boundary (no state marshalling).
+    Aggregate,
 }
 
 /// One declared function in an extension's capability table. A
@@ -145,7 +153,8 @@ pub enum CapabilityKind {
 pub struct FnDecl {
     /// The SQL-visible function name (e.g. `"aba_validate"`).
     pub name: &'static str,
-    /// The capability kind. Currently always [`CapabilityKind::Scalar`].
+    /// The capability kind ([`CapabilityKind::Scalar`] or
+    /// [`CapabilityKind::Aggregate`]).
     pub kind: CapabilityKind,
     /// The neutral argument types, in order.
     pub args: &'static [NeutralType],

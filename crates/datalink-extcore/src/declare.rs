@@ -111,6 +111,143 @@ macro_rules! declare {
             ];
         }
     };
+
+    // ---- Mixed scalar + aggregate form (the aggregate tier) ----
+    //
+    // Scalars are declared exactly as above; aggregates add a neutral
+    // `state` type plus an `init` / `step` / `finalize` fold. DECLS lists
+    // all scalars first (kind Scalar), then all aggregates (kind
+    // Aggregate); the generated `dispatch_aggregate` maps a DECLS index to
+    // an aggregate by subtracting the scalar count. The whole fold runs
+    // in one call (the duckdb host buffers a group), so the neutral state
+    // is a native Rust value and never marshals across the boundary.
+    (
+        core = $core:ident;
+        extension = $name:expr;
+        version = $version:expr;
+        $(
+            scalar $sfname:ident ( $($sargt:tt),* ) -> $srett:tt
+                [ $snullh:tt , $sdetkw:ident ]
+                = $sbody:expr ;
+        )*
+        $(
+            aggregate $afname:ident ( $($aargt:tt),* ) -> $arett:tt
+                [ $adetkw:ident ]
+            {
+                state = $astate:ty ;
+                init = $ainit:expr ;
+                step = $astep:expr ;
+                finalize = $afinal:expr ;
+            }
+        )+
+    ) => {
+        /// The generated extension core (one per crate). Carries the
+        /// capability table + neutral dispatch; the duckdb aggregate shim
+        /// is derived from this type alone.
+        pub struct $core;
+
+        impl $crate::ExtCore for $core {
+            const NAME: &'static str = $name;
+            const VERSION: &'static str = $version;
+            const DECLS: &'static [$crate::FnDecl] = &[
+                $(
+                    $crate::FnDecl {
+                        name: ::core::stringify!($sfname),
+                        kind: $crate::CapabilityKind::Scalar,
+                        args: &[ $( $crate::__ntype!($sargt) ),* ],
+                        ret: $crate::__ntype!($srett),
+                        null_handling: $crate::__nullh!($snullh),
+                        deterministic: $crate::__declare_det!($sdetkw),
+                    },
+                )*
+                $(
+                    $crate::FnDecl {
+                        name: ::core::stringify!($afname),
+                        kind: $crate::CapabilityKind::Aggregate,
+                        args: &[ $( $crate::__ntype!($aargt) ),* ],
+                        ret: $crate::__ntype!($arett),
+                        // Aggregates handle NULL per-row inside `step`
+                        // (matching the hand-written `and_then` skip), so
+                        // the shim never pre-filters: declare Called.
+                        null_handling: $crate::NullHandling::Called,
+                        deterministic: $crate::__declare_det!($adetkw),
+                    },
+                )+
+            ];
+
+            fn dispatch(
+                idx: usize,
+                args: &[$crate::NeutralValue],
+            ) -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String> {
+                #[allow(unused_imports)]
+                use $crate::ArgExt as _;
+                let scalars: &[fn(&[$crate::NeutralValue])
+                    -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String>] = &[
+                    $( $sbody ),*
+                ];
+                match scalars.get(idx) {
+                    ::core::option::Option::Some(f) => f(args),
+                    ::core::option::Option::None => ::core::result::Result::Err(
+                        ::alloc::format!("{}: function index {} is not a scalar", $name, idx)
+                    ),
+                }
+            }
+
+            fn dispatch_aggregate(
+                idx: usize,
+                rows: &[&[$crate::NeutralValue]],
+            ) -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String> {
+                #[allow(unused_imports)]
+                use $crate::ArgExt as _;
+                // The number of scalars precedes the aggregates in DECLS;
+                // compute it from the same scalar list dispatch uses so it
+                // can never drift.
+                let scalar_count: usize = {
+                    let scalars: &[fn(&[$crate::NeutralValue])
+                        -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String>] = &[
+                        $( $sbody ),*
+                    ];
+                    scalars.len()
+                };
+                // One fold per declared aggregate, in DECLS (post-scalar)
+                // order. Each composes init -> step* -> finalize entirely
+                // in-guest over the buffered group.
+                let folds: &[fn(&[&[$crate::NeutralValue]])
+                    -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String>] = &[
+                    $(
+                        |rows: &[&[$crate::NeutralValue]]|
+                            -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String>
+                        {
+                            #[allow(unused_imports)]
+                            use $crate::ArgExt as _;
+                            let mut state: $astate = $ainit;
+                            let step = $astep;
+                            for row in rows {
+                                step(&mut state, *row);
+                            }
+                            let finalize = $afinal;
+                            finalize(state)
+                        }
+                    ),+
+                ];
+                match idx.checked_sub(scalar_count).and_then(|a| folds.get(a)) {
+                    ::core::option::Option::Some(f) => f(rows),
+                    ::core::option::Option::None => ::core::result::Result::Err(
+                        ::alloc::format!("{}: function index {} is not an aggregate", $name, idx)
+                    ),
+                }
+            }
+        }
+
+        impl $core {
+            /// NUL-terminated SCALAR function names (DECLS order). Empty for
+            /// a pure-aggregate core. Used by the (deferred) embed shim.
+            #[allow(dead_code)]
+            pub const SCALAR_NAMES_NUL: &'static [&'static [u8]] = &[
+                $( ::core::concat!(::core::stringify!($sfname), "\0").as_bytes() ),*
+            ];
+        }
+    };
 }
 
 /// Map a determinism keyword (`deterministic` / `nondeterministic`) to a
