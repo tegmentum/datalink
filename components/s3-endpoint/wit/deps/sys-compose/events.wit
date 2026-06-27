@@ -1,0 +1,20 @@
+/// Events interface - structured telemetry and logging
+interface events {
+  use types.{event};
+
+  /// Emit a structured event
+  /// Events are collected by the host and can be forwarded to logging/metrics systems
+  emit: func(event: event);
+
+  /// Emit a trace-level event (detailed debugging)
+  trace: func(message: string, context: option<string>);
+
+  /// Emit an info-level event (general information)
+  info: func(message: string, context: option<string>);
+
+  /// Emit a warn-level event (warning condition)
+  warn: func(message: string, context: option<string>);
+
+  /// Emit an error-level event (error condition)
+  error: func(message: string, context: option<string>);
+}

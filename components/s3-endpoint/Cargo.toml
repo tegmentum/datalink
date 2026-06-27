@@ -1,0 +1,43 @@
+[package]
+name = "s3-endpoint"
+version = "0.1.0"
+edition = "2021"
+description = """
+DB-agnostic S3 provider for the compose:dynlink/endpoint contract. Performs
+signed (AWS SigV4) S3 object operations (get/put/delete/head/list/copy) over
+HTTPS (wasi:sockets + pure-Rust rustls TLS) and speaks the uniform message
+endpoint with a CBOR request/response envelope. The S3 signing + transport
+logic is reused from ducklink's s3fs-component; the op surface mirrors
+sqlink's `s3-base` WIT contract so a host can route its native S3 path through
+this provider as a warm-once resident.
+"""
+license = "MIT"
+publish = false
+
+# Detached from any parent workspace — built standalone via
+# `cargo build --release --target wasm32-wasip2` in this dir.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.33"
+# Pure-Rust TLS stack (builds for wasm32-wasip2), identical to the
+# s3fs-component stack we reuse the S3 logic from.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "0.26"
+# SigV4 signing primitives (hand-rolled, no_std-friendly), reused verbatim
+# from s3fs-component/src/sigv4.rs.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+# CBOR request/response envelope.
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+
+[profile.release]
+opt-level = "s"
+lto = true

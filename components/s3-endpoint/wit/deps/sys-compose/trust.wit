@@ -1,0 +1,38 @@
+/// Trust interface - artifact verification and signature checking
+interface trust {
+  use types.{error, digest};
+
+  /// Verification metadata
+  record verification-metadata {
+    /// Signer identity (e.g., key fingerprint, certificate CN)
+    signer: string,
+    /// Timestamp of signature
+    timestamp: option<u64>,
+    /// Verification backend used (e.g., "sigstore", "pgp", "x509")
+    backend: string,
+  }
+
+  /// Verification result
+  record verification-result {
+    /// Whether verification succeeded
+    verified: bool,
+    /// Metadata about the verification
+    metadata: verification-metadata,
+  }
+
+  /// Verify artifact bytes against a digest and optional signature
+  /// Signature format depends on the trust backend
+  verify: func(digest: digest, bytes: list<u8>, signature: option<list<u8>>) -> result<verification-result, error>;
+
+  /// Verify artifact by digest only (lookup from trust store)
+  verify-digest: func(digest: digest) -> result<verification-result, error>;
+
+  /// Check if a digest is in the trusted set (cached verifications)
+  is-trusted: func(digest: digest) -> bool;
+
+  /// Add a digest to the trusted set (admin operation)
+  trust-digest: func(digest: digest, metadata: verification-metadata) -> result<_, error>;
+
+  /// Remove a digest from the trusted set (admin operation)
+  untrust-digest: func(digest: digest) -> result<_, error>;
+}
