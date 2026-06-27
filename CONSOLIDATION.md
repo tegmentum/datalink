@@ -164,3 +164,64 @@ WIT types + a thin `tooling/config` + `Cargo.toml` deps on the `datalink-*` crat
 - Extract the **identity** scheme (witcanon contract digest + content_digest) — the
   one ducklink just finished — as the canonical shared `datalink-identity`, and
   point sqlink's `checksum` at it.
+
+---
+
+## Tier-2 ValueModel spike — verdict (de-risks the engine lift)
+
+A read-only spike across ducklink/sqlink/datalink resolved the Tier-2 gate. Key
+findings (the plan above slightly mis-framed the difficulty):
+
+**Reframing: the dispatch engine does NOT marshal values.** `dispatch_scalar`
+forwards `&[WireValue]` straight into wasmtime bindgen (`call_call_scalar`); the
+real encode/decode (DataChunk↔Duckvalue, sqlite3_value↔SqlValue) lives at the
+SQL-engine **edge glue** — irreducibly DB-specific and *already outside* the shared
+crate. The canonical-ABI lower/lift is bindgen's job. So the engine moves
+`Vec<WireValue>` **opaquely**; the rich-vs-5-class richness lives in associated
+types + edge glue, NOT in the shared dispatch loop.
+
+**Two traits, factoring at different cleanliness:**
+1. `ValueModel` (clean, no wasmtime — the "one genuine abstraction", and the EASY
+   20%): assoc types `WireValue/WireType/DbValue/WireError` + `null/is_null/
+   type_set/is_escape_hatch/db_to_wire/wire_to_db/logical_to_wire`, over a shared
+   DB-agnostic `NeutralType`. **Load-bearing insight: the escape hatch**
+   (DuckDB `complex(string)` ≈ SQLite `wit-value(payload)`) means the engine never
+   enumerates 21-vs-5 arms — the DB owns its arms; extra DuckDB richness is just
+   more entries in *its* closed set + its own edge glue. Cleanly factorable.
+2. `DispatchBinding` (thick, bindgen-coupled — the REAL cost): every `bindgen!`
+   mints distinct nominal types, so the engine can't name the generated world/
+   `call_*`/Host. The DB crate implements the typed call shims + register-capture +
+   the dispatch `Key`. Proven necessary by two in-tree intra-DB conversion shims
+   (ducklink `storage_duckvalue_to_ext`, sqlink `convert_sql_value_to_loaded`).
+
+**Parameterization mirrors `datalink-dynlink` EXACTLY:** `EngineStore<B>` +
+`load_component<B>` + an `impl_datalink_runtime_host!` wiring macro + `HasData`
+store-genericity; the sync/async split copies dynlink's additive dual-flavor
+(`DispatchBinding`/`Engine` sync + `AsyncDispatchBinding`/`AsyncEngine` async).
+Shared: contract guard, WASI+dynlink linker assembly, store scaffold, the
+generalized `CallbackTable<Key>` (today's `CallbackRegistry`), capture-buffer
+plumbing + drain, the routing table, load orchestration, compile cache, policy.
+
+**Four sharp edges (where the real work is):**
+1. the bindgen nominal-type wall → forces the thick `DispatchBinding` (unavoidable).
+2. the **registration/capability surface is a SECOND deep divergence** this plan
+   underweighted (DuckDB resource-handle registries + 11 categories vs SQLite flat
+   free-fns + hooks + authorizer + ~25-method vtab) — do NOT unify; share only
+   scalar/aggregate/table, keep the long tail (vtab/hooks/storage/index/files/cast)
+   DB-private behind `B::Registrations`.
+3. dispatch-key/routing divergence (DuckDB one `u32` handle vs SQLite
+   `(ext,func,context)` + 6-Store coherence routing) → abstract as `B::Key`, keep
+   the Store-selection policy in the DB crate's `route()`; shared piece is just
+   `HashMap<Key, Instance>`.
+4. sync-vs-async → already solved by dynlink's dual-flavor; mirror, don't unify.
+
+**Refined sequencing (replaces the Risks ordering for Tier 2):**
+1. GATE: bump sqlink wasmtime 45→46 (no shared wasmtime-bound crate compiles otherwise).
+2. Land `ValueModel` + `NeutralType` ALONE (pure data, no wasmtime) + retrofit both
+   repos' edge glue onto it. Low risk, independently shippable, immediately useful
+   to Tier-1 tooling (shared catalog/type descriptions). **Does NOT need the bump.**
+3. Lift the SYNC engine (`DispatchBinding` + `EngineStore<B>` + `load_component<B>`
+   + macro); migrate ducklink first (simpler: one handle, one instance, sync).
+4. Add the ASYNC flavor; migrate sqlink (its 6-Store routing + `(ext,func,context)`
+   key stay in its own `route()`/`Key`, as it kept trust/tenant specifics in dynlink).
+5. Leave the capability long tail per-repo; revisit only if a third consumer appears.
