@@ -78,6 +78,11 @@ pub trait ArgExt {
     /// uses a [`NeutralValue::Text`]'s UTF-8 bytes (matching the existing
     /// hand-written `arg_blob` TEXT fallthrough).
     fn arg_blob(&self, i: usize, fname: &str) -> Result<alloc::vec::Vec<u8>, String>;
+    /// Extract a float argument at `i`. Accepts [`NeutralValue::Float64`]
+    /// and widens a [`NeutralValue::Int64`] to `f64` (matching the
+    /// existing hand-written `f64_arg` INTEGER fallthrough used by
+    /// geometric extensions like `geohash`).
+    fn arg_float(&self, i: usize, fname: &str) -> Result<f64, String>;
 }
 
 impl ArgExt for [NeutralValue] {
@@ -104,6 +109,14 @@ impl ArgExt for [NeutralValue] {
             Some(NeutralValue::Blob(b)) => Ok(b.clone()),
             Some(NeutralValue::Text(s)) => Ok(s.as_bytes().to_vec()),
             _ => Err(alloc::format!("{fname}: expected BLOB arg at position {i}")),
+        }
+    }
+
+    fn arg_float(&self, i: usize, fname: &str) -> Result<f64, String> {
+        match self.get(i) {
+            Some(NeutralValue::Float64(f)) => Ok(*f),
+            Some(NeutralValue::Int64(n)) => Ok(*n as f64),
+            _ => Err(alloc::format!("{fname}: expected FLOAT arg at position {i}")),
         }
     }
 }
