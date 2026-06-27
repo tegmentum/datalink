@@ -1,0 +1,14 @@
+[package]
+name = "aba-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `aba` extension (US ABA / bank routing-number checks): the algorithm + the capability declaration, written ONCE. The per-DB shims (ducklink duckdb:extension, sqlink sqlite:extension, sqlink embed) are generated from this declaration by datalink-extcore. Reconciles the pre-pullup drift to the 3-function superset (aba_validate / aba_frb_district / aba_fed_region) so BOTH databases gain the full surface."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "aba_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }

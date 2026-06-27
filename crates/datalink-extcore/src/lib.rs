@@ -1,0 +1,114 @@
+//! Codegen for the extension pull-up.
+//!
+//! Write an extension ONCE — its DB-agnostic logic plus a capability
+//! [`declare!`] table — and generate BOTH the ducklink
+//! (`duckdb:extension`) and sqlink (`sqlite:extension`) shims, instead
+//! of hand-maintaining the same ~8-line algorithm in three places with
+//! three different registration ABIs and value-marshalling conventions.
+//!
+//! # The split
+//!
+//! Per the design pass (#137), the function LOGIC is byte-for-byte
+//! identical across the two ports; ~80-85% of each extension's source is
+//! pure GLUE that varies only in names/arg-ret-types — exactly what a
+//! DECLARATION names. So:
+//!
+//!   * the CORE crate ([`crate::declare!`]) owns the logic + the
+//!     capability table ([`FnDecl`] slice) + a neutral
+//!     [`ExtCore::dispatch`];
+//!   * the SHIM is fully derived by [`duckdb_shim!`] / [`sqlite_shim!`] /
+//!     [`embed_shim!`] from that declaration + the value model.
+//!
+//! # Per-repo WIT parameterization
+//!
+//! The two repos are on different, FROZEN contracts (ducklink
+//! `duckdb:extension@2.2.0` + wit-bindgen 0.41; sqlink
+//! `sqlite:extension@1.0.0` + wit-bindgen 0.44), and each consuming
+//! crate runs its own `wit_bindgen::generate!`. The shim macros are
+//! therefore parameterized by the binding PATHS the consuming crate
+//! exposes — they never hardcode one repo's package/version. Generated
+//! code names only those paths plus this crate's neutral types.
+//!
+//! # The frozen-type-set rule
+//!
+//! The marshalling here targets the FROZEN v1 value arms only. Anything
+//! outside the closed set rides [`NeutralValue::Complex`] →
+//! `complex(type-expr, json)` / `wit-value`. The codegen NEVER emits a
+//! new `duckvalue`/`logicaltype`/`sql-value` arm.
+
+#![no_std]
+
+extern crate alloc;
+
+pub use datalink_valuemodel::{
+    CapabilityKind, FnDecl, NeutralType, NeutralValue, NullHandling,
+};
+
+use alloc::string::String;
+
+/// The contract an extension core implements. `declare!` generates this
+/// impl; the shim macros consume it. Cores are `no_std`-friendly and
+/// never reference any host WIT type.
+pub trait ExtCore {
+    /// The extension name (the manifest/loadresult `name`).
+    const NAME: &'static str;
+    /// The extension version (typically `env!("CARGO_PKG_VERSION")`).
+    const VERSION: &'static str;
+    /// The capability table — the single source of truth both shims read.
+    const DECLS: &'static [FnDecl];
+
+    /// Invoke the function at index `idx` in [`Self::DECLS`] with neutral
+    /// arguments, producing a neutral result (or an error message). The
+    /// shim has already applied [`NullHandling`] before calling this.
+    fn dispatch(idx: usize, args: &[NeutralValue]) -> Result<NeutralValue, String>;
+}
+
+/// Ergonomic neutral-argument extraction for use inside core logic
+/// bodies. These mirror the hand-written `arg_text`/`arg_int`/`arg_blob`
+/// helpers that every extension copy-pasted, lifted to the neutral
+/// value so a core writes them once.
+pub trait ArgExt {
+    /// Extract a text argument at `i`. Accepts [`NeutralValue::Text`];
+    /// decodes a [`NeutralValue::Blob`] as UTF-8 (matching the existing
+    /// hand-written `arg_text` BLOB fallthrough).
+    fn arg_text(&self, i: usize, fname: &str) -> Result<String, String>;
+    /// Extract an integer argument at `i` ([`NeutralValue::Int64`]).
+    fn arg_int(&self, i: usize, fname: &str) -> Result<i64, String>;
+    /// Extract a blob argument at `i`. Accepts [`NeutralValue::Blob`];
+    /// uses a [`NeutralValue::Text`]'s UTF-8 bytes (matching the existing
+    /// hand-written `arg_blob` TEXT fallthrough).
+    fn arg_blob(&self, i: usize, fname: &str) -> Result<alloc::vec::Vec<u8>, String>;
+}
+
+impl ArgExt for [NeutralValue] {
+    fn arg_text(&self, i: usize, fname: &str) -> Result<String, String> {
+        match self.get(i) {
+            Some(NeutralValue::Text(s)) => Ok(s.clone()),
+            Some(NeutralValue::Blob(b)) => String::from_utf8(b.clone())
+                .map_err(|_| alloc::format!("{fname}: BLOB is not valid UTF-8")),
+            // Matches ducklink aba's `arg_text`: NULL coerces to "".
+            Some(NeutralValue::Null) => Ok(String::new()),
+            _ => Err(alloc::format!("{fname}: expected TEXT arg at position {i}")),
+        }
+    }
+
+    fn arg_int(&self, i: usize, fname: &str) -> Result<i64, String> {
+        match self.get(i) {
+            Some(NeutralValue::Int64(n)) => Ok(*n),
+            _ => Err(alloc::format!("{fname}: expected INTEGER arg at position {i}")),
+        }
+    }
+
+    fn arg_blob(&self, i: usize, fname: &str) -> Result<alloc::vec::Vec<u8>, String> {
+        match self.get(i) {
+            Some(NeutralValue::Blob(b)) => Ok(b.clone()),
+            Some(NeutralValue::Text(s)) => Ok(s.as_bytes().to_vec()),
+            _ => Err(alloc::format!("{fname}: expected BLOB arg at position {i}")),
+        }
+    }
+}
+
+mod declare;
+mod shim_duckdb;
+mod shim_embed;
+mod shim_sqlite;

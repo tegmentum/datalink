@@ -1,0 +1,14 @@
+[package]
+name = "datalink-extcore"
+version = "0.1.0"
+edition = "2021"
+description = "Codegen for the extension pull-up: the declare! macro (an extension core names its capability table once — name/kind/args:[NeutralType]/ret/null_handling/deterministic) plus the per-DB shim generators duckdb_shim! / sqlite_shim! / embed_shim! that expand that one declaration into the full registration ABI + value marshalling for ducklink (duckdb:extension), sqlink (sqlite:extension), and sqlink's static embed path. Parameterized by each repo's WIT binding paths so it works across the @2.2.0 / @1.0.0 contract skew. Built on datalink-valuemodel; no wasmtime (cores never touch the linker)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "datalink_extcore"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-valuemodel = { path = "../datalink-valuemodel" }

@@ -1,0 +1,13 @@
+[package]
+name = "datalink-valuemodel"
+version = "0.1.0"
+edition = "2021"
+description = "Database-agnostic neutral value model for the extension-pullup codegen: NeutralType (the closed scalar type set targeted by the FROZEN v1 ducklink/sqlink WIT contracts) plus a neutral Value, with a single complex() escape hatch that maps to DuckDB complex(type-expr,json) and SQLite wit-value. Used by extension cores to declare a capability table once; the per-DB shims (duckdb/sqlite) are codegen'd from it. Intentionally dependency-light (no_std + alloc, no wasmtime, no serde): extension cores never touch the linker."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "datalink_valuemodel"
+path = "src/lib.rs"
+
+[dependencies]
