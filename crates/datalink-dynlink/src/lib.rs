@@ -63,6 +63,22 @@ pub mod provider {
     });
 }
 
+/// Async-flavor bindings for instantiating a *provider* component. Identical
+/// WIT/world to [`provider`], but bindgen generates `instantiate_async` and an
+/// `async` `endpoint.handle` export call, so an async host (sqlink) can warm
+/// and drive a resident provider without blocking. Mirrors sqlink's own
+/// `dynlink_provider` bindgen (`imports`/`exports: { default: async }`). The
+/// sync [`provider`] above is untouched; the resident-over-async backend uses
+/// THIS module.
+pub mod provider_async {
+    wasmtime::component::bindgen!({
+        path: "wit/compose-dynlink",
+        world: "dynlink-provider",
+        imports: { default: async },
+        exports: { default: async },
+    });
+}
+
 /// Async-flavor bindings for the guest-facing `compose:dynlink/linker`
 /// import. Identical WIT and world to [`bindings`], but bindgen generates
 /// `async fn` Host methods (`imports: { default: async }`) so an async host
@@ -114,6 +130,16 @@ pub fn async_err(code: AsyncErrorCode, message: impl Into<String>) -> AsyncError
 pub fn lower_provider_error(e: provider::sys::compose::types::Error) -> Error {
     Error {
         code: ErrorCode::ExecTrap,
+        message: format!("provider endpoint error: {}", e.message),
+        context: e.context,
+    }
+}
+
+/// Lower an async-flavor provider-side endpoint error (a distinct generated
+/// Rust type with identical shape) into the guest-facing [`AsyncError`].
+pub fn lower_provider_error_async(e: provider_async::sys::compose::types::Error) -> AsyncError {
+    AsyncError {
+        code: AsyncErrorCode::ExecTrap,
         message: format!("provider endpoint error: {}", e.message),
         context: e.context,
     }
@@ -882,6 +908,335 @@ fn invoke_resident(
     result.map_err(lower_provider_error)
 }
 
+// ===========================================================================
+// AsyncResidentBackend — the async-flavor analog of ResidentBackend.
+//
+// Instantiate a registered `dynlink-provider` component ONCE (lazily, on first
+// resolve) into a single resident store, and reuse it across every
+// resolve/invoke — "one heavy provider serving many guests" — but over the
+// ASYNC bridge ([`AsyncProviderBackend`]). This is the enabler for resident
+// S3/HTTP providers on a fully-async host (sqlink): warm the provider once,
+// then route every host S3/HTTP call through it at native-like throughput.
+//
+// Why a SEPARATE registry from the sync [`ProviderRegistry`]: the async store
+// is driven by `instantiate_async` / an async `call_handle`, which cross
+// `.await` points. The single resident Store therefore lives behind a
+// `tokio::sync::Mutex` (held across those awaits to serialize the one Store),
+// and instantiation uses the async [`provider_async`] bindings. The sync
+// registry's `std::sync::Mutex<Store>` could not be held across an await.
+// ===========================================================================
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use tokio::sync::Mutex as AsyncMutex;
+
+/// A resident, async-instantiated provider. Materialized ONCE and shared across
+/// every resolve/invoke. Holds its own store so calls never touch a guest's
+/// store. Guarded by an [`AsyncMutex`] (in [`AsyncSlot`]) so the single Store is
+/// serialized across the async `instantiate`/`call_handle` awaits.
+struct AsyncResidentProvider {
+    store: Store<ProviderState>,
+    instance: provider_async::DynlinkProvider,
+}
+
+/// The lazily-materialized state for one provider id: the compiled component +
+/// preopens needed to instantiate, plus the resident instance once warmed. The
+/// whole slot sits behind an [`AsyncMutex`] so materialization and every invoke
+/// (which mutably drive the one Store) are serialized without blocking the
+/// async runtime.
+struct AsyncSlot {
+    engine: Engine,
+    component: Component,
+    path: PathBuf,
+    preopens: Vec<ProviderPreopen>,
+    /// `Some(..)` once instantiated; reused across all subsequent
+    /// resolves/invokes (the warm-once shared model).
+    resident: Option<AsyncResidentProvider>,
+}
+
+/// Per-id registration record for the async registry. `slot` carries the
+/// materialization inputs + the warmed instance behind an async mutex;
+/// `materialized` + `handle_count` are lock-free counters so test/inspection
+/// helpers never have to take the (possibly in-use) slot lock.
+struct AsyncProviderEntry {
+    slot: Arc<AsyncMutex<AsyncSlot>>,
+    materialized: Arc<AtomicBool>,
+    handle_count: Arc<AtomicU64>,
+}
+
+struct AsyncRegistryInner {
+    engine: Engine,
+    providers: HashMap<String, AsyncProviderEntry>,
+    digest_to_id: HashMap<Vec<u8>, String>,
+}
+
+/// The async provider registry: the wasm engine plus an `id -> AsyncProviderEntry`
+/// map. The engine drives async instantiation/calls (the wasmtime 46 component
+/// model is async-capable by default). Cloneable (`Arc`-shared) so it can be both
+/// the registration surface AND the [`AsyncResidentBackend`]'s shared state.
+#[derive(Clone)]
+pub struct AsyncProviderRegistry {
+    inner: Arc<Mutex<AsyncRegistryInner>>,
+}
+
+impl AsyncProviderRegistry {
+    /// Create a registry over a component-model engine (build it with
+    /// `Config::wasm_component_model(true)`).
+    pub fn new(engine: Engine) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(AsyncRegistryInner {
+                engine,
+                providers: HashMap::new(),
+                digest_to_id: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Register a `dynlink-provider`-world wasm component under `id`, compiling
+    /// it now (async instantiation is deferred to first resolve).
+    pub fn register_provider(
+        &self,
+        id: impl Into<String>,
+        path: impl Into<PathBuf>,
+    ) -> Result<(), String> {
+        self.register_provider_with_preopens(id, path, Vec::new())
+    }
+
+    /// Register a `dynlink-provider`-world wasm component under `id`, with
+    /// directories preopened into its OWN store on materialization.
+    pub fn register_provider_with_preopens(
+        &self,
+        id: impl Into<String>,
+        path: impl Into<PathBuf>,
+        preopens: Vec<ProviderPreopen>,
+    ) -> Result<(), String> {
+        let id = id.into();
+        let path = path.into();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let component = Component::from_binary(&inner.engine, &bytes)
+            .map_err(|e| format!("compile provider {}: {e}", path.display()))?;
+        let engine = inner.engine.clone();
+        inner.providers.insert(
+            id,
+            AsyncProviderEntry {
+                slot: Arc::new(AsyncMutex::new(AsyncSlot {
+                    engine,
+                    component,
+                    path,
+                    preopens,
+                    resident: None,
+                })),
+                materialized: Arc::new(AtomicBool::new(false)),
+                handle_count: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        Ok(())
+    }
+
+    /// Map a content digest to a previously-registered id (so
+    /// `resolve-by-digest` can reuse the same resident provider).
+    pub fn register_digest(&self, digest: Vec<u8>, id: impl Into<String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.digest_to_id.insert(digest, id.into());
+    }
+
+    /// How many resident (instantiated-once) providers exist for `id` (0 or 1).
+    /// Lock-free — reads the `materialized` flag, never the slot — so it is safe
+    /// to call while the provider is mid-invoke. Used to assert ONE instance
+    /// backs N resolves.
+    pub fn resident_count(&self, id: &str) -> usize {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .providers
+            .get(id)
+            .map(|e| usize::from(e.materialized.load(AtomicOrdering::SeqCst)))
+            .unwrap_or(0)
+    }
+
+    /// How many live `instance` handles point at `id`'s resident provider.
+    pub fn handle_count(&self, id: &str) -> u64 {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .providers
+            .get(id)
+            .map(|e| e.handle_count.load(AtomicOrdering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// Look up the per-id slot + counters, cloning the cheap `Arc`s out from
+    /// under the (synchronous) registry lock so the caller can `.await` on the
+    /// slot WITHOUT holding the std mutex across the await.
+    fn entry_handles(
+        &self,
+        id: &str,
+    ) -> Option<(Arc<AsyncMutex<AsyncSlot>>, Arc<AtomicBool>, Arc<AtomicU64>)> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .providers
+            .get(id)
+            .map(|e| (e.slot.clone(), e.materialized.clone(), e.handle_count.clone()))
+    }
+
+    fn digest_id(&self, digest: &[u8]) -> Option<String> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.digest_to_id.get(digest).cloned()
+    }
+}
+
+/// The opaque handle an [`AsyncResidentBackend`] remembers for each resolved
+/// `instance`. It does NOT own the provider — the resident provider lives in the
+/// shared slot. The handle remembers WHICH id it resolved plus cheap `Arc`s to
+/// that id's slot + handle counter, so `invoke`/`on_drop` never re-take the
+/// registry lock.
+#[derive(Clone)]
+pub struct AsyncResidentHandle {
+    id: String,
+    slot: Arc<AsyncMutex<AsyncSlot>>,
+    handle_count: Arc<AtomicU64>,
+}
+
+/// The async resident provider lifecycle: instantiate a registered provider
+/// ONCE (lazily, on first resolve) into a single resident store, and reuse it
+/// across every resolve/invoke — the async analog of [`ResidentBackend`], for a
+/// fully-async host (sqlink). This is the backend that makes resident S3/HTTP
+/// component providers possible: warm once, route every host I/O call through
+/// the same instance. Wraps an [`AsyncProviderRegistry`].
+#[derive(Clone)]
+pub struct AsyncResidentBackend {
+    registry: AsyncProviderRegistry,
+}
+
+impl AsyncResidentBackend {
+    pub fn new(registry: AsyncProviderRegistry) -> Self {
+        Self { registry }
+    }
+
+    /// Access the shared registry (e.g. to inspect `resident_count`).
+    pub fn registry(&self) -> &AsyncProviderRegistry {
+        &self.registry
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncProviderBackend for AsyncResidentBackend {
+    type Handle = AsyncResidentHandle;
+
+    async fn resolve_by_id(&self, id: &str) -> Result<Self::Handle, AsyncError> {
+        let (slot, materialized, handle_count) = self.registry.entry_handles(id).ok_or_else(|| {
+            async_err(AsyncErrorCode::InvalidInput, format!("unknown provider id: {id}"))
+        })?;
+        // Materialize ONCE under the slot's async lock (held across the
+        // instantiate await — the std registry lock was already released).
+        {
+            let mut guard = slot.lock().await;
+            if guard.resident.is_none() {
+                materialize_resident_async(&mut guard, id).await?;
+                materialized.store(true, AtomicOrdering::SeqCst);
+                eprintln!(
+                    "[compose-dynlink] async resident provider '{}' instantiated ONCE from {} (shared across resolves)",
+                    id,
+                    guard.path.display()
+                );
+            } else {
+                eprintln!(
+                    "[compose-dynlink] async resolve '{id}' reuses the existing resident provider (1 instance)"
+                );
+            }
+        }
+        handle_count.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(AsyncResidentHandle {
+            id: id.to_string(),
+            slot,
+            handle_count,
+        })
+    }
+
+    async fn resolve_by_digest(&self, d: &[u8]) -> Result<Self::Handle, AsyncError> {
+        match self.registry.digest_id(d) {
+            Some(id) => self.resolve_by_id(&id).await,
+            None => Err(async_err(
+                AsyncErrorCode::NotImplemented,
+                "resolve-by-digest: no digest->id mapping registered (use register_digest)",
+            )),
+        }
+    }
+
+    async fn invoke(
+        &self,
+        handle: &Self::Handle,
+        method: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, AsyncError> {
+        let mut guard = handle.slot.lock().await;
+        let resident = guard.resident.as_mut().ok_or_else(|| {
+            async_err(
+                AsyncErrorCode::InternalError,
+                format!("provider '{}' not resident", handle.id),
+            )
+        })?;
+        // Split the &mut borrow across the two fields so the endpoint accessor
+        // (borrows `instance`) and the call (borrows `store`) don't conflict.
+        let AsyncResidentProvider { store, instance } = resident;
+        let result = instance
+            .compose_dynlink_endpoint()
+            .call_handle(&mut *store, method, payload)
+            .await
+            .map_err(|e| {
+                async_err(
+                    AsyncErrorCode::ExecTrap,
+                    format!("provider '{}' handle trapped: {e:?}", handle.id),
+                )
+            })?;
+        result.map_err(lower_provider_error_async)
+    }
+
+    async fn on_drop(&self, handle: &Self::Handle) {
+        let prev = handle.handle_count.load(AtomicOrdering::SeqCst);
+        if prev > 0 {
+            handle.handle_count.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
+    }
+}
+
+/// Materialize (instantiate ONCE via the async bindings) the resident provider
+/// inside an already-locked slot.
+async fn materialize_resident_async(slot: &mut AsyncSlot, id: &str) -> Result<(), AsyncError> {
+    let mut linker: Linker<ProviderState> = Linker::new(&slot.engine);
+    // Sync WASI host impls run inline on the async store (matches sqlink's
+    // resident provider wiring); the provider's own logic is driven async.
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+        .map_err(|e| async_err(AsyncErrorCode::EmitLinkError, format!("provider wasi linker: {e}")))?;
+    let mut builder = WasiCtxBuilder::new();
+    builder.inherit_stdio();
+    for po in &slot.preopens {
+        builder
+            .preopened_dir(&po.host, &po.guest, DirPerms::all(), FilePerms::all())
+            .map_err(|e| {
+                async_err(
+                    AsyncErrorCode::InvalidInput,
+                    format!(
+                        "provider '{id}': preopen {} -> {}: {e}",
+                        po.host.display(),
+                        po.guest
+                    ),
+                )
+            })?;
+    }
+    let state = ProviderState {
+        wasi: builder.build(),
+        table: WasiResourceTable::new(),
+    };
+    let mut store = Store::new(&slot.engine, state);
+    let instance =
+        provider_async::DynlinkProvider::instantiate_async(&mut store, &slot.component, &linker)
+            .await
+            .map_err(|e| {
+                async_err(AsyncErrorCode::ExecTrap, format!("instantiate provider '{id}': {e:?}"))
+            })?;
+    slot.resident = Some(AsyncResidentProvider { store, instance });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,5 +1439,109 @@ mod tests {
             Err(e) => assert!(matches!(e.code, ErrorCode::NotImplemented)),
             Ok(_) => panic!("unmapped digest must not resolve"),
         }
+    }
+
+    #[tokio::test]
+    async fn async_resident_backend_reports_digest_unmapped() {
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config).expect("engine");
+        let registry = AsyncProviderRegistry::new(engine);
+        let backend = AsyncResidentBackend::new(registry);
+        match backend.resolve_by_digest(&[0u8; 32]).await {
+            Err(e) => assert!(matches!(e.code, AsyncErrorCode::NotImplemented)),
+            Ok(_) => panic!("unmapped digest must not resolve"),
+        }
+    }
+
+    /// Path to the framework's prebuilt `dynlink_echo_provider.wasm` (a real
+    /// `compose:dynlink/endpoint` provider). The async-resident warm-once test
+    /// skips gracefully if it isn't built (mirrors ducklink's sync dlopen test).
+    fn echo_provider_wasm() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home).join(
+            "git/webassembly-component-orchestration/examples/dynlink-echo-provider/target/wasm32-wasip2/release/dynlink_echo_provider.wasm",
+        )
+    }
+
+    /// The headline Part-1 proof: an in-process ASYNC resident backend warms a
+    /// real wasm provider ONCE and reuses it across multiple resolves/invokes —
+    /// the async analog of ducklink's sync resident proof, and the property the
+    /// resident S3/HTTP migration depends on.
+    #[tokio::test]
+    async fn async_resident_warm_once_reuse() {
+        let provider = echo_provider_wasm();
+        if !provider.exists() {
+            eprintln!(
+                "skipping async_resident_warm_once_reuse: prebuilt provider not found ({})",
+                provider.display()
+            );
+            return;
+        }
+
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config).expect("engine");
+
+        let registry = AsyncProviderRegistry::new(engine);
+        registry
+            .register_provider("echo", &provider)
+            .expect("register echo provider");
+        // Not materialized until the first resolve.
+        assert_eq!(registry.resident_count("echo"), 0, "lazy: no instance pre-resolve");
+
+        let backend = AsyncResidentBackend::new(registry.clone());
+        let bridge = AsyncDynLinkBridge::new(backend);
+        // The handle table lives "in the store" (here a local), threaded into
+        // every routed call — exactly sqlink's seam.
+        let mut table = ResourceTable::new();
+
+        // resolve #1 -> materializes the resident provider ONCE.
+        let h1 = bridge
+            .resolve_by_id(&mut table, "echo".to_string())
+            .await
+            .expect("resolve #1");
+        assert_eq!(registry.resident_count("echo"), 1, "one resident after first resolve");
+        assert_eq!(registry.handle_count("echo"), 1, "one live handle");
+
+        let up = bridge
+            .invoke(
+                &mut table,
+                Resource::new_own(h1.rep()),
+                "upper".to_string(),
+                b"hello from async dlopen".to_vec(),
+            )
+            .await
+            .expect("invoke upper #1");
+        assert_eq!(up, b"HELLO FROM ASYNC DLOPEN");
+
+        // resolve #2 -> REUSES the same resident instance (warm-once shared).
+        let h2 = bridge
+            .resolve_by_id(&mut table, "echo".to_string())
+            .await
+            .expect("resolve #2");
+        assert_eq!(
+            registry.resident_count("echo"),
+            1,
+            "warm-once: STILL one resident across two resolves"
+        );
+        assert_eq!(registry.handle_count("echo"), 2, "two live handles, one instance");
+
+        let echoed = bridge
+            .invoke(
+                &mut table,
+                Resource::new_own(h2.rep()),
+                "echo".to_string(),
+                b"abc".to_vec(),
+            )
+            .await
+            .expect("invoke echo #2");
+        assert_eq!(echoed, b"abc", "second handle drives the SAME resident instance");
+
+        // Drop both handles -> count returns to zero, instance stays resident.
+        bridge.drop_handle(&mut table, h1).await.expect("drop h1");
+        bridge.drop_handle(&mut table, h2).await.expect("drop h2");
+        assert_eq!(registry.handle_count("echo"), 0, "handles released on drop");
+        assert_eq!(registry.resident_count("echo"), 1, "resident instance persists after drops");
     }
 }

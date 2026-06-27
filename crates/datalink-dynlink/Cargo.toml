@@ -18,6 +18,13 @@ wasmtime-wasi = "46.0.1"
 # shared bridge needs an async variant. The sync flavor (ducklink) never
 # touches this dependency.
 async-trait = "0.1"
+# Async resident backend: an async-aware mutex held ACROSS `.await` points
+# (the resident store's `instantiate_async` / `call_handle` futures) so a
+# resident provider's single Store is serialized without blocking the runtime.
+# Only the `sync` feature is pulled (no tokio runtime/net); sqlink (the async
+# consumer) already runs on a tokio runtime. The sync flavor (ducklink) never
+# touches this dependency.
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
