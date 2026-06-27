@@ -948,6 +948,15 @@ struct AsyncSlot {
     component: Component,
     path: PathBuf,
     preopens: Vec<ProviderPreopen>,
+    /// Whether the provider's OWN store is granted outbound network egress
+    /// (TCP + IP name lookup) on materialization. A provider that reaches the
+    /// network from inside wasm — e.g. the `s3-endpoint` provider, which signs
+    /// and sends S3 requests over `wasi:sockets` + rustls — needs this; a
+    /// pure-compute provider (pylon, echo) does not. Off by default, so the
+    /// host opts a provider into egress explicitly (the network grant the host
+    /// supplies to the provider store; the host's policy gate stays upstream of
+    /// the invoke, not here).
+    network: bool,
     /// `Some(..)` once instantiated; reused across all subsequent
     /// resolves/invokes (the warm-once shared model).
     resident: Option<AsyncResidentProvider>,
@@ -1002,12 +1011,42 @@ impl AsyncProviderRegistry {
     }
 
     /// Register a `dynlink-provider`-world wasm component under `id`, with
-    /// directories preopened into its OWN store on materialization.
+    /// directories preopened into its OWN store on materialization (no network
+    /// grant).
     pub fn register_provider_with_preopens(
         &self,
         id: impl Into<String>,
         path: impl Into<PathBuf>,
         preopens: Vec<ProviderPreopen>,
+    ) -> Result<(), String> {
+        self.register_provider_with_options(id, path, preopens, false)
+    }
+
+    /// Register a `dynlink-provider`-world wasm component under `id`, granting
+    /// its OWN store outbound network egress (TCP + IP name lookup) on
+    /// materialization. This is the registration the resident `s3-endpoint` /
+    /// HTTP providers use: they reach the network from inside wasm
+    /// (`wasi:sockets` + rustls), so the host supplies the egress capability to
+    /// the provider store here. The host's capability/policy gate stays UPSTREAM
+    /// of the invoke (it is not moved into the provider).
+    pub fn register_provider_with_network(
+        &self,
+        id: impl Into<String>,
+        path: impl Into<PathBuf>,
+    ) -> Result<(), String> {
+        self.register_provider_with_options(id, path, Vec::new(), true)
+    }
+
+    /// Register a `dynlink-provider`-world wasm component under `id`, with
+    /// directories preopened into its OWN store and an explicit `network` egress
+    /// grant. `register_provider_with_preopens` / `register_provider_with_network`
+    /// are the common-case wrappers.
+    pub fn register_provider_with_options(
+        &self,
+        id: impl Into<String>,
+        path: impl Into<PathBuf>,
+        preopens: Vec<ProviderPreopen>,
+        network: bool,
     ) -> Result<(), String> {
         let id = id.into();
         let path = path.into();
@@ -1024,6 +1063,7 @@ impl AsyncProviderRegistry {
                     component,
                     path,
                     preopens,
+                    network,
                     resident: None,
                 })),
                 materialized: Arc::new(AtomicBool::new(false)),
@@ -1208,6 +1248,14 @@ async fn materialize_resident_async(slot: &mut AsyncSlot, id: &str) -> Result<()
         .map_err(|e| async_err(AsyncErrorCode::EmitLinkError, format!("provider wasi linker: {e}")))?;
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
+    if slot.network {
+        // The host supplies outbound network egress to THIS provider's store
+        // (the s3-endpoint / HTTP providers sign+send over wasi:sockets+rustls).
+        builder
+            .inherit_network()
+            .allow_ip_name_lookup(true)
+            .allow_tcp(true);
+    }
     for po in &slot.preopens {
         builder
             .preopened_dir(&po.host, &po.guest, DirPerms::all(), FilePerms::all())
@@ -1543,5 +1591,166 @@ mod tests {
         bridge.drop_handle(&mut table, h2).await.expect("drop h2");
         assert_eq!(registry.handle_count("echo"), 0, "handles released on drop");
         assert_eq!(registry.resident_count("echo"), 1, "resident instance persists after drops");
+    }
+
+    /// Path to the in-repo `s3-endpoint` provider wasm (built by
+    /// `components/s3-endpoint/build.sh`). The resident-S3 test skips gracefully
+    /// if it isn't built yet.
+    fn s3_endpoint_wasm() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/s3-endpoint/target/wasm32-wasip2/release/s3_endpoint.wasm")
+    }
+
+    /// Encode a CBOR map of `(key, value)` text/value pairs.
+    fn cbor_map(pairs: Vec<(&str, ciborium::value::Value)>) -> Vec<u8> {
+        use ciborium::value::Value;
+        let v = Value::Map(
+            pairs
+                .into_iter()
+                .map(|(k, val)| (Value::Text(k.to_string()), val))
+                .collect(),
+        );
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&v, &mut out).unwrap();
+        out
+    }
+
+    /// The resident-S3 proof: register the REAL `s3-endpoint` provider with a
+    /// network grant, warm it ONCE through the `AsyncResidentBackend`, and drive
+    /// its `sign` op (offline, deterministic) across multiple resolves —
+    /// asserting one resident instance backs N calls and that the SigV4 output
+    /// matches AWS's published "GET Object" vector. This is the end-to-end
+    /// enabler proof for routing a host's native S3 path through a resident
+    /// provider.
+    #[tokio::test]
+    async fn async_resident_s3_endpoint_sign_warm_once() {
+        use ciborium::value::Value;
+
+        let provider = s3_endpoint_wasm();
+        if !provider.exists() {
+            eprintln!(
+                "skipping async_resident_s3_endpoint_sign_warm_once: provider not built ({})",
+                provider.display()
+            );
+            return;
+        }
+
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config).expect("engine");
+
+        let registry = AsyncProviderRegistry::new(engine);
+        // Network-granted registration — the egress wiring a host supplies to
+        // the resident S3 provider's store.
+        registry
+            .register_provider_with_network("s3", &provider)
+            .expect("register s3-endpoint provider");
+        assert_eq!(registry.resident_count("s3"), 0, "lazy: not materialized pre-resolve");
+
+        let backend = AsyncResidentBackend::new(registry.clone());
+        let bridge = AsyncDynLinkBridge::new(backend);
+        let mut table = ResourceTable::new();
+
+        // resolve #1 -> warms the resident provider ONCE.
+        let h1 = bridge
+            .resolve_by_id(&mut table, "s3".to_string())
+            .await
+            .expect("resolve #1");
+        assert_eq!(registry.resident_count("s3"), 1, "one resident after first resolve");
+
+        // The AWS doc "GET Object" SigV4 vector, driven through the resident
+        // provider's `sign` (dry-run) op over the CBOR envelope.
+        let endpoint = Value::Map(vec![
+            (Value::Text("url".into()), Value::Text("https://s3.amazonaws.com".into())),
+            (Value::Text("region".into()), Value::Text("us-east-1".into())),
+            (Value::Text("path_style".into()), Value::Bool(false)),
+        ]);
+        let creds = Value::Map(vec![
+            (Value::Text("access_key_id".into()), Value::Text("AKIAIOSFODNN7EXAMPLE".into())),
+            (
+                Value::Text("secret_access_key".into()),
+                Value::Text("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into()),
+            ),
+            (Value::Text("session_token".into()), Value::Null),
+        ]);
+        let sign_req = cbor_map(vec![
+            ("method", Value::Text("GET".into())),
+            ("endpoint", endpoint),
+            ("credentials", creds),
+            ("bucket", Value::Text("examplebucket".into())),
+            ("key", Value::Text("test.txt".into())),
+            (
+                "extra_headers",
+                Value::Array(vec![Value::Array(vec![
+                    Value::Text("range".into()),
+                    Value::Text("bytes=0-9".into()),
+                ])]),
+            ),
+            ("amz_date", Value::Text("20130524T000000Z".into())),
+        ]);
+
+        let resp_bytes = bridge
+            .invoke(
+                &mut table,
+                Resource::new_own(h1.rep()),
+                "sign".to_string(),
+                sign_req.clone(),
+            )
+            .await
+            .expect("invoke sign #1");
+        let resp: Value = ciborium::de::from_reader(&*resp_bytes).unwrap();
+        let field = |v: &Value, k: &str| -> Option<String> {
+            if let Value::Map(m) = v {
+                for (key, val) in m {
+                    if matches!(key, Value::Text(s) if s == k) {
+                        if let Value::Text(s) = val {
+                            return Some(s.clone());
+                        }
+                    }
+                }
+            }
+            None
+        };
+        let authz = field(&resp, "authorization").expect("authorization in sign response");
+        assert!(
+            authz.contains(
+                "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+            ),
+            "resident s3-endpoint SigV4 vector mismatch: {authz}"
+        );
+        assert_eq!(
+            field(&resp, "url").as_deref(),
+            Some("https://examplebucket.s3.amazonaws.com/test.txt")
+        );
+
+        // resolve #2 -> REUSES the same resident instance (warm-once shared).
+        let h2 = bridge
+            .resolve_by_id(&mut table, "s3".to_string())
+            .await
+            .expect("resolve #2");
+        assert_eq!(
+            registry.resident_count("s3"),
+            1,
+            "warm-once: STILL one resident across two resolves"
+        );
+        assert_eq!(registry.handle_count("s3"), 2, "two handles, one instance");
+
+        // A second op through the second handle hits the SAME resident store.
+        let manifest = bridge
+            .invoke(
+                &mut table,
+                Resource::new_own(h2.rep()),
+                "manifest".to_string(),
+                Vec::new(),
+            )
+            .await
+            .expect("invoke manifest #2");
+        let mv: Value = ciborium::de::from_reader(&*manifest).unwrap();
+        assert_eq!(field(&mv, "name").as_deref(), Some("s3-endpoint"));
+
+        bridge.drop_handle(&mut table, h1).await.expect("drop h1");
+        bridge.drop_handle(&mut table, h2).await.expect("drop h2");
+        assert_eq!(registry.handle_count("s3"), 0, "handles released");
+        assert_eq!(registry.resident_count("s3"), 1, "resident persists after drops");
     }
 }

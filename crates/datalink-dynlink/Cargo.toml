@@ -28,3 +28,6 @@ tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+# Build the CBOR sign-request envelope for the resident s3-endpoint provider
+# integration test (drives the real provider through the async bridge).
+ciborium = "0.2"
