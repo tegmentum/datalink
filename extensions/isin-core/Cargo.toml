@@ -1,0 +1,14 @@
+[package]
+name = "isin-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `isin` extension (ISIN / ISO 6166 securities identifier checks + field extraction): the algorithm + the capability declaration, written ONCE. The per-DB shims (ducklink duckdb:extension, sqlink sqlite:extension, sqlink embed) are generated from this declaration by datalink-extcore. The ducklink and sqlink ports already shared the exact 4-function surface (isin_validate / isin_check_digit / isin_country / isin_nsin) and the same expand+Luhn algorithm, so this is a zero-drift pull-up."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "isin_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
