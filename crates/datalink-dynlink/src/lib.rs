@@ -1242,10 +1242,22 @@ impl AsyncProviderBackend for AsyncResidentBackend {
 /// inside an already-locked slot.
 async fn materialize_resident_async(slot: &mut AsyncSlot, id: &str) -> Result<(), AsyncError> {
     let mut linker: Linker<ProviderState> = Linker::new(&slot.engine);
-    // Sync WASI host impls run inline on the async store (matches sqlink's
-    // resident provider wiring); the provider's own logic is driven async.
-    wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-        .map_err(|e| async_err(AsyncErrorCode::EmitLinkError, format!("provider wasi linker: {e}")))?;
+    // WASI host impls. A network-granted provider does real socket I/O from
+    // inside wasm (wasi:sockets), whose host ops suspend on wasi:io/poll — so it
+    // needs the ASYNC WASI linker: the socket futures are awaited through the
+    // component call (call_handle().await) with no nested `block_on`. (The sync
+    // WASI linker's socket ops call `block_on` internally, which panics when the
+    // provider is driven from an async runtime.) A pure-compute provider
+    // (pylon, echo) keeps the sync WASI linker — it never suspends.
+    if slot.network {
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| {
+            async_err(AsyncErrorCode::EmitLinkError, format!("provider async wasi linker: {e}"))
+        })?;
+    } else {
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| {
+            async_err(AsyncErrorCode::EmitLinkError, format!("provider wasi linker: {e}"))
+        })?;
+    }
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
     if slot.network {
@@ -1637,6 +1649,8 @@ mod tests {
 
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
+        // Network providers use the async WASI linker (awaited socket futures).
+        config.async_support(true);
         let engine = Engine::new(&config).expect("engine");
 
         let registry = AsyncProviderRegistry::new(engine);
