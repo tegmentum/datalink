@@ -1,0 +1,37 @@
+[package]
+name = "http-endpoint"
+version = "0.1.0"
+edition = "2021"
+description = """
+DB-agnostic HTTP provider for the compose:dynlink/endpoint contract. Performs
+plain HTTP/HTTPS requests over wasi:sockets + pure-Rust rustls TLS (the proven
+transport from the sibling s3-endpoint provider, minus SigV4 signing) and
+speaks the uniform message endpoint with a CBOR request/response envelope. The
+request/response shape mirrors sqlink's `http` host SPI field-for-field so a
+host can route its native reqwest HTTP path through this as a warm-once
+resident provider.
+"""
+license = "MIT"
+publish = false
+
+# Detached from any parent workspace — built standalone via
+# `cargo build --release --target wasm32-wasip2` in this dir.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.33"
+# Pure-Rust TLS stack (builds for wasm32-wasip2), same as s3-endpoint.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "0.26"
+# CBOR request/response envelope.
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+
+[profile.release]
+opt-level = "s"
+lto = true

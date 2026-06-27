@@ -1,0 +1,25 @@
+/// Emit interface - composition and artifact generation
+interface emit {
+  use types.{error, digest};
+  use plan.{plan-v1};
+
+  /// Composition result
+  record composition-result {
+    /// Digest of the composed artifact
+    digest: digest,
+    /// Size in bytes
+    size: u64,
+    /// Emit cache key for reproducibility
+    emit-key: digest,
+  }
+
+  /// Compose components according to plan and emit a single artifact
+  /// Returns the digest of the composed component
+  compose: func(plan: plan-v1) -> result<composition-result, error>;
+
+  /// Retrieve the composed artifact bytes by digest
+  get-artifact: func(digest: digest) -> result<list<u8>, error>;
+
+  /// Check if an artifact is already cached by emit-key
+  check-cache: func(emit-key: digest) -> option<digest>;
+}
