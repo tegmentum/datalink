@@ -250,11 +250,18 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     // the output record. Same-record aggregates have `input ==
     // output`; different-record aggregates carry distinct kebabs.
     for entry in &aggregate_entries {
-        if let interface_db::AccKind::Record { input, output } =
-            &entry.shape.accumulator_kind
-        {
-            referenced_records.insert(input.kebab_name.clone());
-            referenced_records.insert(output.kebab_name.clone());
+        // #614: RecordToScalar uses the same per-input-record
+        // decoder as Record but no output-record encoder (the
+        // output is a primitive scalar wrap).
+        match &entry.shape.accumulator_kind {
+            interface_db::AccKind::Record { input, output } => {
+                referenced_records.insert(input.kebab_name.clone());
+                referenced_records.insert(output.kebab_name.clone());
+            }
+            interface_db::AccKind::RecordToScalar { input, .. } => {
+                referenced_records.insert(input.kebab_name.clone());
+            }
+            interface_db::AccKind::Geom | interface_db::AccKind::Raster => {}
         }
         match &entry.shape.ret {
             interface_db::RetShape::WitValueRecord { kebab_name, .. }

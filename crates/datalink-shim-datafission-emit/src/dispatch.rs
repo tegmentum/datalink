@@ -50,8 +50,8 @@
 
 use datalink_shim_codegen_core::interface_db::{
     AccKind, AggregateShape, ColumnAffinity, DispatchShape, JsonRetKind,
-    ListPrimElem, ParamShape, RetShape, UdtfFieldShape, UdtfOutputRow,
-    UdtfShape,
+    ListPrimElem, ParamShape, RetShape, ScalarReturnKind, UdtfFieldShape,
+    UdtfOutputRow, UdtfShape,
 };
 
 /// Emit the body of one match arm of the scalar dispatch by name
@@ -824,6 +824,15 @@ pub fn emit_aggregate_finalize_body(
     if let AccKind::Record { .. } = &shape.accumulator_kind {
         return emit_aggregate_finalize_body_record(shape, sql_name, arm_indent);
     }
+    // #614: RecordToScalar — same record-decode pattern as
+    // AccKind::Record on the input side, primitive-scalar wrap on
+    // the output side. Dedicated emitter so the Geom/Raster
+    // scaffolding below stays clean.
+    if let AccKind::RecordToScalar { .. } = &shape.accumulator_kind {
+        return emit_aggregate_finalize_body_record_to_scalar(
+            shape, sql_name, arm_indent,
+        );
+    }
 
     // Decode accumulated blobs into a typed Vec<Resource>; build
     // refs slice for the upstream call.
@@ -849,6 +858,9 @@ pub fn emit_aggregate_finalize_body(
             ));
         }
         AccKind::Record { .. } => unreachable!("handled by Phase 2 stub above"),
+        AccKind::RecordToScalar { .. } => {
+            unreachable!("handled by #614 RecordToScalar stub above")
+        }
     }
 
     // Marshal extras (configs passed at create-accumulator-with-
@@ -1096,6 +1108,162 @@ fn emit_aggregate_finalize_body_record(
          {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
          {i}    None => Ok(ftypes::ScalarValue::Null),\n\
          {i}}}\n",
+    ));
+    s
+}
+
+/// #614: Datafission-target aggregate finalize body for
+/// `AccKind::RecordToScalar` — mobilitydb trajectory-pattern
+/// counters. Input side mirrors `emit_aggregate_finalize_body_record`
+/// (decode each `st.blobs` entry via the per-input-record
+/// `arg_witvalue_<in_snake>` helper); output side wraps the
+/// primitive return in the matching `ScalarValue` variant rather
+/// than routing through `ret_to_witvalue_<snake>`.
+///
+/// Extras (configs serialised at `create-accumulator-with-configs`
+/// time) follow the same JSON-decoded shape the Geom/Raster
+/// aggregate path uses (`serde_json::from_str` per-extra).
+fn emit_aggregate_finalize_body_record_to_scalar(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::RecordToScalar { input, output } = &shape.accumulator_kind else {
+        unreachable!("invariant: caller checks AccKind::RecordToScalar");
+    };
+    let in_snake = input.kebab_name.replace('-', "_");
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "{i}let mut upstream_vec = Vec::with_capacity(st.blobs.len());\n\
+         {i}for b in &st.blobs {{\n\
+         {i}    let __args = [ftypes::ScalarValue::Binary(b.clone())];\n\
+         {i}    upstream_vec.push(arg_witvalue_{in_snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}}}\n",
+    ));
+
+    // Re-decode extras into Rust-typed bindings — same JSON-config
+    // shape as the Geom/Raster aggregate finalize path.
+    let mut call_extras: Vec<String> = Vec::new();
+    if !shape.extra_args.is_empty() {
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            let getc = format!(
+                "{i}let extra{j}_str = st.extras.get({j})\n\
+                 {i}    .ok_or_else(|| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: missing config arg #{j}\")))?;\n",
+            );
+            match p {
+                ParamShape::Text => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: &str = extra{j}_str.as_str();\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::F64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: f64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S32 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: i32 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: i64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U32 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: u32 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: u64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Bool => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: bool = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::OptionNone => {
+                    call_extras.push("None".to_string());
+                }
+                ParamShape::Blob
+                | ParamShape::Geom
+                | ParamShape::Geog
+                | ParamShape::Raster
+                | ParamShape::Topology
+                | ParamShape::ListGeom
+                | ParamShape::WitValueRecord { .. }
+                | ParamShape::Enum { .. }
+                | ParamShape::ListPrim(_)
+                | ParamShape::ListRecord { .. }
+                | ParamShape::ListTuple { .. } => {
+                    return format!(
+                        "{i}Err(ftypes::FunctionError::ExecutionError(\
+                         format!(\"{sql_name}: aggregate config arg #{j} shape not wired\")))",
+                    );
+                }
+            }
+        }
+    }
+
+    let call_args = if call_extras.is_empty() {
+        "&upstream_vec".to_string()
+    } else {
+        format!("&upstream_vec, {}", call_extras.join(", "))
+    };
+
+    let wrap = match output {
+        ScalarReturnKind::F64 | ScalarReturnKind::F32 => {
+            format!("Ok(ftypes::ScalarValue::Float64(__r as f64))")
+        }
+        ScalarReturnKind::Bool => {
+            format!("Ok(ftypes::ScalarValue::Boolean(__r))")
+        }
+        ScalarReturnKind::U32
+        | ScalarReturnKind::S32
+        | ScalarReturnKind::U64
+        | ScalarReturnKind::S64
+        | ScalarReturnKind::U8 => {
+            format!("Ok(ftypes::ScalarValue::Int64(__r as i64))")
+        }
+    };
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}({call_args});\n\
+         {i}{wrap}\n",
     ));
     s
 }

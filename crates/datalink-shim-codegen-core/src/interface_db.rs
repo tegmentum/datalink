@@ -760,6 +760,47 @@ pub enum AccKind {
         input: RecordSpec,
         output: RecordSpec,
     },
+    /// #614: record-typed list input, primitive-scalar output.
+    ///
+    /// Step body is structurally identical to `Record` (push the
+    /// per-row `WitValuePayload` onto the witvalue accumulator
+    /// state + latch any extras). Finalize decodes each payload
+    /// via the input record's `arg_witvalue_<snake>` helper, calls
+    /// the upstream aggregator, and wraps the primitive return in
+    /// the target's native scalar variant (`SqlValue::Integer`,
+    /// `Duckvalue::Bigint`, `ScalarValue::UInt32`, etc.) selected
+    /// by `output`.
+    ///
+    /// Today's surface (mobilitydb): the three trajectory-pattern
+    /// counters `tgeompoint-num-convoys` / `-flocks` / `-meetings`
+    /// take `list<tgeompoint-sequence>` + a handful of f64/s64/u32
+    /// extras and return `u32`. They didn't fit `Geom`/`Raster`
+    /// (raw-blob accumulator) or `Record` (record-out finalize)
+    /// before this kind landed.
+    RecordToScalar {
+        input: RecordSpec,
+        output: ScalarReturnKind,
+    },
+}
+
+/// #614: primitive scalar return for `AccKind::RecordToScalar`.
+///
+/// The `classify_return` path collapses every integer width to
+/// `RetShape::Int` / every float width to `RetShape::Real` /
+/// `bool` to `RetShape::BoolInt`; for record-input aggregates we
+/// re-walk the raw `WitType` so each emit target can pick the
+/// precise native-scalar wrap on the finalize encoder rather than
+/// going through the collapsed RetShape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ScalarReturnKind {
+    U32,
+    S32,
+    U64,
+    S64,
+    U8,
+    F64,
+    F32,
+    Bool,
 }
 
 /// #612 (OQ1): canonical per-record identifying tuple. The six
@@ -1125,6 +1166,29 @@ pub fn classify_shape(
     })
 }
 
+/// #614: map a raw return `WitType` to the precise scalar primitive
+/// kind for `AccKind::RecordToScalar`. Returns `None` if the WIT
+/// shape isn't a primitive — record/option/list/etc. all fall
+/// through, and the caller falls back to the existing failure
+/// branch.
+///
+/// Mirrors the prim-arm subset of `classify_return` but keeps the
+/// integer widths distinct so each emit target can pick the right
+/// native-scalar wrap on the finalize encoder.
+fn scalar_return_kind(t: &WitType) -> Option<ScalarReturnKind> {
+    match t {
+        WitType::U32 => Some(ScalarReturnKind::U32),
+        WitType::S32 => Some(ScalarReturnKind::S32),
+        WitType::U64 => Some(ScalarReturnKind::U64),
+        WitType::S64 => Some(ScalarReturnKind::S64),
+        WitType::U8 => Some(ScalarReturnKind::U8),
+        WitType::F64 => Some(ScalarReturnKind::F64),
+        WitType::F32 => Some(ScalarReturnKind::F32),
+        WitType::Bool => Some(ScalarReturnKind::Bool),
+        _ => None,
+    }
+}
+
 pub fn classify_aggregate_shape(
     f: &WitFunction,
     records: &[RecordType],
@@ -1233,38 +1297,52 @@ pub fn classify_aggregate_shape(
     let accumulator_kind = match (accumulator_kind_partial, input_spec) {
         (Some(k), _) => k, // Geom / Raster: no output-record resolution
         (None, Some(input)) => {
+            // Record-typed input: branch on whether the return is
+            // another record (the existing `AccKind::Record` path)
+            // or a primitive scalar (#614 `RecordToScalar`).
             let output_kebab = match &ret {
                 RetShape::OptionWitValueRecord { kebab_name, .. }
                 | RetShape::WitValueRecord { kebab_name, .. }
                 | RetShape::FirstWitValueRecord { kebab_name, .. } => Some(kebab_name.as_str()),
                 _ => None,
             };
-            let Some(out_kebab) = output_kebab else {
-                return Err(format!(
-                    "AccKind::Record aggregate input `{}` but return shape is not a record",
-                    input.kebab_name,
-                ));
-            };
-            let output = if out_kebab == input.kebab_name.as_str() {
-                input.clone()
-            } else if let Some(rec) = records.iter().find(|r| r.kebab_name == out_kebab) {
-                let type_id_hex: String =
-                    rec.type_id.iter().map(|b| format!("{:02x}", b)).collect();
-                RecordSpec {
-                    kebab_name: rec.kebab_name.clone(),
-                    wit_interface: rec.interface.clone(),
-                    wit_package: rec.package.clone(),
-                    wit_package_version: rec.package_version.clone(),
-                    symbolic_name: rec.symbolic_name.clone(),
-                    type_id_hex,
+            if let Some(out_kebab) = output_kebab {
+                let output = if out_kebab == input.kebab_name.as_str() {
+                    input.clone()
+                } else if let Some(rec) = records.iter().find(|r| r.kebab_name == out_kebab) {
+                    let type_id_hex: String =
+                        rec.type_id.iter().map(|b| format!("{:02x}", b)).collect();
+                    RecordSpec {
+                        kebab_name: rec.kebab_name.clone(),
+                        wit_interface: rec.interface.clone(),
+                        wit_package: rec.package.clone(),
+                        wit_package_version: rec.package_version.clone(),
+                        symbolic_name: rec.symbolic_name.clone(),
+                        type_id_hex,
+                    }
+                } else {
+                    return Err(format!(
+                        "AccKind::Record aggregate output `{}` has no matching record in the bridge registry",
+                        out_kebab,
+                    ));
+                };
+                AccKind::Record { input, output }
+            } else if let Some(scalar_out) = scalar_return_kind(&f.ret.inner) {
+                // #614: list<record> → primitive scalar shape.
+                // RetShape collapses integer widths (every
+                // u32/s32/u64/etc. lands on RetShape::Int) so re-
+                // walk the raw WitType to capture the precise
+                // width.
+                AccKind::RecordToScalar {
+                    input,
+                    output: scalar_out,
                 }
             } else {
                 return Err(format!(
-                    "AccKind::Record aggregate output `{}` has no matching record in the bridge registry",
-                    out_kebab,
+                    "AccKind::Record aggregate input `{}` but return shape is not a record or recognised primitive scalar",
+                    input.kebab_name,
                 ));
-            };
-            AccKind::Record { input, output }
+            }
         }
         (None, None) => unreachable!("classifier above rejects non-list-record first params"),
     };

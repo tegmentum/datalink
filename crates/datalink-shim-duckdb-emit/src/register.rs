@@ -354,7 +354,14 @@ pub fn render_aggregates(
         let mut args_block = String::new();
         let acc_logical = match &entry.shape.accumulator_kind {
             AccKind::Geom | AccKind::Raster => "types::Logicaltype::Blob",
-            AccKind::Record { .. } => continue,
+            // Record / RecordToScalar accumulators stream wit-value
+            // payloads through column 0. Host-side registration on
+            // the DuckDB target is still pending wider runtime
+            // wiring (the dispatch arm is emitted, but the
+            // `register_aggregates` block doesn't currently
+            // advertise the Logicaltype::Complex accumulator —
+            // matches the pre-#611 pattern for AccKind::Record).
+            AccKind::Record { .. } | AccKind::RecordToScalar { .. } => continue,
         };
         args_block.push_str(&format!(
             "            runtime::Funcarg {{\n\

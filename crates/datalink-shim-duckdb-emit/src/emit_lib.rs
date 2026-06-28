@@ -986,12 +986,20 @@ fn collect_referenced_records(
     // for the output record's encoder. Same-record aggregates have
     // matching kebabs (so only one codec block is emitted via the
     // BTreeSet dedupe); different-record (#612) cases need both.
+    //
+    // #614: `RecordToScalar` only references the INPUT-side
+    // `arg_witvalue_<in>` helper — the output is a primitive
+    // scalar wrap, not a record codec call.
     for entry in aggregate_entries {
-        if let interface_db::AccKind::Record { input, output } =
-            &entry.shape.accumulator_kind
-        {
-            out.insert(input.kebab_name.clone());
-            out.insert(output.kebab_name.clone());
+        match &entry.shape.accumulator_kind {
+            interface_db::AccKind::Record { input, output } => {
+                out.insert(input.kebab_name.clone());
+                out.insert(output.kebab_name.clone());
+            }
+            interface_db::AccKind::RecordToScalar { input, .. } => {
+                out.insert(input.kebab_name.clone());
+            }
+            interface_db::AccKind::Geom | interface_db::AccKind::Raster => {}
         }
     }
     out

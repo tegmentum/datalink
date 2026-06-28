@@ -459,13 +459,18 @@ use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
         &collect_tuple_list_sigs(&scalar_entries, &agg_entries, &udtf_entries),
     );
 
-    // #607 Phase 1: only emit the witvalue-typed aggregator state
-    // (thread-local Vec<WitValuePayload> + push/take helpers) when
-    // there's at least one `AccKind::Record` aggregate in the wired
-    // set. Postgis bridges (no record-typed aggregates today) skip
-    // this block entirely — byte-identical to the pre-#607 output.
+    // #607 Phase 1 + #614: only emit the witvalue-typed aggregator
+    // state (thread-local Vec<WitValuePayload> + push/take helpers)
+    // when there's at least one record-input aggregate (Record or
+    // RecordToScalar) in the wired set. Postgis bridges (no record-
+    // typed aggregates today) skip this block entirely — byte-
+    // identical to the pre-#607 output.
     let has_record_agg = agg_entries.iter().any(|e| {
-        matches!(e.shape.accumulator_kind, dispatch::AccKind::Record { .. })
+        matches!(
+            e.shape.accumulator_kind,
+            dispatch::AccKind::Record { .. }
+                | dispatch::AccKind::RecordToScalar { .. }
+        )
     });
     let (witvalue_state_decl, witvalue_state_helpers) = if has_record_agg {
         (
@@ -1867,9 +1872,19 @@ fn collect_referenced_records(
         // codec block is emitted. For different-record aggregates
         // (#612: `tgeompoint-st-extent`, `t*-temporal-count`) both
         // need to be present.
-        if let dispatch::AccKind::Record { input, output } = &entry.shape.accumulator_kind {
-            out.insert(input.kebab_name.clone());
-            out.insert(output.kebab_name.clone());
+        //
+        // #614: `RecordToScalar` only references the INPUT-side
+        // `arg_witvalue_<in>` helper — the output is a primitive
+        // scalar wrap, not a record codec call.
+        match &entry.shape.accumulator_kind {
+            dispatch::AccKind::Record { input, output } => {
+                out.insert(input.kebab_name.clone());
+                out.insert(output.kebab_name.clone());
+            }
+            dispatch::AccKind::RecordToScalar { input, .. } => {
+                out.insert(input.kebab_name.clone());
+            }
+            dispatch::AccKind::Geom | dispatch::AccKind::Raster => {}
         }
     }
     for entry in udtf_entries {

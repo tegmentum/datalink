@@ -765,10 +765,15 @@ pub fn emit_aggregate_step_body(
     arm_indent: &str,
 ) -> String {
     let i = arm_indent;
-    // #607 Phase 1: AccKind::Record uses a different per-row shape
-    // (WitValuePayload extracted from SqlValue::WitValue rather than
-    // a raw blob). Emit a dedicated body.
-    if let AccKind::Record { .. } = &shape.accumulator_kind {
+    // #607 Phase 1 + #614: AccKind::Record / RecordToScalar use a
+    // different per-row shape (WitValuePayload extracted from
+    // SqlValue::WitValue rather than a raw blob). The step body
+    // is structurally identical for both — only finalize diverges
+    // — so reuse the existing record step emitter.
+    if matches!(
+        &shape.accumulator_kind,
+        AccKind::Record { .. } | AccKind::RecordToScalar { .. }
+    ) {
         return emit_aggregate_step_body_record(shape, sql_name, arm_indent);
     }
     // #548 (W3.2): the push helper varies by accumulator kind.
@@ -776,7 +781,9 @@ pub fn emit_aggregate_step_body(
     let push = match &shape.accumulator_kind {
         AccKind::Geom => "push_geom_state",
         AccKind::Raster => "push_raster_state",
-        AccKind::Record { .. } => unreachable!("handled above"),
+        AccKind::Record { .. } | AccKind::RecordToScalar { .. } => {
+            unreachable!("handled above")
+        }
     };
     if shape.extra_args.is_empty() {
         // Simple shape: just push the resource blob.
@@ -856,6 +863,15 @@ pub fn emit_aggregate_finalize_body(
     if let AccKind::Record { .. } = &shape.accumulator_kind {
         return emit_aggregate_finalize_body_record(shape, sql_name, arm_indent);
     }
+    // #614: RecordToScalar mirrors the record decode path but
+    // emits a primitive-scalar finalize encoder instead of routing
+    // through `ret_to_witvalue_<snake>`. Dedicated emitter keeps
+    // the Geom/Raster scaffolding below clean.
+    if let AccKind::RecordToScalar { .. } = &shape.accumulator_kind {
+        return emit_aggregate_finalize_body_record_to_scalar(
+            shape, sql_name, arm_indent,
+        );
+    }
     let mut s = String::new();
     // #548 (W3.2): per-kind accumulator take + decode. Both paths
     // materialise `refs: Vec<&Resource>` so the downstream
@@ -880,7 +896,9 @@ pub fn emit_aggregate_finalize_body(
                  {i}let refs: Vec<&Raster> = rasters.iter().collect();\n",
             ));
         }
-        AccKind::Record { .. } => unreachable!("handled above"),
+        AccKind::Record { .. } | AccKind::RecordToScalar { .. } => {
+            unreachable!("handled above")
+        }
     }
 
     // Build the extras as Rust-typed bindings if any.
@@ -1119,6 +1137,155 @@ fn emit_aggregate_finalize_body_record(
          {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
          {i}    None => Ok(SqlValue::Null),\n\
          {i}}}",
+    ));
+    s
+}
+
+/// #614: aggregate finalize body for `AccKind::RecordToScalar` —
+/// mobilitydb trajectory-pattern counters. The input side mirrors
+/// `emit_aggregate_finalize_body_record` (drain the witvalue
+/// accumulator, decode each payload to UPSTREAM via the per-input-
+/// record helper); the output side wraps the primitive return in
+/// the matching `SqlValue` variant rather than routing through
+/// `ret_to_witvalue_<snake>`.
+///
+/// Extras (constants like `distance-threshold`, `min-duration-us`,
+/// `min-size`) are supported: the step body latches `args[1..]`
+/// via `set_or_validate_extras` on first invocation, and finalize
+/// re-decodes them through the same per-`ParamShape` arms the
+/// Geom/Raster aggregate path uses.
+fn emit_aggregate_finalize_body_record_to_scalar(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::RecordToScalar { input, output } = &shape.accumulator_kind else {
+        unreachable!("invariant: caller checks AccKind::RecordToScalar");
+    };
+    let in_snake = input.kebab_name.replace('-', "_");
+
+    let mut s = String::new();
+    // Drain the per-context witvalue accumulator + decode each
+    // payload to UPSTREAM. Identical to the Record path.
+    s.push_str(&format!(
+        "{i}let payloads = take_witvalue_state(context_id);\n\
+         {i}let mut upstream_vec = Vec::with_capacity(payloads.len());\n\
+         {i}for pw in payloads {{\n\
+         {i}    let __args = [SqlValue::WitValue(pw)];\n\
+         {i}    upstream_vec.push(arg_witvalue_{in_snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}}}\n",
+    ));
+
+    // Re-decode the extras into Rust-typed bindings; mirrors the
+    // Geom/Raster aggregate finalize extras-decode block. Only the
+    // primitive ParamShape arms are reachable here (the only known
+    // RecordToScalar callers — mobilitydb's three trajectory
+    // counters — take f64/s64/u32 extras).
+    let mut call_extras: Vec<String> = Vec::new();
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}let extras = take_extras_state(context_id);\n",
+        ));
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            match p {
+                ParamShape::Text => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_text(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::F64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_f64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? as i32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? as u32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? as u64;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Bool => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? != 0;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Blob => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_blob(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::OptionNone => {
+                    call_extras.push("None".to_string());
+                }
+                ParamShape::Geom
+                | ParamShape::Geog
+                | ParamShape::Raster
+                | ParamShape::Topology
+                | ParamShape::ListGeom
+                | ParamShape::WitValueRecord { .. }
+                | ParamShape::Enum { .. }
+                | ParamShape::ListPrim(_)
+                | ParamShape::ListRecord { .. }
+                | ParamShape::ListTuple { .. } => {
+                    return format!(
+                        "{i}Err(format!(\"{sql_name}: aggregate extra arg #{j} shape not wired\"))",
+                    );
+                }
+            }
+        }
+    }
+
+    let call_args = if call_extras.is_empty() {
+        "&upstream_vec".to_string()
+    } else {
+        format!("&upstream_vec, {}", call_extras.join(", "))
+    };
+
+    // Wrap the primitive return in the matching SqlValue variant.
+    // SQLite has no native bool — Bool collapses to Integer 0/1
+    // (mirrors the scalar `RetShape::BoolInt` arm). Float widths
+    // collapse to f64; integer widths collapse to i64.
+    let wrap = match output {
+        ScalarReturnKind::F64 | ScalarReturnKind::F32 => {
+            format!("Ok(SqlValue::Real(__r as f64))")
+        }
+        ScalarReturnKind::Bool => {
+            format!("Ok(SqlValue::Integer(if __r {{ 1 }} else {{ 0 }}))")
+        }
+        ScalarReturnKind::U32
+        | ScalarReturnKind::S32
+        | ScalarReturnKind::U64
+        | ScalarReturnKind::S64
+        | ScalarReturnKind::U8 => format!("Ok(SqlValue::Integer(__r as i64))"),
+    };
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}({call_args});\n\
+         {i}{wrap}",
     ));
     s
 }
