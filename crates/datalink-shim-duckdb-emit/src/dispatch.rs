@@ -1056,9 +1056,10 @@ fn emit_aggregate_arm_body_record_to_scalar(
     let i = arm_indent;
     let module = &shape.wit_module;
     let func = &shape.wit_func;
-    let AccKind::RecordToScalar { input, output } = &shape.accumulator_kind else {
+    let AccKind::RecordToScalar { input, output, optional } = &shape.accumulator_kind else {
         unreachable!("invariant: caller checks AccKind::RecordToScalar");
     };
+    let optional = *optional;
     let in_snake = input.kebab_name.replace('-', "_");
 
     let mut s = String::new();
@@ -1175,18 +1176,37 @@ fn emit_aggregate_arm_body_record_to_scalar(
         format!("&upstream_vec, {}", call_extras.join(", "))
     };
 
-    let wrap = match output {
+    // #637: `optional = true` wraps `Some(v)` per the native scalar
+    // variant and emits `Duckvalue::Null` on `None`.
+    let some_wrap = match output {
         ScalarReturnKind::F64 | ScalarReturnKind::F32 => {
-            format!("Ok(types::Duckvalue::Float64(__r as f64))")
+            "types::Duckvalue::Float64(v as f64)".to_string()
         }
-        ScalarReturnKind::Bool => {
-            format!("Ok(types::Duckvalue::Boolean(__r))")
-        }
+        ScalarReturnKind::Bool => "types::Duckvalue::Boolean(v)".to_string(),
         ScalarReturnKind::U32
         | ScalarReturnKind::S32
         | ScalarReturnKind::U64
         | ScalarReturnKind::S64
-        | ScalarReturnKind::U8 => format!("Ok(types::Duckvalue::Int64(__r as i64))"),
+        | ScalarReturnKind::U8 => "types::Duckvalue::Int64(v as i64)".to_string(),
+    };
+    let wrap = if optional {
+        format!(
+            "match __r {{ Some(v) => Ok({some_wrap}), None => Ok(types::Duckvalue::Null) }}",
+        )
+    } else {
+        match output {
+            ScalarReturnKind::F64 | ScalarReturnKind::F32 => {
+                format!("Ok(types::Duckvalue::Float64(__r as f64))")
+            }
+            ScalarReturnKind::Bool => {
+                format!("Ok(types::Duckvalue::Boolean(__r))")
+            }
+            ScalarReturnKind::U32
+            | ScalarReturnKind::S32
+            | ScalarReturnKind::U64
+            | ScalarReturnKind::S64
+            | ScalarReturnKind::U8 => format!("Ok(types::Duckvalue::Int64(__r as i64))"),
+        }
     };
     s.push_str(&format!(
         "{i}let __r = {module}::{func}({call_args});\n\

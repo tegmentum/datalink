@@ -796,9 +796,17 @@ pub enum AccKind {
     /// extras and return `u32`. They didn't fit `Geom`/`Raster`
     /// (raw-blob accumulator) or `Record` (record-out finalize)
     /// before this kind landed.
+    ///
+    /// #637: `optional = true` covers `func(list<X-sequence>) -> option<T>`
+    /// where T is a primitive matching `ScalarReturnKind`. Today's
+    /// surface (mobilitydb): `tint-min-value-aggregate` /
+    /// `tint-max-value-aggregate` return `option<s64>` — the
+    /// finalize encoder wraps `Some(v)` per the primitive variant
+    /// and emits the target's native NULL on `None`.
     RecordToScalar {
         input: RecordSpec,
         output: ScalarReturnKind,
+        optional: bool,
     },
 }
 
@@ -1355,6 +1363,28 @@ pub fn classify_aggregate_shape(
                 AccKind::RecordToScalar {
                     input,
                     output: scalar_out,
+                    optional: false,
+                }
+            } else if let WitType::Option(inner) = &f.ret.inner {
+                // #637: list<record> → option<primitive> scalar.
+                // Mirrors the bare-scalar arm above but the
+                // finalize encoder wraps the upstream return in
+                // `Some(v) → target-native scalar variant` /
+                // `None → target-native NULL`. Today's surface:
+                // mobilitydb `tint-min-value-aggregate` /
+                // `tint-max-value-aggregate` returning `option<s64>`.
+                if let Some(scalar_out) = scalar_return_kind(inner) {
+                    AccKind::RecordToScalar {
+                        input,
+                        output: scalar_out,
+                        optional: true,
+                    }
+                } else {
+                    return Err(format!(
+                        "AccKind::Record aggregate input `{}` but return shape is option<{:?}> (inner not a recognised primitive scalar)",
+                        input.kebab_name,
+                        inner,
+                    ));
                 }
             } else {
                 return Err(format!(

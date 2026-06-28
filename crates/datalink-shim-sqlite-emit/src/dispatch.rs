@@ -1179,9 +1179,10 @@ fn emit_aggregate_finalize_body_record_to_scalar(
     let i = arm_indent;
     let module = &shape.wit_module;
     let func = &shape.wit_func;
-    let AccKind::RecordToScalar { input, output } = &shape.accumulator_kind else {
+    let AccKind::RecordToScalar { input, output, optional } = &shape.accumulator_kind else {
         unreachable!("invariant: caller checks AccKind::RecordToScalar");
     };
+    let optional = *optional;
     let in_snake = input.kebab_name.replace('-', "_");
 
     let mut s = String::new();
@@ -1287,18 +1288,41 @@ fn emit_aggregate_finalize_body_record_to_scalar(
     // SQLite has no native bool — Bool collapses to Integer 0/1
     // (mirrors the scalar `RetShape::BoolInt` arm). Float widths
     // collapse to f64; integer widths collapse to i64.
-    let wrap = match output {
+    //
+    // #637: `optional = true` wraps the upstream return in `match __r
+    // { Some(v) => <native scalar>, None => SqlValue::Null }`. The
+    // inner Some-branch wrap mirrors the bare-primitive arm.
+    let some_wrap = match output {
         ScalarReturnKind::F64 | ScalarReturnKind::F32 => {
-            format!("Ok(SqlValue::Real(__r as f64))")
+            "SqlValue::Real(v as f64)".to_string()
         }
         ScalarReturnKind::Bool => {
-            format!("Ok(SqlValue::Integer(if __r {{ 1 }} else {{ 0 }}))")
+            "SqlValue::Integer(if v { 1 } else { 0 })".to_string()
         }
         ScalarReturnKind::U32
         | ScalarReturnKind::S32
         | ScalarReturnKind::U64
         | ScalarReturnKind::S64
-        | ScalarReturnKind::U8 => format!("Ok(SqlValue::Integer(__r as i64))"),
+        | ScalarReturnKind::U8 => "SqlValue::Integer(v as i64)".to_string(),
+    };
+    let wrap = if optional {
+        format!(
+            "match __r {{ Some(v) => Ok({some_wrap}), None => Ok(SqlValue::Null) }}",
+        )
+    } else {
+        match output {
+            ScalarReturnKind::F64 | ScalarReturnKind::F32 => {
+                format!("Ok(SqlValue::Real(__r as f64))")
+            }
+            ScalarReturnKind::Bool => {
+                format!("Ok(SqlValue::Integer(if __r {{ 1 }} else {{ 0 }}))")
+            }
+            ScalarReturnKind::U32
+            | ScalarReturnKind::S32
+            | ScalarReturnKind::U64
+            | ScalarReturnKind::S64
+            | ScalarReturnKind::U8 => format!("Ok(SqlValue::Integer(__r as i64))"),
+        }
     };
     s.push_str(&format!(
         "{i}let __r = {module}::{func}({call_args});\n\
