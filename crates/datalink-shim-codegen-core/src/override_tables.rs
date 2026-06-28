@@ -28,6 +28,16 @@ use crate::wit_parse::WitFunction;
 /// (typically a `postgis-operators::op-*` entry). The standard
 /// snake-to-kebab resolver misses these because the names don't
 /// share a stem.
+///
+/// #639 batch 2/3: also routes mobilitydb EWKT-text scalars whose
+/// SQL surface drops the `_instant_` infix that the upstream WIT
+/// kebab carries. The interface DB advertises both `tX_from_ewkt`
+/// (bare) and `tX_instant_from_ewkt` for the instant variant; the
+/// explicit-instant SQL name resolves directly via the snake
+/// index, but the bare name shares no stem with `tX-instant-from-
+/// ewkt` and needs the hand-curated route. Sequence variants
+/// (`tX_sequence_from_ewkt`) resolve directly when the shim
+/// advertises them — no override needed there.
 pub fn operator_function_overrides() -> &'static [(&'static str, &'static str, &'static str)] {
     // (sql_name, wit_interface, wit_kebab_name)
     &[
@@ -36,6 +46,21 @@ pub fn operator_function_overrides() -> &'static [(&'static str, &'static str, &
         ("st_knndistance",      "postgis-operators", "op-knn-distance"),
         ("st_bboxdistance",     "postgis-operators", "op-bbox-distance"),
         ("st_geomequal",        "postgis-operators", "op-equals-spatially"),
+        // #639 batch 2: EWKT text parsers — bare SQL name routes to
+        // the `-instant-` WIT variant (matching the convention also
+        // used by the existing `tgeompoint3d_from_ewkt` etc. shim
+        // entries). The explicit `tX_instant_from_ewkt` SQL aliases
+        // resolve via the snake index without an override.
+        ("tbool_from_ewkt",       "tbool-ops",       "tbool-instant-from-ewkt"),
+        ("tint_from_ewkt",        "tint-ops",        "tint-instant-from-ewkt"),
+        ("tfloat_from_ewkt",      "tfloat-ops",      "tfloat-instant-from-ewkt"),
+        ("ttext_from_ewkt",       "ttext-ops",       "ttext-instant-from-ewkt"),
+        ("tgeompoint_from_ewkt",  "tgeompoint-ops",  "tgeompoint-instant-from-ewkt"),
+        // #639 batch 3 — tgeogpoint variants. The SQL surface for
+        // these doesn't ship in the current interface DB; the
+        // override is preregistered so it fires automatically once
+        // the shim advertises the corresponding SQL functions.
+        ("tgeogpoint_from_ewkt",  "tgeogpoint-ops",  "tgeogpoint-instant-from-ewkt"),
     ]
 }
 
@@ -184,6 +209,23 @@ pub fn aggregate_function_overrides() -> &'static [(&'static str, &'static str, 
             "ttext_concat_agg",
             "temporal-aggregate-ops",
             "ttext-concat-aggregate",
+        ),
+        // #639 batch 2 — upstream mobilitydb-wasm ada1857 added two
+        // more whole-aggregate (set-shaped) WIT entries under the
+        // `_aggregate` suffix. Same name-match miss pattern as the
+        // #636 entries above: the interface DB spells them with
+        // `_agg`, suffix-strip fallback yields the bare stem
+        // (`tfloat_variance` / `tint_range`) which doesn't exist
+        // as a WIT entry. Route directly.
+        (
+            "tfloat_variance_agg",
+            "temporal-aggregate-ops",
+            "tfloat-variance-aggregate",
+        ),
+        (
+            "tint_range_agg",
+            "temporal-aggregate-ops",
+            "tint-range-aggregate",
         ),
     ]
 }
