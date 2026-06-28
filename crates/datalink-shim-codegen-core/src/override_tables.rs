@@ -163,6 +163,28 @@ pub fn aggregate_function_overrides() -> &'static [(&'static str, &'static str, 
             "temporal-aggregate-ops",
             "tgeompoint-temporal-centroid",
         ),
+        // #636 batch 1 — upstream mobilitydb-wasm 8cdc881 added 4
+        // whole-aggregate (set-shaped) WIT entries under
+        // `_aggregate` suffix. The interface DB still spells them
+        // with `_agg`; the existing `_agg`-strip fallback yields
+        // the bare scalar stem (`tint_count`) which doesn't exist
+        // as a WIT entry. Route directly to the new entries.
+        ("tint_count_agg", "temporal-aggregate-ops", "tint-count-aggregate"),
+        (
+            "tint_min_value_agg",
+            "temporal-aggregate-ops",
+            "tint-min-value-aggregate",
+        ),
+        (
+            "tint_max_value_agg",
+            "temporal-aggregate-ops",
+            "tint-max-value-aggregate",
+        ),
+        (
+            "ttext_concat_agg",
+            "temporal-aggregate-ops",
+            "ttext-concat-aggregate",
+        ),
     ]
 }
 
