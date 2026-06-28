@@ -132,10 +132,37 @@ pub fn tuple_pick_override_for<'a>(
 ///   letter" rule. The interface DB's `st_3d_extent` alias bridges
 ///   the prefix style but not the trailing rename, so name-match
 ///   misses; this entry routes it directly.
+/// - #615 mobilitydb name-match misses: the SQL aggregate names
+///   diverge from the upstream `temporal-aggregate-ops` kebab names
+///   by more than the `_agg` suffix-strip path can bridge. Each
+///   entry routes a single SQL name at an upstream
+///   `tX-temporal-Y` function whose signature
+///   `func(sequences: list<X-sequence>) -> option<X-sequence>` is
+///   the same-record case downstream classification already handles.
+///     - `tfloat_total` → `tfloat-temporal-sum`: SQL stem `total`
+///       has no shared root with WIT stem `sum`, so neither direct
+///       match nor `_agg`-strip helps.
+///     - `tint_min_agg` / `tint_max_agg` / `tint_sum_agg`: the
+///       upstream WIT names are `tint-temporal-{min,max,sum}`; the
+///       SQL names lack the `temporal-` infix so name-match misses
+///       even after `_agg` strip (`tint_min` vs `tint-temporal-min`).
+///     - `tgeompoint_centroid_agg` → `tgeompoint-temporal-centroid`:
+///       same `temporal-` infix mismatch (`tgeompoint_centroid` vs
+///       `tgeompoint-temporal-centroid`).
 pub fn aggregate_function_overrides() -> &'static [(&'static str, &'static str, &'static str)] {
     // (sql_name, wit_interface, wit_kebab_name)
     &[
         ("st_3dextent", "postgis-aggregates", "st-extent-threed"),
+        // #615 mobilitydb temporal-aggregate-ops name-match misses.
+        ("tfloat_total", "temporal-aggregate-ops", "tfloat-temporal-sum"),
+        ("tint_min_agg", "temporal-aggregate-ops", "tint-temporal-min"),
+        ("tint_max_agg", "temporal-aggregate-ops", "tint-temporal-max"),
+        ("tint_sum_agg", "temporal-aggregate-ops", "tint-temporal-sum"),
+        (
+            "tgeompoint_centroid_agg",
+            "temporal-aggregate-ops",
+            "tgeompoint-temporal-centroid",
+        ),
     ]
 }
 
