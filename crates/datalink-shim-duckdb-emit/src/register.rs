@@ -299,3 +299,124 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
         }
     }
 }
+
+// ─── Aggregate registration ───
+//
+// Mirrors `render` but against `Capabilitykind::Aggregate` and
+// the aggregate-specific callback / handle table. Each aggregate
+// in the interface DB becomes one call to
+// `registry.register(name, &args, &ret, AggregateCallback::new(handle), Some(&opts))`.
+//
+// The arg/return Logicaltype declarations come from the same
+// `paramshape_to_logicaltype` / `retshape_to_logicaltype` helpers
+// the scalar path uses — the streaming accumulator column is the
+// first arg (always `Blob` for Geom / Raster shapes) followed by
+// any `extra_args` constants.
+pub fn render_aggregates(
+    plan: &shim_bridge_codegen_core::BridgePlan,
+    agg_entries: &[datalink_shim_codegen_core::interface_db::AggregateEntry],
+) -> anyhow::Result<String> {
+    use datalink_shim_codegen_core::interface_db::AccKind;
+    let mut det: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
+    for ext in &plan.extensions {
+        for ag in &ext.aggregates {
+            det.insert(ag.canonical_name.clone(), true);
+            for alias in &ag.aliases {
+                det.insert(alias.clone(), true);
+            }
+        }
+    }
+
+    let mut s = String::new();
+    s.push_str(AGGREGATE_REGISTER_PRELUDE);
+
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut arm_idx: usize = 0;
+    for entry in agg_entries {
+        if !seen.insert(entry.sql_name.clone()) {
+            // first writer wins — mirrors build_aggregate_arms's dedupe.
+            continue;
+        }
+        // Arg 0 is the streaming accumulator column: Blob for both
+        // Geom and Raster aggregates (the WKB / raster-binary the
+        // bridge decodes inside the dispatch arm).
+        let mut args_block = String::new();
+        let acc_logical = match entry.shape.accumulator_kind {
+            AccKind::Geom | AccKind::Raster => "types::Logicaltype::Blob",
+        };
+        args_block.push_str(&format!(
+            "            runtime::Funcarg {{\n\
+             \x20               name: Some(\"arg0\".into()),\n\
+             \x20               logical: {acc_logical},\n\
+             \x20           }},\n",
+        ));
+        for (i, p) in entry.shape.extra_args.iter().enumerate() {
+            let logical = paramshape_to_logicaltype(p);
+            let i1 = i + 1;
+            args_block.push_str(&format!(
+                "            runtime::Funcarg {{\n\
+                 \x20               name: Some(\"arg{i1}\".into()),\n\
+                 \x20               logical: {logical},\n\
+                 \x20           }},\n",
+            ));
+        }
+        let ret_logical = retshape_to_logicaltype(&entry.shape.ret);
+        let deterministic =
+            det.get(&entry.sql_name).copied().unwrap_or(true);
+        let attrs = if deterministic {
+            "types::Funcflags::DETERMINISTIC | types::Funcflags::STATELESS"
+        } else {
+            "types::Funcflags::STATELESS"
+        };
+        let sql_name = entry.sql_name.replace('"', "\\\"");
+        s.push_str(&format!(
+            r##"    {{
+        let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        aggregate_handle_table()
+            .lock()
+            .expect("aggregate handle mutex poisoned")
+            .insert(handle, {arm_idx}usize);
+        let callback = runtime::AggregateCallback::new(handle);
+        let args: Vec<runtime::Funcarg> = vec![
+{args_block}        ];
+        let opts = runtime::Funcopts {{
+            description: Some("{sql_name} (sqlink-shim-codegen)".into()),
+            tags: vec!["{sql_name}".into()],
+            attributes: {attrs},
+        }};
+        registry.register(
+            "{sql_name}",
+            &args,
+            &{ret_logical},
+            callback,
+            Some(&opts),
+        )?;
+    }}
+"##,
+        ));
+        arm_idx += 1;
+    }
+
+    s.push_str("    Ok(())\n}\n");
+    Ok(s)
+}
+
+const AGGREGATE_REGISTER_PRELUDE: &str = r##"
+fn register_aggregates() -> Result<(), types::Duckerror> {
+    let capability = runtime::get_capability(types::Capabilitykind::Aggregate)
+        .ok_or_else(|| {
+            types::Duckerror::Internal(
+                "host did not expose aggregate capability".into(),
+            )
+        })?;
+    let registry = match capability {
+        runtime::Capability::Aggregate(r) => r,
+        _ => {
+            return Err(types::Duckerror::Internal(
+                "aggregate capability returned unexpected variant".into(),
+            ));
+        }
+    };
+"##;

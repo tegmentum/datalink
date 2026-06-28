@@ -57,6 +57,13 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let (scalar_entries, scalar_unwired) =
         interface_db::build_full(plan, &shim_wit_dir, &records)?;
 
+    // Aggregate entries — Phase 1 of the aggregate/UDTF batch.
+    // Wires the postgis & mobilitydb dissolve-shape aggregates
+    // (`list<borrow<geometry>>` / `list<borrow<raster>>` → result)
+    // against DuckDB's `call_aggregate` whole-group fold ABI.
+    let (aggregate_entries, aggregate_unwired) =
+        interface_db::build_aggregate_registry(plan, &shim_wit_dir, &records)?;
+
     // Report on what fell through so the maintainer sees coverage
     // at codegen time.
     let total_unwired = scalar_unwired.len();
@@ -65,6 +72,15 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             "[duckdb-target] {total_unwired} scalar(s) not wired:"
         );
         for u in &scalar_unwired {
+            eprintln!("  - {}: {}", u.sql_name, u.reason);
+        }
+    }
+    if !aggregate_unwired.is_empty() {
+        eprintln!(
+            "[duckdb-target] {} aggregate(s) not wired:",
+            aggregate_unwired.len(),
+        );
+        for u in &aggregate_unwired {
             eprintln!("  - {}: {}", u.sql_name, u.reason);
         }
     }
@@ -167,6 +183,15 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
                     .or_insert_with(|| wit_package.clone());
             }
         }
+    }
+    // Aggregate WIT modules — typically `pg_agg`
+    // (postgis-aggregates) and `pg_rast_agg`
+    // (postgis-raster-aggregates). Same package as the scalar set
+    // but a distinct module alias.
+    for entry in &aggregate_entries {
+        used_aliases
+            .entry(entry.shape.wit_module.clone())
+            .or_insert_with(|| entry.shape.wit_package.clone());
     }
 
     // Discover the primary shim package so we can gate resource
@@ -350,12 +375,23 @@ use bindings::exports::duckdb::extension::guest;
     s.push_str(&helpers_block);
 
     s.push_str(handle_table::render());
-    s.push_str(&lifecycle::render(&bridge_struct, plan));
+    s.push_str(&lifecycle::render(
+        &bridge_struct,
+        plan,
+        !aggregate_entries.is_empty(),
+        false,
+    ));
 
     // call_scalar dispatch: build the per-arm match
     let mut scalar_arms = String::new();
     let scalar_arm_count = build_scalar_arms(&mut scalar_arms, &scalar_entries);
     let _ = scalar_arm_count;
+
+    // call_aggregate dispatch: build the per-arm match
+    let mut aggregate_arms = String::new();
+    let aggregate_arm_count =
+        build_aggregate_arms(&mut aggregate_arms, &aggregate_entries);
+    let _ = aggregate_arm_count;
 
     s.push_str(&format!(
         r##"
@@ -416,12 +452,22 @@ impl callback_dispatch::Guest for {bridge_struct} {{
         ))
     }}
     fn call_aggregate(
-        _handle: u32,
-        _rows: types::Rowbatch,
+        handle: u32,
+        rows: types::Rowbatch,
     ) -> Result<types::Duckvalue, types::Duckerror> {{
-        Err(types::Duckerror::Unsupported(
-            format!("{primary}: aggregates not wired (Step 4 scalar-first cut)")
-        ))
+        let arm_idx = aggregate_handle_table()
+            .lock()
+            .expect("aggregate handle mutex poisoned")
+            .get(&handle)
+            .copied()
+            .ok_or_else(|| types::Duckerror::Internal(
+                "unknown aggregate handle".into()
+            ))?;
+        match arm_idx {{
+{aggregate_arms}            _ => Err(types::Duckerror::Internal(format!(
+                "unknown aggregate arm index {{}}", arm_idx
+            ))),
+        }}
     }}
     fn call_pragma(
         _handle: u32,
@@ -443,6 +489,7 @@ impl callback_dispatch::Guest for {bridge_struct} {{
 "##,
         bridge_struct = bridge_struct,
         scalar_arms = scalar_arms,
+        aggregate_arms = aggregate_arms,
         primary = primary,
     ));
 
@@ -451,6 +498,14 @@ impl callback_dispatch::Guest for {bridge_struct} {{
     // dedupe (so the handle→arm_idx map points at real arms) and
     // derive per-arg Logicaltype widths from the ParamShape IR.
     s.push_str(&register::render(plan, &scalar_entries)?);
+
+    // register_aggregates() body. Emitted only when any aggregate
+    // entry was classified; otherwise lifecycle::load skips the
+    // call. Mirrors the scalar registration shape but against the
+    // `Capabilitykind::Aggregate` registry.
+    if !aggregate_entries.is_empty() {
+        s.push_str(&register::render_aggregates(plan, &aggregate_entries)?);
+    }
 
     // Export macro at file scope
     s.push_str(&format!(
@@ -527,6 +582,50 @@ fn build_scalar_arms(
         let body = dispatch::emit_scalar_arm_body(
             &entry.shape,
             *fallible,
+            &entry.sql_name,
+            "                ",
+        );
+        out.push_str(&format!(
+            "            {arm_idx}usize => {{\n{body}\n            }}\n",
+        ));
+    }
+    next
+}
+
+/// Build the per-arm aggregate dispatch match arms. Each unique
+/// SQL name (canonical + each alias resolves to a separate
+/// registration but they share an arm-index since they all
+/// invoke the same WIT upstream). Mirrors `build_scalar_arms`'s
+/// sql_name dedupe so the handle→arm_idx map produced by
+/// `register::render_aggregates` lines up with these arms.
+fn build_aggregate_arms(
+    out: &mut String,
+    agg_entries: &[interface_db::AggregateEntry],
+) -> usize {
+    let mut arm_for: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    let mut next: usize = 0;
+    for entry in agg_entries {
+        let key: &str = entry.sql_name.as_str();
+        arm_for.entry(key).or_insert_with(|| {
+            let i = next;
+            next += 1;
+            i
+        });
+    }
+    let mut emitted: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    for entry in agg_entries {
+        let key: &str = entry.sql_name.as_str();
+        let arm_idx = match arm_for.get(key) {
+            Some(&i) => i,
+            None => continue,
+        };
+        if !emitted.insert(arm_idx) {
+            continue;
+        }
+        let body = dispatch::emit_aggregate_arm_body(
+            &entry.shape,
             &entry.sql_name,
             "                ",
         );

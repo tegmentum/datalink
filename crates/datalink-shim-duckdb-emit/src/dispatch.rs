@@ -31,8 +31,8 @@
 //!     makes UPSTREAM serdeable.
 
 use datalink_shim_codegen_core::interface_db::{
-    list_tuple_sig_suffix, DispatchShape, JsonRetKind, ListPrimElem,
-    ParamShape, RetShape,
+    list_tuple_sig_suffix, AccKind, AggregateShape, DispatchShape,
+    JsonRetKind, ListPrimElem, ParamShape, RetShape,
 };
 
 /// Emit the body of one match arm of `call_scalar`. The body
@@ -619,4 +619,260 @@ fn kebab_to_pascal(s: &str) -> String {
         }
     }
     out
+}
+
+// ─── Aggregate dispatch ───
+//
+// DuckDB's aggregate ABI hands the guest the entire group as
+// `rows: rowbatch` in one call (see callback-dispatch.wit:11
+// `call-aggregate`). The guest performs a whole-group fold and
+// returns a single `duckvalue`. There is no separate
+// init/step/finalize round-trip — the host gathers the rows
+// inside DuckDB's aggregate engine and delivers them as a single
+// `list<list<duckvalue>>`.
+//
+// Each row is `list<duckvalue>` ordered as the registration
+// declared its args. Column 0 is the streaming arg (a Blob
+// carrying the WKB for `Geom` accumulators or the
+// PostGIS-raster binary for `Raster` accumulators); columns
+// 1..N are extras that must be constant across rows
+// (PostgreSQL semantics — `set_or_validate_extras` enforces this
+// in sqlite-emit; here we read them from the first non-null row
+// and validate on subsequent rows).
+//
+// Returns the per-arm body — the caller wraps it in
+// `<arm_idx>usize => { ... }`.
+pub fn emit_aggregate_arm_body(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let mut s = String::new();
+
+    // Accumulator iteration: walk `rows`, skip rows whose
+    // streaming arg is NULL, collect raw blobs. Mirrors
+    // sqlite-emit's per-row push semantics (#548 W3.2) but
+    // performs the whole fold inline rather than across xStep
+    // callbacks.
+    let (decode_call, resource_ty, err_helper) = match shape.accumulator_kind {
+        AccKind::Geom => (
+            "Geometry::from_wkb(b)",
+            "Geometry",
+            "postgis_err_string",
+        ),
+        AccKind::Raster => (
+            "from_raster_binary(b.as_slice(), \"AGG_NAME\")",
+            "Raster",
+            "raster_err_string",
+        ),
+    };
+    let decode_call = decode_call.replace("AGG_NAME", sql_name);
+
+    // For aggregates with extras, latch the constant args from
+    // the first non-null row's tail and validate against
+    // subsequent rows. PostgreSQL semantics: SQL aggregate
+    // constant args MUST be uniform within a group.
+    let extras_pre = if shape.extra_args.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{i}let mut extras: Option<Vec<types::Duckvalue>> = None;\n",
+        )
+    };
+
+    let extras_latch = if shape.extra_args.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{i}    if extras.is_none() {{\n\
+             {i}        extras = Some(row[1..].to_vec());\n\
+             {i}    }} else if extras.as_ref().map(|e| e.as_slice() != &row[1..]).unwrap_or(false) {{\n\
+             {i}        return Err(types::Duckerror::Invalidargument(format!(\n\
+             {i}            \"{sql_name}: aggregate constant args drifted between rows\")));\n\
+             {i}    }}\n",
+        )
+    };
+
+    s.push_str(&extras_pre);
+    s.push_str(&format!(
+        "{i}let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(rows.len());\n\
+         {i}for row in &rows {{\n\
+         {i}    if row.is_empty() {{ continue; }}\n\
+         {i}    if matches!(row[0], types::Duckvalue::Null) {{ continue; }}\n\
+         {i}    let bytes = dv_blob(row, 0, \"{sql_name}\")?;\n\
+         {i}    blobs.push(bytes.to_vec());\n\
+         {extras_latch}{i}}}\n",
+    ));
+
+    // Decode accumulated blobs. The decode helper differs by
+    // accumulator kind; both produce a `Vec<&Resource>` so the
+    // call site below is uniform.
+    match shape.accumulator_kind {
+        AccKind::Geom => {
+            s.push_str(&format!(
+                "{i}let resources: Vec<{resource_ty}> = blobs.iter()\n\
+                 {i}    .map(|b| {decode_call})\n\
+                 {i}    .collect::<Result<Vec<_>, _>>()\n\
+                 {i}    .map_err(|e| types::Duckerror::Invalidargument(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", {err_helper}(e))))?;\n\
+                 {i}let refs: Vec<&{resource_ty}> = resources.iter().collect();\n",
+            ));
+        }
+        AccKind::Raster => {
+            // from_raster_binary returns Result<Raster, types::Duckerror>;
+            // it already wraps the error so we propagate with `?`.
+            s.push_str(&format!(
+                "{i}let resources: Vec<{resource_ty}> = blobs.iter()\n\
+                 {i}    .map(|b| {decode_call})\n\
+                 {i}    .collect::<Result<Vec<_>, _>>()?;\n\
+                 {i}let refs: Vec<&{resource_ty}> = resources.iter().collect();\n",
+            ));
+        }
+    }
+
+    // Marshal extras (constant across rows) into Rust-typed
+    // bindings. Only the primitive shapes seen in postgis/
+    // mobilitydb aggregate signatures are supported; geom/record/
+    // enum extras bail with a clear error.
+    let mut call_extras: Vec<String> = Vec::new();
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}let extras = extras.unwrap_or_default();\n",
+        ));
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            match p {
+                ParamShape::Text => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_text(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::F64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_f64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")? as i32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")? as u32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")? as u64;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Bool => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_bool(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Blob => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_blob(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::OptionNone => {
+                    call_extras.push("None".to_string());
+                }
+                ParamShape::Geom
+                | ParamShape::Geog
+                | ParamShape::Raster
+                | ParamShape::Topology
+                | ParamShape::ListGeom
+                | ParamShape::WitValueRecord { .. }
+                | ParamShape::Enum { .. }
+                | ParamShape::ListPrim(_)
+                | ParamShape::ListRecord { .. }
+                | ParamShape::ListTuple { .. } => {
+                    // Record / list / enum extras are not part of
+                    // the postgis or mobilitydb aggregate surfaces
+                    // today. Bail clearly so the unwired-symbol
+                    // diagnostic surfaces it.
+                    return format!(
+                        "{i}Err(types::Duckerror::Unsupported(format!(\
+                         \"{sql_name}: aggregate extra arg #{j} shape not wired\")))",
+                    );
+                }
+            }
+        }
+    }
+
+    let call_args = if call_extras.is_empty() {
+        "&refs".to_string()
+    } else {
+        format!("&refs, {}", call_extras.join(", "))
+    };
+
+    // Encode the upstream result back into a Duckvalue per
+    // RetShape. Mirrors the four ret shapes covered by sqlite-emit's
+    // `emit_aggregate_finalize_body` plus `Real` / `Int` for any
+    // future aggregate whose IR carries a primitive return.
+    match shape.ret {
+        RetShape::GeomBlob => {
+            s.push_str(&format!(
+                "{i}let r = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| types::Duckerror::Invalidargument(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}Ok(types::Duckvalue::Blob(r.as_wkb()))",
+            ));
+        }
+        RetShape::RasterBlob => {
+            s.push_str(&format!(
+                "{i}let r = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| types::Duckerror::Invalidargument(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", shim_err_string(e))))?;\n\
+                 {i}Ok(types::Duckvalue::Blob(r.as_binary()))",
+            ));
+        }
+        RetShape::FirstGeomBlob => {
+            s.push_str(&format!(
+                "{i}let r: Vec<Geometry> = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| types::Duckerror::Invalidargument(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}match r.first() {{\n\
+                 {i}    Some(g) => Ok(types::Duckvalue::Blob(g.as_wkb())),\n\
+                 {i}    None => Ok(types::Duckvalue::Null),\n\
+                 {i}}}",
+            ));
+        }
+        RetShape::FirstOptionU32Int => {
+            s.push_str(&format!(
+                "{i}let r: Vec<Option<u32>> = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| types::Duckerror::Invalidargument(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}match r.first() {{\n\
+                 {i}    Some(Some(v)) => Ok(types::Duckvalue::Int64(*v as i64)),\n\
+                 {i}    Some(None) | None => Ok(types::Duckvalue::Null),\n\
+                 {i}}}",
+            ));
+        }
+        _ => {
+            s.push_str(&format!(
+                "{i}Err(types::Duckerror::Unsupported(format!(\
+                 \"{sql_name}: aggregate return shape not wired\")))",
+            ));
+        }
+    }
+    s
 }

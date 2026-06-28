@@ -106,6 +106,12 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let (scalar_entries, scalar_unwired) =
         interface_db::build_full(plan, &shim_wit_dir, &records)?;
 
+    // Aggregate entries — wires the postgis & mobilitydb
+    // dissolve-shape aggregates against datafission's
+    // `aggregate_function_registry@1.0.0` handle-based ABI.
+    let (aggregate_entries, aggregate_unwired) =
+        interface_db::build_aggregate_registry(plan, &shim_wit_dir, &records)?;
+
     // Report on what fell through so the maintainer sees coverage
     // at codegen time.
     let total_unwired = scalar_unwired.len();
@@ -114,6 +120,15 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             "[datafission-target] {total_unwired} scalar(s) not wired in scalar-first cut:"
         );
         for u in &scalar_unwired {
+            eprintln!("  - {}: {}", u.sql_name, u.reason);
+        }
+    }
+    if !aggregate_unwired.is_empty() {
+        eprintln!(
+            "[datafission-target] {} aggregate(s) not wired:",
+            aggregate_unwired.len(),
+        );
+        for u in &aggregate_unwired {
             eprintln!("  - {}: {}", u.sql_name, u.reason);
         }
     }
@@ -166,6 +181,14 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
                     .or_insert_with(|| wit_package.clone());
             }
         }
+    }
+    // Aggregate WIT modules — typically `pg_agg`
+    // (postgis-aggregates) and `pg_rast_agg`
+    // (postgis-raster-aggregates).
+    for entry in &aggregate_entries {
+        used_aliases
+            .entry(entry.shape.wit_module.clone())
+            .or_insert_with(|| entry.shape.wit_package.clone());
     }
 
     // Collect referenced records: any scalar with a WitValueRecord
@@ -515,8 +538,17 @@ use bindings::datafission::function_plugin::types as types;
     let scalar_block = build_scalar_registry_impl(&scalar_entries, plan);
     s.push_str(&scalar_block);
 
-    // ---- aggregate-function-registry: stub ----
-    s.push_str(AGGREGATE_STUB);
+    // ---- aggregate-function-registry: WIRED ----
+    // When any aggregate is classified, emit the AccState prelude
+    // and the dispatching impl. Empty surface falls back to the
+    // original stub (advertises nothing, every per-call returns
+    // UnknownFunction) so an unwired bridge still compiles.
+    if aggregate_entries.is_empty() {
+        s.push_str(AGGREGATE_STUB);
+    } else {
+        s.push_str(AGGREGATE_STATE_BLOCK);
+        s.push_str(&build_aggregate_registry_impl(&aggregate_entries, plan));
+    }
 
     // ---- window-function-registry: stub ----
     s.push_str(WINDOW_STUB);
@@ -837,6 +869,298 @@ fn build_scalar_registry_impl(
         execute_arms = execute_arms,
     )
 }
+
+/// Build the `aggregate_function_registry::Guest` impl block.
+/// Emits per-name metadata, return_type arm, the
+/// create-accumulator family (passes the name into the per-handle
+/// AccState), `accumulate` (pushes the row's blob arg), `merge`
+/// (appends source blobs into target), and `finalize` (decodes
+/// the accumulated blobs and calls the upstream WIT aggregate).
+///
+/// The thread-local accumulator state lives in the
+/// `AGGREGATE_STATE_BLOCK` prelude emitted alongside this impl.
+fn build_aggregate_registry_impl(
+    agg_entries: &[interface_db::AggregateEntry],
+    _plan: &BridgePlan,
+) -> String {
+    // Walk aggregates with first-writer-wins dedupe over sql_name.
+    // The host calls all of {create_accumulator, accumulate, ...,
+    // finalize} by NAME — but our finalize body needs to know
+    // which decode/upstream-call recipe to run, so we assign each
+    // unique name an arm_idx and store it on the AccState. Aliases
+    // resolve to the same arm_idx as their canonical.
+    let mut arm_for: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut next_arm: usize = 0;
+    for entry in agg_entries {
+        arm_for.entry(entry.sql_name.clone()).or_insert_with(|| {
+            let i = next_arm;
+            next_arm += 1;
+            i
+        });
+    }
+
+    let mut metas_block = String::new();
+    let mut return_arms = String::new();
+    let mut create_arms = String::new();
+    let mut finalize_arms = String::new();
+    let mut emitted_finalize: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut seen_meta: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for entry in agg_entries {
+        let escaped = entry.sql_name.replace('"', "\\\"");
+        let arm_idx = *arm_for.get(&entry.sql_name).unwrap();
+
+        if seen_meta.insert(entry.sql_name.clone()) {
+            // ---- metadata entry ----
+            let mut sig_block = String::new();
+            sig_block.push_str("vec![vec![");
+            // Streaming accumulator arg signature: Blob (WKB or
+            // raster binary).
+            sig_block.push_str("ftypes::LogicalType::Binary, ");
+            for p in &entry.shape.extra_args {
+                let lt = dispatch::paramshape_to_logicaltype(p);
+                sig_block.push_str(&lt);
+                sig_block.push_str(", ");
+            }
+            sig_block.push_str("]]");
+            // config-arg-indices: positions 1..=extras_len map to
+            // the constant config args (after the streaming arg).
+            let mut cfg_indices = String::new();
+            for j in 0..entry.shape.extra_args.len() {
+                let i1 = j + 1;
+                cfg_indices.push_str(&format!("{i1}u32, "));
+            }
+            let accepts_config = !entry.shape.extra_args.is_empty();
+            metas_block.push_str(&format!(
+                "        ftypes::AggregateFunctionMeta {{\n\
+                 \x20           name: \"{escaped}\".to_string(),\n\
+                 \x20           aliases: Vec::new(),\n\
+                 \x20           param_types: {sig_block},\n\
+                 \x20           supports_grouped: true,\n\
+                 \x20           supports_partial: true,\n\
+                 \x20           is_order_sensitive: false,\n\
+                 \x20           accepts_config: {accepts_config},\n\
+                 \x20           config_arg_indices: vec![{cfg_indices}],\n\
+                 \x20       }},\n",
+            ));
+
+            let ret_logical =
+                dispatch::aggregate_ret_logicaltype(&entry.shape);
+            return_arms.push_str(&format!(
+                "            \"{escaped}\" => Ok({ret_logical}),\n",
+            ));
+
+            create_arms.push_str(&format!(
+                "            \"{escaped}\" => {arm_idx}usize,\n",
+            ));
+        }
+
+        if emitted_finalize.insert(arm_idx) {
+            let body = dispatch::emit_aggregate_finalize_body(
+                &entry.shape,
+                &entry.sql_name,
+                "                ",
+            );
+            finalize_arms.push_str(&format!(
+                "            {arm_idx}usize => {{\n{body}\n            }}\n",
+            ));
+        }
+    }
+
+    format!(
+        r##"impl aggregate_function_registry::Guest for Component {{
+    fn list_functions() -> Vec<ftypes::AggregateFunctionMeta> {{
+        vec![
+{metas_block}        ]
+    }}
+
+    fn return_type(
+        name: String,
+        _input_types: Vec<ftypes::LogicalType>,
+    ) -> Result<ftypes::LogicalType, ftypes::FunctionError> {{
+        match name.as_str() {{
+{return_arms}            other => Err(ftypes::FunctionError::UnknownFunction(other.into())),
+        }}
+    }}
+
+    fn create_accumulator(name: String) -> Result<u64, ftypes::FunctionError> {{
+        let arm = match name.as_str() {{
+{create_arms}            other => return Err(ftypes::FunctionError::UnknownFunction(other.into())),
+        }};
+        Ok(alloc_accumulator(arm, Vec::new()))
+    }}
+
+    fn create_accumulator_with_config(
+        name: String,
+        config: String,
+    ) -> Result<u64, ftypes::FunctionError> {{
+        let arm = match name.as_str() {{
+{create_arms}            other => return Err(ftypes::FunctionError::UnknownFunction(other.into())),
+        }};
+        Ok(alloc_accumulator(arm, alloc::vec![config]))
+    }}
+
+    fn create_accumulator_with_configs(
+        name: String,
+        configs: Vec<String>,
+    ) -> Result<u64, ftypes::FunctionError> {{
+        let arm = match name.as_str() {{
+{create_arms}            other => return Err(ftypes::FunctionError::UnknownFunction(other.into())),
+        }};
+        Ok(alloc_accumulator(arm, configs))
+    }}
+
+    fn accumulate(
+        handle: u64,
+        value: ftypes::ScalarValue,
+    ) -> Result<(), ftypes::FunctionError> {{
+        ACCUMULATORS.with(|m| {{
+            let mut g = m.borrow_mut();
+            let st = g.get_mut(&handle).ok_or_else(|| {{
+                ftypes::FunctionError::ExecutionError(format!(
+                    "no accumulator at handle {{}}", handle
+                ))
+            }})?;
+            // Null streaming inputs are skipped (SQL aggregate
+            // semantics: NULL contributions don't change the result).
+            if matches!(value, ftypes::ScalarValue::Null) {{
+                return Ok(());
+            }}
+            let bytes = match value {{
+                ftypes::ScalarValue::Binary(b) => b,
+                ftypes::ScalarValue::Utf8(s) => s.into_bytes(),
+                _ => return Err(ftypes::FunctionError::TypeError(
+                    "aggregate streaming arg must be BINARY".into()
+                )),
+            }};
+            st.blobs.push(bytes);
+            Ok(())
+        }})
+    }}
+
+    fn accumulate_batch(
+        handle: u64,
+        values: Vec<ftypes::ScalarValue>,
+    ) -> Result<(), ftypes::FunctionError> {{
+        for v in values {{
+            <Self as aggregate_function_registry::Guest>::accumulate(handle, v)?;
+        }}
+        Ok(())
+    }}
+
+    fn merge(
+        target: u64,
+        source: u64,
+    ) -> Result<(), ftypes::FunctionError> {{
+        ACCUMULATORS.with(|m| {{
+            let mut g = m.borrow_mut();
+            let src = g.remove(&source).ok_or_else(|| {{
+                ftypes::FunctionError::ExecutionError(format!(
+                    "merge: source handle {{}} not found", source
+                ))
+            }})?;
+            let tgt = g.get_mut(&target).ok_or_else(|| {{
+                ftypes::FunctionError::ExecutionError(format!(
+                    "merge: target handle {{}} not found", target
+                ))
+            }})?;
+            if tgt.arm_idx != src.arm_idx {{
+                return Err(ftypes::FunctionError::ExecutionError(
+                    "merge: target and source must come from the same aggregate".into()
+                ));
+            }}
+            tgt.blobs.extend(src.blobs);
+            Ok(())
+        }})
+    }}
+
+    fn finalize(handle: u64) -> Result<ftypes::ScalarValue, ftypes::FunctionError> {{
+        // Take the accumulator out — finalize consumes it
+        // (subsequent calls on the same handle return UnknownFunction).
+        let st = ACCUMULATORS.with(|m| m.borrow_mut().remove(&handle)).ok_or_else(|| {{
+            ftypes::FunctionError::ExecutionError(format!(
+                "finalize: no accumulator at handle {{}}", handle
+            ))
+        }})?;
+        match st.arm_idx {{
+{finalize_arms}            other => Err(ftypes::FunctionError::ExecutionError(format!(
+                "finalize: unknown aggregate arm {{}}", other
+            ))),
+        }}
+    }}
+
+    fn reset(handle: u64) {{
+        ACCUMULATORS.with(|m| {{
+            if let Some(st) = m.borrow_mut().get_mut(&handle) {{
+                st.blobs.clear();
+            }}
+        }});
+    }}
+
+    fn destroy_accumulator(handle: u64) {{
+        ACCUMULATORS.with(|m| {{
+            m.borrow_mut().remove(&handle);
+        }});
+    }}
+}}
+
+"##,
+    )
+}
+
+/// Per-handle accumulator state + thread-local map. Emitted into
+/// the bridge's lib.rs prelude once when any aggregate is wired.
+const AGGREGATE_STATE_BLOCK: &str = r##"// ─── Aggregate accumulator state ───
+//
+// Datafission's aggregate_function_registry@1.0.0 contract is
+// handle-based: create-accumulator returns u64, subsequent
+// accumulate/merge/finalize calls reference that handle. The
+// bridge keeps a thread-local `BTreeMap<u64, AccState>` keyed by
+// handle, with a monotonic u64 counter for fresh handles. Each
+// AccState carries: which aggregate (arm_idx) it represents, the
+// raw blobs accumulated via `accumulate`, and any constant
+// configs passed at create-accumulator-with-configs time.
+//
+// thread_local because wit-bindgen's guest impl is per-instance
+// and each component instance handles its own host calls in its
+// own thread.
+
+use core::cell::{Cell, RefCell};
+use alloc::collections::BTreeMap;
+
+#[derive(Clone)]
+struct AccState {
+    arm_idx: usize,
+    blobs: Vec<Vec<u8>>,
+    extras: Vec<String>,
+}
+
+thread_local! {
+    static ACCUMULATORS: RefCell<BTreeMap<u64, AccState>> =
+        RefCell::new(BTreeMap::new());
+    static NEXT_ACC_HANDLE: Cell<u64> = const { Cell::new(1) };
+}
+
+fn alloc_accumulator(arm_idx: usize, extras: Vec<String>) -> u64 {
+    let h = NEXT_ACC_HANDLE.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    ACCUMULATORS.with(|m| {
+        m.borrow_mut().insert(h, AccState {
+            arm_idx,
+            blobs: Vec::new(),
+            extras,
+        });
+    });
+    h
+}
+
+"##;
 
 const HEADER: &str =
     "// === GENERATED by sqlink-shim-codegen (target=datafission)  do not edit by hand ===\n\n";

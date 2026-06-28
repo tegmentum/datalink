@@ -49,7 +49,8 @@
 //!     `ExecutionError`.
 
 use datalink_shim_codegen_core::interface_db::{
-    DispatchShape, JsonRetKind, ListPrimElem, ParamShape, RetShape,
+    AccKind, AggregateShape, DispatchShape, JsonRetKind, ListPrimElem,
+    ParamShape, RetShape,
 };
 
 /// Emit the body of one match arm of the scalar dispatch by name
@@ -754,4 +755,226 @@ pub fn list_tuple_sig_suffix(elements: &[ListPrimElem]) -> String {
         .map(|e| e.helper_suffix())
         .collect::<Vec<_>>()
         .join("_")
+}
+
+// ─── Aggregate finalize dispatch ───
+//
+// Datafission's `aggregate_function_registry@1.0.0` contract is
+// handle-based, with a per-handle accumulator state on the guest
+// side:
+//
+//   create-accumulator(name)               -> u64                (init)
+//   accumulate(handle, value: scalar-value) -> ()                (per-row)
+//   merge(target, source)                  -> ()                 (combine)
+//   finalize(handle)                       -> scalar-value       (emit)
+//   reset(handle), destroy-accumulator(handle)
+//
+// The bridge maintains a global `BTreeMap<u64, AccState>` where
+// `AccState { arm_idx, blobs, extras }` carries the accumulator
+// arm-index, the streaming blobs collected via `accumulate`, and
+// any constant configs passed at `create-accumulator-with-configs`
+// time. `finalize` then dispatches by arm-index to the per-arm
+// body emitted here.
+//
+// Unlike the SQLite per-row step (which holds raw blobs in a
+// thread_local map keyed by context-id) the Datafission shape
+// holds them in the accumulator struct directly — handles are the
+// host's identity for the group.
+//
+// The per-arm body returned here is what goes inside the
+// `<arm_idx>usize => { ... }` finalize match. It expects bindings
+// `st: AccState` in scope (the popped accumulator).
+pub fn emit_aggregate_finalize_body(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let mut s = String::new();
+
+    // Decode accumulated blobs into a typed Vec<Resource>; build
+    // refs slice for the upstream call.
+    match shape.accumulator_kind {
+        AccKind::Geom => {
+            s.push_str(&format!(
+                "{i}let geoms: Vec<Geometry> = st.blobs.iter()\n\
+                 {i}    .map(|b| Geometry::from_wkb(b))\n\
+                 {i}    .collect::<Result<Vec<_>, _>>()\n\
+                 {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}let refs: Vec<&Geometry> = geoms.iter().collect();\n",
+            ));
+        }
+        AccKind::Raster => {
+            // from_raster_binary returns Result<Raster, FunctionError>;
+            // it already wraps the error so we propagate with `?`.
+            s.push_str(&format!(
+                "{i}let rasters: Vec<Raster> = st.blobs.iter()\n\
+                 {i}    .map(|b| from_raster_binary(b.as_slice(), \"{sql_name}\"))\n\
+                 {i}    .collect::<Result<Vec<_>, _>>()?;\n\
+                 {i}let refs: Vec<&Raster> = rasters.iter().collect();\n",
+            ));
+        }
+    }
+
+    // Marshal extras (configs passed at create-accumulator-with-
+    // configs time) into Rust-typed bindings. Each config is a
+    // JSON-encoded string; the host JSON-encodes constant arg slots
+    // when calling the constructor.
+    let mut call_extras: Vec<String> = Vec::new();
+    if !shape.extra_args.is_empty() {
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            let getc = format!(
+                "{i}let extra{j}_str = st.extras.get({j})\n\
+                 {i}    .ok_or_else(|| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: missing config arg #{j}\")))?;\n",
+            );
+            match p {
+                ParamShape::Text => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: &str = extra{j}_str.as_str();\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::F64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: f64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S32 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: i32 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: i64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U32 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: u32 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: u64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Bool => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: bool = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::OptionNone => {
+                    call_extras.push("None".to_string());
+                }
+                ParamShape::Blob
+                | ParamShape::Geom
+                | ParamShape::Geog
+                | ParamShape::Raster
+                | ParamShape::Topology
+                | ParamShape::ListGeom
+                | ParamShape::WitValueRecord { .. }
+                | ParamShape::Enum { .. }
+                | ParamShape::ListPrim(_)
+                | ParamShape::ListRecord { .. }
+                | ParamShape::ListTuple { .. } => {
+                    return format!(
+                        "{i}Err(ftypes::FunctionError::ExecutionError(\
+                         format!(\"{sql_name}: aggregate config arg #{j} shape not wired\")))",
+                    );
+                }
+            }
+        }
+    }
+
+    let call_args = if call_extras.is_empty() {
+        "&refs".to_string()
+    } else {
+        format!("&refs, {}", call_extras.join(", "))
+    };
+
+    match shape.ret {
+        RetShape::GeomBlob => {
+            s.push_str(&format!(
+                "{i}let r = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}Ok(ftypes::ScalarValue::Binary(r.as_wkb()))",
+            ));
+        }
+        RetShape::RasterBlob => {
+            s.push_str(&format!(
+                "{i}let r = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", shim_err_string(e))))?;\n\
+                 {i}Ok(ftypes::ScalarValue::Binary(r.as_binary()))",
+            ));
+        }
+        RetShape::FirstGeomBlob => {
+            s.push_str(&format!(
+                "{i}let r: Vec<Geometry> = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}match r.first() {{\n\
+                 {i}    Some(g) => Ok(ftypes::ScalarValue::Binary(g.as_wkb())),\n\
+                 {i}    None => Ok(ftypes::ScalarValue::Null),\n\
+                 {i}}}",
+            ));
+        }
+        RetShape::FirstOptionU32Int => {
+            s.push_str(&format!(
+                "{i}let r: Vec<Option<u32>> = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}match r.first() {{\n\
+                 {i}    Some(Some(v)) => Ok(ftypes::ScalarValue::Int64(*v as i64)),\n\
+                 {i}    Some(None) | None => Ok(ftypes::ScalarValue::Null),\n\
+                 {i}}}",
+            ));
+        }
+        _ => {
+            s.push_str(&format!(
+                "{i}Err(ftypes::FunctionError::ExecutionError(\
+                 format!(\"{sql_name}: aggregate return shape not wired\")))",
+            ));
+        }
+    }
+    s
+}
+
+/// Map an `AggregateShape` ret to the LogicalType the
+/// `return_type` method should advertise. Same FROZEN logical-set
+/// rules as scalar `retshape_to_logicaltype`. Mirrors the per-arm
+/// finalize encoder.
+pub fn aggregate_ret_logicaltype(shape: &AggregateShape) -> String {
+    retshape_to_logicaltype(&shape.ret)
 }
