@@ -1,0 +1,18 @@
+[package]
+name = "datalink-shim-codegen-core"
+version = "0.1.0"
+edition = "2021"
+description = "Database-agnostic substrate for the shim-bridge codegen: WIT walker + reachability, record registry (canonical-CBOR type-id derivation), interface-DB parser to dispatch IR, force-link emission, name-matching heuristic, and operator/passthrough/tuple_pick override tables. Carved out of sqlink-shim-codegen Step 2 of PLAN-shim-codegen-datalink-migration; per-database emit subtrees (sqlite, future duckdb) consume this crate."
+license = "Apache-2.0"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "datalink_shim_codegen_core"
+path = "src/lib.rs"
+
+[dependencies]
+shim-bridge-codegen-core = { git = "https://github.com/tegmentum/shim-bridge-codegen-core.git", rev = "0e25c2929845b9051e8481746f63061a3944037a" }
+anyhow = "1"
+# Canonical-WIT shape hashing for wit-value type-id (32-byte
+# sha256 match key in `typed-value-binding`).
+sha2 = "0.10"
