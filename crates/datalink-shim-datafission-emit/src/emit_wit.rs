@@ -1,0 +1,407 @@
+//! Emit the WIT world + vendored deps for the wasm-component
+//! bridge (datafission target).
+//!
+//! The world `include`s the canonical composite world
+//! `datafission:extension/extension@1.0.0` (which transitively
+//! exports identity, sql-extension-plugin/metadata, scalar /
+//! aggregate / window / table function registries, custom-type,
+//! multi-custom-type, spatial-index, system-catalog, and index)
+//! AND adds `import` declarations for every upstream shim
+//! interface the bridge delegates scalar work to (the same
+//! `postgis:wasm/*` / `mobilitydb:temporal/*` set the SQLite and
+//! DuckDB targets consume).
+//!
+//! The vendored `wit/deps/` holds the seven datafission packages
+//! (extension + function-plugin + sql-extension-plugin + type-plugin
+//! + spatial-index-plugin + system-catalog-plugin + index-plugin)
+//! plus the upstream shim packages.
+//!
+//! ## Source locations
+//!
+//! Per-primary upstream-shim WIT (same as the SQLite + DuckDB
+//! targets):
+//!   * `postgis`     → `~/git/sqlink/extensions/postgis-bridge/wit/deps`
+//!   * `mobilitydb`  → `~/git/mobilitydb-sqlink-bridge/wit/deps`
+//!                 (or `~/git/mobilitydb-wasm/wit/deps`)
+//!
+//! Datafission extension WIT:
+//!   * `$DATAFISSION_EXTENSION_WIT_DEPS=...` (overrides the search;
+//!     should point at a `wit/deps/` directory containing the seven
+//!     datafission packages already laid out, e.g.
+//!     `~/git/datafission/extensions/postgis/wit/deps`)
+//!   * `$DATAFISSION_WIT=...` (point at the canonical
+//!     `~/git/datafission/wit` and let the codegen vendor each
+//!     plugin package itself)
+//!   * `$HOME/git/datafission/extensions/<primary>/wit/deps`
+//!     (use the per-extension pre-laid-out deps tree)
+//!   * `$HOME/git/datafission/wit` (vendor from the canonical
+//!     source-of-truth dir)
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context, Result};
+
+use shim_bridge_codegen_core::BridgePlan;
+use datalink_shim_codegen_core::wit_parse::{self, WitPackage};
+
+/// Write `wit/world.wit`.
+pub fn write_world(plan: &BridgePlan, dest: &Path) -> Result<()> {
+    let primary = primary_extension_name(plan);
+    let shim_deps = source_shim_deps_dir(primary)?;
+    let shim_packages = discover_shim_packages(&shim_deps)?;
+    let datafission_pkg = discover_datafission_extension_package(primary)?;
+    let world = render_world(primary, &shim_packages, &datafission_pkg);
+    fs::write(dest, world).with_context(|| format!("writing {}", dest.display()))?;
+    Ok(())
+}
+
+/// Copy the dependency WIT tree into `wit/deps/`.
+///
+/// Every subdir of the source shim deps tree that holds a
+/// well-formed package is copied as-is, EXCLUDING:
+///   - `sqlite-extension` — not part of the datafission world.
+///   - `duckdb-extension` — not part of the datafission world.
+///   - The seven `datafission:*` packages — those are sourced
+///     separately from the canonical datafission WIT location so
+///     a shim-side stale copy can't drift the contract.
+pub fn write_deps(plan: &BridgePlan, deps_dir: &Path) -> Result<()> {
+    let primary = primary_extension_name(plan);
+    let shim_src = source_shim_deps_dir(primary)?;
+    for entry in fs::read_dir(&shim_src)? {
+        let entry = entry?;
+        let from = entry.path();
+        if !from.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(
+            name_str.as_ref(),
+            "sqlite-extension"
+                | "duckdb-extension"
+                | "extension"
+                | "function-plugin"
+                | "sql-extension-plugin"
+                | "type-plugin"
+                | "spatial-index-plugin"
+                | "system-catalog-plugin"
+                | "index-plugin"
+        ) {
+            // SQLite + DuckDB contracts aren't part of the
+            // datafission world. The seven datafission packages
+            // ride through the canonical source-of-truth copy
+            // below.
+            continue;
+        }
+        let to = deps_dir.join(&name);
+        copy_tree(&from, &to)
+            .with_context(|| format!("copying {} -> {}", from.display(), to.display()))?;
+    }
+    let datafission_wit_root = source_datafission_wit_root()?;
+    for pkg_dir_name in DATAFISSION_PACKAGE_DIRS {
+        let from = datafission_wit_root.join(pkg_dir_name);
+        if !from.is_dir() {
+            return Err(anyhow!(
+                "datafission WIT package directory missing: {}",
+                from.display()
+            ));
+        }
+        let to = deps_dir.join(pkg_dir_name);
+        copy_tree(&from, &to).with_context(|| {
+            format!(
+                "copying datafission wit/{} -> {}",
+                pkg_dir_name,
+                to.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Locate the source `wit/deps/` directory for the upstream shim
+/// WIT packages. Same lookup tree as sqlite-emit and duckdb-emit —
+/// the wasm component imports are identical between the three
+/// targets; only the contract (sqlite:extension / duckdb:extension /
+/// datafission:extension) differs at the export surface.
+pub fn source_shim_deps_dir(primary: &str) -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("SQLINK_SHIM_WIT_DEPS") {
+        let p = PathBuf::from(p);
+        if p.is_dir() {
+            return Ok(p);
+        }
+        return Err(anyhow!(
+            "SQLINK_SHIM_WIT_DEPS={} does not exist",
+            p.display()
+        ));
+    }
+    let env_per_primary = match primary {
+        "postgis" => Some("SQLINK_POSTGIS_BRIDGE_WIT_DEPS"),
+        "mobilitydb" => Some("SQLINK_MOBILITYDB_BRIDGE_WIT_DEPS"),
+        _ => None,
+    };
+    if let Some(var) = env_per_primary {
+        if let Ok(p) = std::env::var(var) {
+            let p = PathBuf::from(p);
+            if p.is_dir() {
+                return Ok(p);
+            }
+            return Err(anyhow!("{}={} does not exist", var, p.display()));
+        }
+    }
+    let candidates: Vec<PathBuf> = match primary {
+        "postgis" => vec![
+            home_path("git/sqlink/extensions/postgis-bridge/wit/deps"),
+            Some(PathBuf::from("../sqlink/extensions/postgis-bridge/wit/deps")),
+        ],
+        "mobilitydb" => vec![
+            home_path("git/mobilitydb-sqlink-bridge/wit/deps"),
+            home_path("git/mobilitydb-wasm/wit/deps"),
+            Some(PathBuf::from("../mobilitydb-wasm/wit/deps")),
+        ],
+        _ => vec![home_path(&format!(
+            "git/{}-sqlink-bridge/wit/deps",
+            primary
+        ))],
+    }
+    .into_iter()
+    .flatten()
+    .collect();
+    for c in &candidates {
+        if c.is_dir() {
+            return Ok(c.clone());
+        }
+    }
+    Err(anyhow!(
+        "cannot locate shim wit/deps for primary '{primary}'. Set \
+         SQLINK_SHIM_WIT_DEPS=/path/to/wit/deps"
+    ))
+}
+
+/// Locate the canonical datafission WIT root.
+///
+/// Resolution order:
+///   1. `$DATAFISSION_EXTENSION_WIT_DEPS` — point at an
+///      already-laid-out `wit/deps/` (e.g. the postgis extension's
+///      own `wit/deps/`). When set, this dir is used VERBATIM as the
+///      package source.
+///   2. `$DATAFISSION_WIT` — explicit override pointing at
+///      `~/git/datafission/wit` (or wherever the seven plugin
+///      packages live).
+///   3. `$HOME/git/datafission/extensions/<primary>/wit/deps`
+///      (per-extension pre-laid-out deps tree).
+///   4. `$HOME/git/datafission/wit` (canonical source-of-truth).
+fn source_datafission_wit_root() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("DATAFISSION_EXTENSION_WIT_DEPS") {
+        let p = PathBuf::from(p);
+        if p.is_dir() {
+            return Ok(p);
+        }
+        return Err(anyhow!(
+            "DATAFISSION_EXTENSION_WIT_DEPS={} does not exist",
+            p.display()
+        ));
+    }
+    if let Ok(p) = std::env::var("DATAFISSION_WIT") {
+        let p = PathBuf::from(p);
+        if p.is_dir() {
+            return Ok(p);
+        }
+        return Err(anyhow!(
+            "DATAFISSION_WIT={} does not exist",
+            p.display()
+        ));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_pb = PathBuf::from(&home);
+        let per_ext = home_pb.join("git/datafission/extensions");
+        if per_ext.is_dir() {
+            for entry in fs::read_dir(&per_ext)?.flatten() {
+                let pe_wit = entry.path().join("wit/deps");
+                if pe_wit.is_dir() && pe_wit.join("extension/world.wit").is_file() {
+                    return Ok(pe_wit);
+                }
+            }
+        }
+        let canonical = home_pb.join("git/datafission/wit");
+        if canonical.is_dir() {
+            return Ok(canonical);
+        }
+    }
+    Err(anyhow!(
+        "cannot locate datafission wit/. Set DATAFISSION_WIT=/path/to/datafission/wit \
+         or DATAFISSION_EXTENSION_WIT_DEPS=/path/to/wit/deps"
+    ))
+}
+
+/// Discover datafission's `extension` package, used to render the
+/// world's `include` statement with the correct version pin.
+pub fn discover_datafission_extension_package(_primary: &str) -> Result<WitPackage> {
+    let root = source_datafission_wit_root()?;
+    let pkg_dir = root.join("extension");
+    let pkg = wit_parse::parse_package_dir(&pkg_dir)?.ok_or_else(|| {
+        anyhow!(
+            "datafission extension wit dir {} has no parseable package declaration",
+            pkg_dir.display()
+        )
+    })?;
+    Ok(pkg)
+}
+
+/// Walk the shim deps tree and parse every package subdir into a
+/// `WitPackage`. The datafission packages are loaded separately
+/// (from the canonical datafission WIT location).
+pub fn discover_shim_packages(deps_root: &Path) -> Result<Vec<WitPackage>> {
+    let mut out = Vec::new();
+    if !deps_root.is_dir() {
+        return Ok(out);
+    }
+    let mut entries: Vec<PathBuf> = fs::read_dir(deps_root)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    entries.sort();
+    for d in entries {
+        let name = d.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if matches!(
+            name,
+            "sqlite-extension"
+                | "duckdb-extension"
+                | "extension"
+                | "function-plugin"
+                | "sql-extension-plugin"
+                | "type-plugin"
+                | "spatial-index-plugin"
+                | "system-catalog-plugin"
+                | "index-plugin"
+        ) {
+            continue;
+        }
+        if let Some(pkg) = wit_parse::parse_package_dir(&d)
+            .with_context(|| format!("parsing {}", d.display()))?
+        {
+            out.push(pkg);
+        }
+    }
+    Ok(out)
+}
+
+/// Render `world.wit` from the parsed packages.
+///
+/// The world `include`s the composite datafission extension world,
+/// which exports all 11 capability interfaces (identity, sql-ext
+/// metadata, scalar/aggregate/window/table function registries,
+/// custom-type, multi-custom-type, spatial-index, system-catalog,
+/// index). Each shim-package import is added so the bridge can
+/// delegate scalar work to the upstream component via `wac plug`.
+pub fn render_world(
+    primary: &str,
+    shim_packages: &[WitPackage],
+    datafission_pkg: &WitPackage,
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "package datafission-bridge:{primary}@0.1.0;\n\n",
+    ));
+    s.push_str("/// Generated by sqlink-shim-codegen (target=datafission).\n");
+    s.push_str("/// Bridges the shim's WIT-exposed surface onto the\n");
+    s.push_str("/// canonical `datafission:extension@1.0.0` composite\n");
+    s.push_str("/// world. Imports are derived from the shim's\n");
+    s.push_str("/// vendored WIT packages; exports come from the\n");
+    s.push_str("/// `include`d composite world (identity +\n");
+    s.push_str("/// sql-extension-plugin/metadata + 4× function\n");
+    s.push_str("/// registries + custom-type + multi-custom-type +\n");
+    s.push_str("/// spatial-index + system-catalog + index).\n");
+    s.push_str("world bridge {\n");
+
+    // Include the canonical composite world. The `extension` world
+    // pulls in all per-capability exports.
+    s.push_str(&format!(
+        "    include {ns}/extension@{ver};\n",
+        ns = datafission_pkg.ns_name,
+        ver = datafission_pkg.version,
+    ));
+    // The composite world omits multi-custom-type intentionally (see
+    // `extension/world.wit`'s comment block). Add it as an explicit
+    // export so generated bridges can register N custom types from
+    // a single component (matches the postgis-shim world's pattern).
+    s.push_str(&format!(
+        "    export datafission:type-plugin/multi-custom-type@1.0.0;\n",
+    ));
+    s.push('\n');
+
+    // Shim imports — every interface in every shim package.
+    for pkg in shim_packages {
+        for iface in &pkg.interfaces {
+            s.push_str(&format!(
+                "    import {ns}/{iface}@{ver};\n",
+                ns = pkg.ns_name,
+                iface = iface,
+                ver = pkg.version,
+            ));
+        }
+    }
+    s.push_str("}\n");
+    s
+}
+
+/// The seven datafission WIT packages that get vendored into the
+/// bridge's `wit/deps/`. Directory names follow the canonical
+/// `~/git/datafission/wit/<plugin>/` layout.
+pub const DATAFISSION_PACKAGE_DIRS: &[&str] = &[
+    "extension",
+    "function-plugin",
+    "sql-extension-plugin",
+    "type-plugin",
+    "spatial-index-plugin",
+    "system-catalog-plugin",
+    "index-plugin",
+];
+
+pub(crate) fn primary_extension_name(plan: &BridgePlan) -> &str {
+    plan.extensions
+        .first()
+        .map(|e| e.name.as_str())
+        .unwrap_or("shim")
+}
+
+/// Returns true when `package` is the primary shim's own package
+/// (mirrors the helper in sqlite-emit / duckdb-emit's emit_wit).
+pub fn package_belongs_to_primary(package: &str, primary: &str) -> bool {
+    package.split(':').next().map(|ns| ns == primary).unwrap_or(false)
+}
+
+fn home_path(rel: &str) -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rel))
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Err(anyhow!("source {} is not a directory", src.display()));
+    }
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if file_type.is_file() {
+            if same_file(&from, &to) {
+                continue;
+            }
+            fs::copy(&from, &to)
+                .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
