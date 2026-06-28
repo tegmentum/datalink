@@ -1071,14 +1071,18 @@ fn emit_aggregate_finalize_body_record(
     let i = arm_indent;
     let module = &shape.wit_module;
     let func = &shape.wit_func;
-    let AccKind::Record { kebab_name, .. } = &shape.accumulator_kind else {
+    let AccKind::Record { input, output } = &shape.accumulator_kind else {
         unreachable!("invariant: caller checks AccKind::Record");
     };
-    let snake = kebab_name.replace('-', "_");
+    // #612 (OQ1): decode side resolves the per-record helper on the
+    // INPUT record; encode side resolves on the OUTPUT record. For
+    // same-record aggregates the two snakes are identical.
+    let in_snake = input.kebab_name.replace('-', "_");
+    let out_snake = output.kebab_name.replace('-', "_");
 
     let mut s = String::new();
     // Drain the per-context witvalue accumulator, then decode each
-    // payload to UPSTREAM via the per-record helper.
+    // payload to UPSTREAM via the per-input-record helper.
     s.push_str(&format!(
         "{i}let payloads = take_witvalue_state(context_id);\n\
          {i}let mut upstream_vec = Vec::with_capacity(payloads.len());\n\
@@ -1088,7 +1092,7 @@ fn emit_aggregate_finalize_body_record(
          {i}    // slice so we can reuse the helper from the aggregate\n\
          {i}    // finalize site.\n\
          {i}    let __args = [SqlValue::WitValue(pw)];\n\
-         {i}    upstream_vec.push(arg_witvalue_{snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}    upstream_vec.push(arg_witvalue_{in_snake}(&__args, 0, \"{sql_name}\")?);\n\
          {i}}}\n",
     ));
 
@@ -1104,11 +1108,15 @@ fn emit_aggregate_finalize_body_record(
     }
 
     // Upstream takes `list<R>` which wit-bindgen lowers to `&[R]`;
-    // `&upstream_vec` coerces to a slice cleanly.
+    // `&upstream_vec` coerces to a slice cleanly. The Option<R'>
+    // result encodes back via the output-record's ret helper, which
+    // may differ from the input record (#612 OQ1: e.g. decode via
+    // `arg_witvalue_tgeompoint_sequence`, encode via
+    // `ret_to_witvalue_stbox`).
     s.push_str(&format!(
         "{i}let __r = {module}::{func}(&upstream_vec);\n\
          {i}match __r {{\n\
-         {i}    Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
+         {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
          {i}    None => Ok(SqlValue::Null),\n\
          {i}}}",
     ));

@@ -244,12 +244,17 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             _ => {}
         }
     }
-    // #607 Phase 2: record-typed aggregate accumulator + return.
+    // #607 Phase 2 + #612 (OQ1): record-typed aggregates reference
+    // TWO per-record codec sites — decode via `arg_witvalue_<in>`
+    // on the input record + encode via `ret_to_witvalue_<out>` on
+    // the output record. Same-record aggregates have `input ==
+    // output`; different-record aggregates carry distinct kebabs.
     for entry in &aggregate_entries {
-        if let interface_db::AccKind::Record { kebab_name, .. } =
+        if let interface_db::AccKind::Record { input, output } =
             &entry.shape.accumulator_kind
         {
-            referenced_records.insert(kebab_name.clone());
+            referenced_records.insert(input.kebab_name.clone());
+            referenced_records.insert(output.kebab_name.clone());
         }
         match &entry.shape.ret {
             interface_db::RetShape::WitValueRecord { kebab_name, .. }

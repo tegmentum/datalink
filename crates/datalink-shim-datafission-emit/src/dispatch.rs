@@ -1052,10 +1052,14 @@ fn emit_aggregate_finalize_body_record(
     let i = arm_indent;
     let module = &shape.wit_module;
     let func = &shape.wit_func;
-    let AccKind::Record { kebab_name, .. } = &shape.accumulator_kind else {
+    let AccKind::Record { input, output } = &shape.accumulator_kind else {
         unreachable!("invariant: caller checks AccKind::Record");
     };
-    let snake = kebab_name.replace('-', "_");
+    // #612 (OQ1): decode side resolves the per-record helper on the
+    // INPUT record; encode side resolves on the OUTPUT record. For
+    // same-record aggregates the two snakes are identical.
+    let in_snake = input.kebab_name.replace('-', "_");
+    let out_snake = output.kebab_name.replace('-', "_");
 
     let mut s = String::new();
     s.push_str(&format!(
@@ -1068,7 +1072,7 @@ fn emit_aggregate_finalize_body_record(
          {i}    // the WTV magic + type-id and ciborium-decodes the\n\
          {i}    // CBOR payload into UPSTREAM.\n\
          {i}    let __args = [ftypes::ScalarValue::Binary(b.clone())];\n\
-         {i}    upstream_vec.push(arg_witvalue_{snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}    upstream_vec.push(arg_witvalue_{in_snake}(&__args, 0, \"{sql_name}\")?);\n\
          {i}}}\n",
     ));
 
@@ -1082,10 +1086,14 @@ fn emit_aggregate_finalize_body_record(
         return s;
     }
 
+    // Option<R'> result encodes via the output-record's ret helper,
+    // which may differ from the input record (#612 OQ1: e.g. decode
+    // via `arg_witvalue_tgeompoint_sequence`, encode via
+    // `ret_to_witvalue_stbox`).
     s.push_str(&format!(
         "{i}let __r = {module}::{func}(&upstream_vec);\n\
          {i}match __r {{\n\
-         {i}    Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
+         {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
          {i}    None => Ok(ftypes::ScalarValue::Null),\n\
          {i}}}\n",
     ));

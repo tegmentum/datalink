@@ -1859,12 +1859,17 @@ fn collect_referenced_records(
         if let Some(name) = record_name_in_ret(&entry.shape.ret) {
             out.insert(name.clone());
         }
-        // #607 Phase 1: AccKind::Record aggregates reference the
-        // upstream record's `arg_witvalue_<snake>` decoder helper
-        // at the aggregate's finalize site. Pull the kebab into the
-        // helper-emission set so the codec helpers get generated.
-        if let dispatch::AccKind::Record { kebab_name, .. } = &entry.shape.accumulator_kind {
-            out.insert(kebab_name.clone());
+        // #607 Phase 1 + #612 (OQ1): AccKind::Record aggregates
+        // reference TWO per-record codec sites — `arg_witvalue_<in>`
+        // for the input record's decoder + `ret_to_witvalue_<out>`
+        // for the output record's encoder. For same-record aggregates
+        // (Phase 1 pilot scope) the two kebabs match, so only one
+        // codec block is emitted. For different-record aggregates
+        // (#612: `tgeompoint-st-extent`, `t*-temporal-count`) both
+        // need to be present.
+        if let dispatch::AccKind::Record { input, output } = &entry.shape.accumulator_kind {
+            out.insert(input.kebab_name.clone());
+            out.insert(output.kebab_name.clone());
         }
     }
     for entry in udtf_entries {
