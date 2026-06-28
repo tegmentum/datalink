@@ -18,7 +18,7 @@
 //! Nothing in this module touches `SqlValue` — that's the
 //! emit-side boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -2323,6 +2323,92 @@ pub fn build_full(
                 Err(reason) => unwired.push(UnwiredScalar {
                     sql_name: sc.canonical_name.clone(),
                     reason,
+                }),
+            }
+        }
+
+        // #631: cast-rewrite synthesis pass.
+        //
+        // Some extension shims emit `cast_rewrites` rows whose
+        // `function_name` points at a SQL-callable function that is
+        // present in the WIT surface but NOT registered as a row in
+        // the interface DB's `scalars` table. The mobilitydb shim
+        // does this for `stbox3d_from_text` — the cast rewrite says
+        // "CAST(text AS STBOX3D) → stbox3d_from_text(text)" but
+        // `register_scalar_function("stbox3d_from_text", ...)` is
+        // never called, so the canonical `for sc in &ext.scalars`
+        // loop above never sees the name and the dispatch table
+        // grows no arm for it.
+        //
+        // The override mechanism can't rescue this case — overrides
+        // run INSIDE the scalars loop, so a missing row stays
+        // invisible. We synthesize a `DispatchEntry` by looking up
+        // the function in WIT, classifying it, and pushing it onto
+        // `entries` directly. The cast_rewrites consumer downstream
+        // (sqlink/ducklink/datafission emit) then has a real arm to
+        // wire the cast to.
+        let known_scalar_names: HashSet<&str> = ext
+            .scalars
+            .iter()
+            .flat_map(|s| {
+                std::iter::once(s.canonical_name.as_str())
+                    .chain(s.aliases.iter().map(|a| a.as_str()))
+            })
+            .collect();
+        let mut synthesized: HashSet<String> = HashSet::new();
+        for cast in &ext.cast_rewrites {
+            let fn_name = cast.function_name.as_str();
+            if fn_name.is_empty() {
+                continue;
+            }
+            if known_scalar_names.contains(fn_name) {
+                continue;
+            }
+            if !synthesized.insert(fn_name.to_string()) {
+                continue;
+            }
+            // Build a one-element candidate list. Cast rewrites only
+            // carry the canonical SQL function name — no aliases —
+            // so `find_wit_fn`'s no-hyphen / `st_`-strip fallbacks
+            // run against just that name.
+            let candidates = vec![fn_name.to_string()];
+            let matched = find_wit_fn(&candidates, &wit_index, &wit_nohyphen)
+                .or_else(|| find_resource_method(&candidates, &method_index))
+                .or_else(|| {
+                    find_same_interface_free_fn(
+                        &candidates,
+                        &wit_index,
+                        &resource_iface_index,
+                    )
+                });
+            let Some(f) = matched else {
+                unwired.push(UnwiredScalar {
+                    sql_name: fn_name.to_string(),
+                    reason: format!(
+                        "cast_rewrites references function `{}` (target_type={}, \
+                         source_kind={}) but no WIT function matches and the \
+                         shim's scalars table has no row for it",
+                        fn_name, cast.target_type, cast.source_kind,
+                    ),
+                });
+                continue;
+            };
+            match classify_shape(f, records, &enums) {
+                Ok(shape) => {
+                    let fallible = f.ret.fallible;
+                    entries.push((
+                        DispatchEntry {
+                            sql_name: fn_name.to_string(),
+                            shape,
+                        },
+                        fallible,
+                    ));
+                }
+                Err(reason) => unwired.push(UnwiredScalar {
+                    sql_name: fn_name.to_string(),
+                    reason: format!(
+                        "cast_rewrites synthesis: {reason}"
+                    ),
                 }),
             }
         }
