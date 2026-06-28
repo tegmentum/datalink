@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 from . import dlconfig  # noqa: E402
@@ -49,6 +50,18 @@ def bare(cfg, name: str) -> str:
 def ext_dir(cfg, name: str) -> Path:
     sc_dir = cfg.get("scaffold", "extensions_dir", default="extensions")
     return cfg.repo_root / sc_dir / f"{bare(cfg, name)}{_suffix(cfg)}"
+
+
+def _lib_name(cfg, name: str) -> str | None:
+    """Custom [lib] name from the component's Cargo.toml, if it sets one."""
+    cargo = ext_dir(cfg, name) / "Cargo.toml"
+    if not cargo.exists():
+        return None
+    try:
+        data = tomllib.loads(cargo.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    return (data.get("lib") or {}).get("name")
 
 
 def find_smoke_files(cfg) -> list[Path]:
@@ -185,8 +198,21 @@ def build_component(cfg, name: str) -> tuple[bool, str]:
         return (False, "\n".join(result.stderr.split("\n")[-30:]))
     out_tmpl = cfg.get("smoke", "build_output")
     target_dir = cfg.repo_root / "target" / target / "release"
-    built = cfg.path(out_tmpl.replace("{UNDERSCORE}", underscore)
-                             .replace("{TARGET_DIR}", str(target_dir)))
+    # Resolve the REAL cargo-component output. Components that set a custom
+    # [lib] name emit "{lib_name}.wasm"; otherwise cargo derives the artifact
+    # from the package name, matching the configured "{UNDERSCORE}_component"
+    # template. Probe the lib-name candidate first, then the template, then
+    # fall back to the newest *.wasm cargo-component just produced.
+    candidates = []
+    lib_name = _lib_name(cfg, name)
+    if lib_name:
+        candidates.append(target_dir / f"{lib_name}.wasm")
+    candidates.append(cfg.path(out_tmpl.replace("{UNDERSCORE}", underscore)
+                                       .replace("{TARGET_DIR}", str(target_dir))))
+    built = next((c for c in candidates if c.exists()), None)
+    if built is None:
+        wasms = sorted(target_dir.glob("*.wasm"), key=lambda p: p.stat().st_mtime)
+        built = wasms[-1] if wasms else candidates[-1]
     if not built.exists():
         return (False, f"expected build output {cfg.rel(built)} not found")
     ext_artifacts = cfg.path(cfg.get("smoke", "extensions_dir"))
