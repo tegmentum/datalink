@@ -154,3 +154,4 @@ mod shim_duckdb;
 mod shim_duckdb_agg;
 mod shim_embed;
 mod shim_sqlite;
+mod shim_sqlite_agg;
