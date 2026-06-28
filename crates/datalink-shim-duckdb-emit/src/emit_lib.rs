@@ -237,8 +237,11 @@ impl callback_dispatch::Guest for {bridge_struct} {{
         primary = primary,
     ));
 
-    // register_scalars() body
-    s.push_str(&register::render(plan)?);
+    // register_scalars() body. Threading `scalar_entries` here
+    // lets register::render mirror build_scalar_arms's sql_name
+    // dedupe (so the handle→arm_idx map points at real arms) and
+    // derive per-arg Logicaltype widths from the ParamShape IR.
+    s.push_str(&register::render(plan, &scalar_entries)?);
 
     // Export macro at file scope
     s.push_str(&format!(
@@ -290,12 +293,26 @@ fn build_scalar_arms(
         });
     }
 
+    // Track which arm indices have already been emitted so we
+    // don't write the same `<arm_idx>usize => { ... }` arm twice
+    // when two SQL-name entries (canonical + alias, or two
+    // aliases) resolve to the same arm index. The match would
+    // accept it but rustc warns `unreachable_patterns` on the
+    // second emission. Mirrors sqlite-emit's `seen_ids` pattern
+    // in `emit_scalar_impl`.
+    let mut emitted: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
     for (entry, fallible) in scalar_entries {
         let key: &str = entry.sql_name.as_str();
         let arm_idx = match arm_for.get(key) {
             Some(&i) => i,
             None => continue,
         };
+        if !emitted.insert(arm_idx) {
+            // Same arm-index already emitted; skip to avoid the
+            // unreachable-pattern compiler warning.
+            continue;
+        }
         // Emit the arm body. The dispatch loop matches on
         // `arm_idx` (usize); we render `<arm_idx>usize => { ... }`.
         let body = dispatch::emit_scalar_arm_body(
