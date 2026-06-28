@@ -1147,6 +1147,10 @@ fn emit_aggregate_impl(
         }}
     }}
     fn value(func_id: u64, context_id: u64) -> Result<SqlValue, String> {{
+        // Bind to a `_` shadow so this compiles warning-clean when
+        // no window arms reference context_id (mobilitydb has 0
+        // window functions; the match arm list is empty).
+        let _ = context_id;
         match func_id {{
 {value_arms}            _ => Err(stubbed("aggregate-function value (window mode not wired)", func_id)),
         }}
