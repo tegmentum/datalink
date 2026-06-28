@@ -22,6 +22,7 @@ use anyhow::Result;
 use shim_bridge_codegen_core::BridgePlan;
 use crate::dispatch::{
     self, AggregateEntry, DispatchEntry, ParamShape, UdtfEntry, UnwiredScalar,
+    WindowEntry, WindowReturn,
 };
 use crate::emit_wit;
 use crate::vtab::{build_vtab_schema, visible_column_count};
@@ -49,6 +50,11 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let scalar_id_for = build_scalar_id_index(plan);
     let agg_id_for = build_aggregate_id_index(plan);
     let udtf_id_for = build_udtf_id_index(plan);
+    // #616 Phase 1: window functions occupy a distinct id range
+    // (3_000_000+) and route through the AggregateGuest interface
+    // (step/finalize/value/inverse) with `is_window: true` on the
+    // manifest entry. Same demux-by-func-id pattern as aggregates.
+    let window_id_for = build_window_id_index(plan);
 
     // Generate the dispatch registries from the WIT + interface DB.
     //
@@ -151,12 +157,18 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         dispatch::build_aggregate_registry(plan, &shim_wit_dir, &records)?;
     let (udtf_entries, mut udtf_unwired) =
         dispatch::build_udtf_registry(plan, &shim_wit_dir, &records)?;
+    // #616 Phase 1: classify window functions against the same WIT
+    // root the scalars/aggregates use.
+    let (window_entries, mut window_unwired) =
+        dispatch::build_window_registry(plan, &shim_wit_dir)?;
 
     // Collected diagnostics — surfaced at codegen time via stderr
     // so the maintainer can see in one place which functions
     // didn't get wired.
-    let total_unwired =
-        scalar_unwired.len() + agg_unwired.len() + udtf_unwired.len();
+    let total_unwired = scalar_unwired.len()
+        + agg_unwired.len()
+        + udtf_unwired.len()
+        + window_unwired.len();
     if total_unwired > 0 {
         eprintln!(
             "[wasm-target] {total_unwired} symbol(s) not wired (Phase 3):"
@@ -165,6 +177,7 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         all.append(&mut scalar_unwired);
         all.append(&mut agg_unwired);
         all.append(&mut udtf_unwired);
+        all.append(&mut window_unwired);
         for UnwiredScalar { sql_name, reason } in &all {
             eprintln!("  - {sql_name}: {reason}");
         }
@@ -268,6 +281,11 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         used_aliases
             .entry(u.shape.wit_module.clone())
             .or_insert_with(|| u.shape.wit_package.clone());
+    }
+    for w in &window_entries {
+        used_aliases
+            .entry(w.shape.wit_module.clone())
+            .or_insert_with(|| w.shape.wit_package.clone());
     }
 
     let mut s = String::new();
@@ -472,6 +490,102 @@ use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
                 | dispatch::AccKind::RecordToScalar { .. }
         )
     });
+    // #616 Phase 1: only emit window-function state machinery
+    // (per-context buffered rows + per-window-id compute helpers)
+    // when there's at least one wired window function. Mobilitydb
+    // (0 windows) skips this block — byte-identical to pre-#616.
+    let has_window = !window_entries.is_empty();
+    let (window_state_decl, window_state_helpers, window_compute_helpers) =
+        if has_window {
+            (
+                concat!(
+                    "\n    /// #616 Phase 1: per-context buffered partition rows\n",
+                    "    /// for window functions. Step() pushes each row's args;\n",
+                    "    /// value() lazily computes on first call (caching the\n",
+                    "    /// per-row result list) then walks a per-context cursor\n",
+                    "    /// emitting labels[cursor] per row. inverse() no-ops\n",
+                    "    /// (whole-partition compute is frame-invariant — DD2 in\n",
+                    "    /// PLAN-window-substrate.md). finalize() drops state.\n",
+                    "    static WINDOW_STATE: RefCell<HashMap<u64, WindowContext>> =\n",
+                    "        RefCell::new(HashMap::new());"
+                )
+                .to_string(),
+                concat!(
+                    "\n/// #616 Phase 1: per-window-context state. `rows` holds\n",
+                    "/// each row's incoming SqlValue args verbatim; `results`\n",
+                    "/// caches the upstream cluster function's per-row output\n",
+                    "/// after the first value() call; `cursor` walks one-per-\n",
+                    "/// value() emission.\n",
+                    "#[derive(Default)]\n",
+                    "struct WindowContext {\n",
+                    "    rows: Vec<Vec<SqlValue>>,\n",
+                    "    results: Option<Vec<SqlValue>>,\n",
+                    "    cursor: usize,\n",
+                    "}\n\n",
+                    "fn push_window_row(context_id: u64, args: Vec<SqlValue>) {\n",
+                    "    WINDOW_STATE.with(|m| {\n",
+                    "        m.borrow_mut()\n",
+                    "            .entry(context_id)\n",
+                    "            .or_default()\n",
+                    "            .rows\n",
+                    "            .push(args);\n",
+                    "    });\n",
+                    "}\n\n",
+                    "/// Pull the buffered partition rows from the per-context\n",
+                    "/// state without removing the entry (`value()` keeps reading\n",
+                    "/// `results`; `finalize()` drops the whole entry).\n",
+                    "fn drain_window_rows(context_id: u64) -> Vec<Vec<SqlValue>> {\n",
+                    "    WINDOW_STATE.with(|m| {\n",
+                    "        let mut g = m.borrow_mut();\n",
+                    "        g.get_mut(&context_id)\n",
+                    "            .map(|c| core::mem::take(&mut c.rows))\n",
+                    "            .unwrap_or_default()\n",
+                    "    })\n",
+                    "}\n\n",
+                    "/// Cache the computed per-row results on the per-context\n",
+                    "/// state (first value() call writes; subsequent reads).\n",
+                    "fn set_window_results(context_id: u64, results: Vec<SqlValue>) {\n",
+                    "    WINDOW_STATE.with(|m| {\n",
+                    "        let mut g = m.borrow_mut();\n",
+                    "        let entry = g.entry(context_id).or_default();\n",
+                    "        entry.results = Some(results);\n",
+                    "    });\n",
+                    "}\n\n",
+                    "/// Read the cached per-row results without consuming. Returns\n",
+                    "/// `None` when the cache hasn't been populated yet (caller\n",
+                    "/// recomputes via the per-func helper).\n",
+                    "fn window_results_cached(context_id: u64) -> Option<Vec<SqlValue>> {\n",
+                    "    WINDOW_STATE.with(|m| {\n",
+                    "        m.borrow().get(&context_id)\n",
+                    "            .and_then(|c| c.results.clone())\n",
+                    "    })\n",
+                    "}\n\n",
+                    "/// Advance the per-context cursor and return the previous\n",
+                    "/// value (SQLite walks `value()` left-to-right per the\n",
+                    "/// window-function ABI; the cursor counts rows already\n",
+                    "/// emitted from the partition).\n",
+                    "fn bump_window_cursor(context_id: u64) -> usize {\n",
+                    "    WINDOW_STATE.with(|m| {\n",
+                    "        let mut g = m.borrow_mut();\n",
+                    "        let entry = g.entry(context_id).or_default();\n",
+                    "        let i = entry.cursor;\n",
+                    "        entry.cursor += 1;\n",
+                    "        i\n",
+                    "    })\n",
+                    "}\n\n",
+                    "fn drop_window_state(context_id: u64) {\n",
+                    "    WINDOW_STATE.with(|m| {\n",
+                    "        m.borrow_mut().remove(&context_id);\n",
+                    "    });\n",
+                    "}\n"
+                )
+                .to_string(),
+                emit_window_compute_helpers(&window_entries),
+            )
+        } else {
+            (String::new(), String::new(), String::new())
+        };
+
     let (witvalue_state_decl, witvalue_state_helpers) = if has_record_agg {
         (
             "\n    /// #607 Phase 1: parallel accumulator for record-typed\n\
@@ -681,7 +795,7 @@ thread_local! {{
     /// concurrent geom + raster aggregates on the same connection
     /// don't share state.
     static AGG_RASTER_STATE: RefCell<HashMap<u64, Vec<Vec<u8>>>> =
-        RefCell::new(HashMap::new());{WITVALUE_AGG_STATE_DECL}
+        RefCell::new(HashMap::new());{WITVALUE_AGG_STATE_DECL}{WINDOW_STATE_DECL}
     /// Round 2: per-context constant args for aggregates that
     /// take extra params beyond the streaming geometry
     /// (`st_clusterwithin(geom, distance)` and friends).
@@ -713,8 +827,7 @@ fn take_raster_state(context_id: u64) -> Vec<Vec<u8>> {{
         m.borrow_mut().remove(&context_id).unwrap_or_default()
     }})
 }}
-{WITVALUE_AGG_STATE_HELPERS}
-
+{WITVALUE_AGG_STATE_HELPERS}{WINDOW_STATE_HELPERS}{WINDOW_COMPUTE_HELPERS}
 /// Round 2: store-or-validate the constant extras for an
 /// aggregate. On the first step we just record them; on
 /// subsequent steps we validate that the constants haven't
@@ -790,14 +903,18 @@ struct {bridge_struct};
         FORCE_LINK_BLOCK = force_link_block.as_str(),
         WITVALUE_AGG_STATE_DECL = witvalue_state_decl.as_str(),
         WITVALUE_AGG_STATE_HELPERS = witvalue_state_helpers.as_str(),
+        WINDOW_STATE_DECL = window_state_decl.as_str(),
+        WINDOW_STATE_HELPERS = window_state_helpers.as_str(),
+        WINDOW_COMPUTE_HELPERS = window_compute_helpers.as_str(),
     ));
 
     // MetadataGuest impl — reflect every scalar / aggregate / UDTF
     // from the interface DB into the manifest. Phase C: also reflect
     // every record-type discovered in the primary shim's WIT into
     // `typed_values` so the host's per-extension registry indexes
-    // them at load time.
-    s.push_str(&emit_metadata_impl(plan, &bridge_struct, &records));
+    // them at load time. #616: window functions ride the
+    // `aggregate_functions` list with `is_window: true`.
+    s.push_str(&emit_metadata_impl(plan, &bridge_struct, &records, &window_entries));
 
     // Phase E: per-record wit-value marshaling helpers. Each
     // record gets an `arg_witvalue_<snake>` decoder + a
@@ -832,10 +949,16 @@ struct {bridge_struct};
 
     // AggregateGuest impl — wires step/finalize for every wired
     // aggregate; unwired aggregates fall through to stub errors.
+    // #616: window functions ride the same AggregateGuest interface
+    // (step buffers rows, value computes-then-cursor, inverse no-ops,
+    // finalize drops state) — `is_window: true` on the manifest tells
+    // the host to register via `sqlite3_create_window_function`.
     s.push_str(&emit_aggregate_impl(
         &bridge_struct,
         &agg_entries,
         &agg_id_for,
+        &window_entries,
+        &window_id_for,
     ));
 
     // VtabGuest impl — every wired UDTF gets a per-vtab arm in
@@ -915,16 +1038,29 @@ impl ScalarFunctionGuest for {bridge_struct} {{
     )
 }
 
-/// Emit `impl AggregateGuest for $Bridge`.
+/// Emit `impl AggregateGuest for $Bridge`. #616: extended to
+/// dispatch window-function arms on the same interface — step
+/// buffers each row's args into `WINDOW_STATE`, value lazily
+/// computes the upstream cluster function on first call (caching
+/// `Vec<SqlValue>` results) then advances a per-context cursor to
+/// emit the next label, inverse no-ops (whole-partition compute
+/// is frame-invariant), finalize drops the per-context entry.
 fn emit_aggregate_impl(
     bridge_struct: &str,
     agg_entries: &[AggregateEntry],
     agg_id_for: &HashMap<&str, u64>,
+    window_entries: &[WindowEntry],
+    window_id_for: &HashMap<&str, u64>,
 ) -> String {
     let mut step_arms = String::new();
     let mut final_arms = String::new();
+    let mut value_arms = String::new();
+    let mut inverse_arms = String::new();
     let mut seen_step = std::collections::HashSet::new();
     let mut seen_final = std::collections::HashSet::new();
+    let mut seen_value = std::collections::HashSet::new();
+    let mut seen_inverse = std::collections::HashSet::new();
+
     for entry in agg_entries {
         let Some(&id) = agg_id_for.get(entry.sql_name.as_str()) else {
             continue;
@@ -951,6 +1087,49 @@ fn emit_aggregate_impl(
         }
     }
 
+    // #616 Phase 1: window-function arms across all 4 of step / value
+    // / inverse / finalize. The step buffers args verbatim into
+    // WINDOW_STATE; value() routes per func_id to the right per-window
+    // compute helper (emitted in the prelude); inverse() no-ops;
+    // finalize() drops the per-context state.
+    for entry in window_entries {
+        let Some(&id) = window_id_for.get(entry.sql_name.as_str()) else {
+            continue;
+        };
+        if seen_step.insert(id) {
+            step_arms.push_str(&format!(
+                "            {id} => {{\n                push_window_row(context_id, args);\n                Ok(())\n            }}\n",
+            ));
+        }
+        if seen_value.insert(id) {
+            let compute_fn = window_compute_fn_name(id);
+            value_arms.push_str(&format!(
+                "            {id} => {{\n\
+                 \x20               // First value() call materialises the cached results;\n\
+                 \x20               // subsequent calls read from cache and bump cursor.\n\
+                 \x20               if window_results_cached(context_id).is_none() {{\n\
+                 \x20                   let rows = drain_window_rows(context_id);\n\
+                 \x20                   let results = {compute_fn}(&rows)?;\n\
+                 \x20                   set_window_results(context_id, results);\n\
+                 \x20               }}\n\
+                 \x20               let i = bump_window_cursor(context_id);\n\
+                 \x20               let cached = window_results_cached(context_id).unwrap_or_default();\n\
+                 \x20               Ok(cached.get(i).cloned().unwrap_or(SqlValue::Null))\n\
+                 \x20           }}\n",
+            ));
+        }
+        if seen_inverse.insert(id) {
+            inverse_arms.push_str(&format!(
+                "            {id} => {{ Ok(()) }} // whole-partition compute: inverse is a no-op\n",
+            ));
+        }
+        if seen_final.insert(id) {
+            final_arms.push_str(&format!(
+                "            {id} => {{\n                drop_window_state(context_id);\n                Ok(SqlValue::Null)\n            }}\n",
+            ));
+        }
+    }
+
     format!(
         r##"impl AggregateGuest for {bridge_struct} {{
     fn step(func_id: u64, context_id: u64, args: Vec<SqlValue>) -> Result<(), String> {{
@@ -967,16 +1146,219 @@ fn emit_aggregate_impl(
 {final_arms}            _ => Err(stubbed("aggregate-function finalize", func_id)),
         }}
     }}
-    fn value(func_id: u64, _context_id: u64) -> Result<SqlValue, String> {{
-        Err(stubbed("aggregate-function value (window mode not wired)", func_id))
+    fn value(func_id: u64, context_id: u64) -> Result<SqlValue, String> {{
+        match func_id {{
+{value_arms}            _ => Err(stubbed("aggregate-function value (window mode not wired)", func_id)),
+        }}
     }}
-    fn inverse(func_id: u64, _context_id: u64, _args: Vec<SqlValue>) -> Result<(), String> {{
-        Err(stubbed("aggregate-function inverse (window mode not wired)", func_id))
+    fn inverse(func_id: u64, context_id: u64, _args: Vec<SqlValue>) -> Result<(), String> {{
+        // Whole-partition window functions (DD2 in
+        // PLAN-window-substrate.md) are frame-invariant; inverse is
+        // a no-op. Non-window aggregates never reach this path
+        // (sqlite only calls inverse on window-mode aggregates).
+        let _ = context_id;
+        match func_id {{
+{inverse_arms}            _ => Err(stubbed("aggregate-function inverse (window mode not wired)", func_id)),
+        }}
     }}
 }}
 
 "##
     )
+}
+
+/// #616: per-window-id compute function name.  One Rust function
+/// per window-function dispatch id; the value() arm calls it on
+/// first invocation to materialise the cached `Vec<SqlValue>`
+/// results.
+fn window_compute_fn_name(id: u64) -> String {
+    format!("compute_window_{id}")
+}
+
+/// #616 Phase 1: emit one Rust helper `compute_window_<id>(rows)`
+/// per wired window function. Each helper:
+///   1. Walks rows, decodes the first column (geometry blob -> WKB
+///      -> Geometry resource) — postgis-clustering shape.
+///   2. Picks extras from `rows[0]` (SQL window constants are
+///      uniform across the partition).
+///   3. Builds the `Vec<&Geometry>` borrow slice.
+///   4. Calls the upstream cluster function.
+///   5. Marshals each per-row Y back to a `SqlValue` per the
+///      classified `WindowReturn` shape.
+fn emit_window_compute_helpers(entries: &[WindowEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut emitted: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
+    let mut window_id_for: HashMap<&str, u64> = HashMap::new();
+    {
+        // Reconstruct id-for map locally (mirrors build_window_id_index).
+        let mut id: u64 = 3_000_000;
+        for e in entries {
+            window_id_for.entry(e.sql_name.as_str()).or_insert_with(|| {
+                let i = id;
+                id += 1;
+                i
+            });
+        }
+    }
+    let mut out = String::new();
+    out.push('\n');
+    for entry in entries {
+        let Some(&id) = window_id_for.get(entry.sql_name.as_str()) else {
+            continue;
+        };
+        if !emitted.insert(id) {
+            continue;
+        }
+        let name = &entry.sql_name;
+        let shape = &entry.shape;
+        let module = &shape.wit_module;
+        let func = &shape.wit_func;
+
+        // Build extras decode + the call's extra-arg slot.
+        let mut extras_decode = String::new();
+        let mut call_extras: Vec<String> = Vec::new();
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            let arg_index = j + 1; // arg 0 is the geometry
+            let (decode_line, var_expr) = match p {
+                ParamShape::F64 => (
+                    format!(
+                        "    let extra{j} = arg_f64(&rows[0], {arg_index}, \"{name}\")?;\n"
+                    ),
+                    format!("extra{j}"),
+                ),
+                ParamShape::S32 => (
+                    format!(
+                        "    let extra{j} = arg_i64(&rows[0], {arg_index}, \"{name}\")? as i32;\n"
+                    ),
+                    format!("extra{j}"),
+                ),
+                ParamShape::S64 => (
+                    format!(
+                        "    let extra{j} = arg_i64(&rows[0], {arg_index}, \"{name}\")?;\n"
+                    ),
+                    format!("extra{j}"),
+                ),
+                ParamShape::U32 => (
+                    format!(
+                        "    let extra{j} = arg_i64(&rows[0], {arg_index}, \"{name}\")? as u32;\n"
+                    ),
+                    format!("extra{j}"),
+                ),
+                ParamShape::U64 => (
+                    format!(
+                        "    let extra{j} = arg_i64(&rows[0], {arg_index}, \"{name}\")? as u64;\n"
+                    ),
+                    format!("extra{j}"),
+                ),
+                ParamShape::Bool => (
+                    format!(
+                        "    let extra{j} = arg_i64(&rows[0], {arg_index}, \"{name}\")? != 0;\n"
+                    ),
+                    format!("extra{j}"),
+                ),
+                ParamShape::Text => (
+                    format!(
+                        "    let extra{j} = arg_text(&rows[0], {arg_index}, \"{name}\")?.to_string();\n"
+                    ),
+                    format!("&extra{j}"),
+                ),
+                ParamShape::Blob => (
+                    format!(
+                        "    let extra{j} = arg_blob(&rows[0], {arg_index}, \"{name}\")?.to_vec();\n"
+                    ),
+                    format!("&extra{j}"),
+                ),
+                other => {
+                    // Defensive: classifier rejects fancier extras
+                    // up front, but if a new shape sneaks through
+                    // we fail the codegen with a visible error
+                    // rather than silently misemitting.
+                    return format!(
+                        "// ERROR: window {name} has unsupported extra arg shape {other:?}\n"
+                    );
+                }
+            };
+            extras_decode.push_str(&decode_line);
+            call_extras.push(var_expr);
+        }
+
+        let _ = &call_extras;
+        let call_extras_lit = if call_extras.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", call_extras.join(", "))
+        };
+
+        // Upstream fallibility -> map_err wrap.
+        let map_err = if shape.fallible {
+            format!(
+                ".map_err(|e| format!(\"{name}: {{}}\", postgis_err_string(e)))?"
+            )
+        } else {
+            String::new()
+        };
+
+        // Per-row return -> SqlValue marshaling.
+        let row_to_sqlvalue = match &shape.returns {
+            WindowReturn::OptionU32 => concat!(
+                "    Ok(labels\n",
+                "        .into_iter()\n",
+                "        .map(|opt| match opt {\n",
+                "            Some(id) => SqlValue::Integer(id as i64),\n",
+                "            None => SqlValue::Null,\n",
+                "        })\n",
+                "        .collect())\n",
+            )
+            .to_string(),
+            WindowReturn::U32 => concat!(
+                "    Ok(labels\n",
+                "        .into_iter()\n",
+                "        .map(|id| SqlValue::Integer(id as i64))\n",
+                "        .collect())\n",
+            )
+            .to_string(),
+            WindowReturn::GeomBlob => concat!(
+                "    Ok(labels\n",
+                "        .into_iter()\n",
+                "        .map(|g| SqlValue::Blob(g.as_wkb()))\n",
+                "        .collect())\n",
+            )
+            .to_string(),
+        };
+
+        let returns_dbg = format!("{:?}", shape.returns);
+        out.push_str(&format!(
+            "/// #616 Phase 1: per-partition compute for `{name}`\n\
+             /// (func_id {id}). The upstream returns the full per-row\n\
+             /// result list in input order; we marshal each into the\n\
+             /// classified SqlValue shape ({returns_dbg}). Called once\n\
+             /// per partition (first value() invocation); subsequent\n\
+             /// value() calls read from cache.\n\
+             fn {compute_fn}(rows: &[Vec<SqlValue>]) -> Result<Vec<SqlValue>, String> {{\n\
+             \x20   if rows.is_empty() {{\n\
+             \x20       return Ok(Vec::new());\n\
+             \x20   }}\n\
+             \x20   let mut geoms: Vec<Geometry> = Vec::with_capacity(rows.len());\n\
+             \x20   for row in rows {{\n\
+             \x20       let bytes = arg_blob(row, 0, \"{name}\")?;\n\
+             \x20       geoms.push(\n\
+             \x20           Geometry::from_wkb(bytes)\n\
+             \x20               .map_err(|e| format!(\"{name}: row decode: {{}}\", postgis_err_string(e)))?,\n\
+             \x20       );\n\
+             \x20   }}\n\
+             {extras}\
+             \x20   let geom_refs: Vec<&Geometry> = geoms.iter().collect();\n\
+             \x20   let labels = {module}::{func}(&geom_refs{call_extras_lit}){map_err};\n\
+             {row_to_sqlvalue}\
+             }}\n\n",
+            compute_fn = window_compute_fn_name(id),
+            extras = extras_decode,
+        ));
+    }
+    out
 }
 
 
@@ -1503,6 +1885,27 @@ fn build_aggregate_id_index(plan: &BridgePlan) -> HashMap<&str, u64> {
     idx
 }
 
+/// #616: window-function id index. Mirrors `build_aggregate_id_index`
+/// over `plan.extensions[*].window_functions`. Window ids start at
+/// 3_000_000 so they don't collide with the scalar / aggregate /
+/// UDTF ranges; the `is_window: true` flag on the manifest entry
+/// makes the host route through `sqlite3_create_window_function`.
+fn build_window_id_index(plan: &BridgePlan) -> HashMap<&str, u64> {
+    let mut idx = HashMap::new();
+    let mut id: u64 = 3_000_000;
+    for ext in &plan.extensions {
+        for w in &ext.window_functions {
+            idx.insert(w.canonical_name.as_str(), id);
+            id += 1;
+            for alias in &w.aliases {
+                idx.insert(alias.as_str(), id);
+                id += 1;
+            }
+        }
+    }
+    idx
+}
+
 fn build_udtf_id_index(plan: &BridgePlan) -> HashMap<&str, u64> {
     let mut idx = HashMap::new();
     let mut id: u64 = 2_000_000;
@@ -1529,6 +1932,7 @@ fn emit_metadata_impl(
     plan: &BridgePlan,
     bridge_struct: &str,
     records: &[RecordType],
+    window_entries: &[WindowEntry],
 ) -> String {
     let primary = plan
         .extensions
@@ -1567,11 +1971,59 @@ fn emit_metadata_impl(
     for ext in &plan.extensions {
         for ag in &ext.aggregates {
             let num_args = aggregate_num_args(ag);
-            push_aggregate_entry(&mut agg_entries, agg_id, &ag.canonical_name, num_args);
+            push_aggregate_entry(
+                &mut agg_entries,
+                agg_id,
+                &ag.canonical_name,
+                num_args,
+                false,
+            );
             agg_id += 1;
             for alias in &ag.aliases {
-                push_aggregate_entry(&mut agg_entries, agg_id, alias, num_args);
+                push_aggregate_entry(&mut agg_entries, agg_id, alias, num_args, false);
                 agg_id += 1;
+            }
+        }
+    }
+    // #616: window functions ride the AggregateFunctionSpec list
+    // with `is_window: true`. Ids start at 3_000_000 (matches
+    // `build_window_id_index`); per-row arg count includes the
+    // streaming geometry + any constant extras.
+    let mut window_id_iter: u64 = 3_000_000;
+    let mut window_arg_count: HashMap<&str, i32> = HashMap::new();
+    for w in window_entries {
+        let num_args = (1 + w.shape.extra_args.len()) as i32;
+        window_arg_count.insert(w.sql_name.as_str(), num_args);
+    }
+    for ext in &plan.extensions {
+        for w in &ext.window_functions {
+            let num_args = window_arg_count
+                .get(w.canonical_name.as_str())
+                .copied()
+                .unwrap_or_else(|| {
+                    // Fallback if the classifier didn't wire it (shouldn't
+                    // happen for postgis pilot but keeps behaviour predictable
+                    // when a future extension has interface-DB rows without a
+                    // matching upstream).
+                    w.param_signatures.first().map(|s| s.len() as i32).unwrap_or(-1)
+                });
+            push_aggregate_entry(
+                &mut agg_entries,
+                window_id_iter,
+                &w.canonical_name,
+                num_args,
+                true,
+            );
+            window_id_iter += 1;
+            for alias in &w.aliases {
+                push_aggregate_entry(
+                    &mut agg_entries,
+                    window_id_iter,
+                    alias,
+                    num_args,
+                    true,
+                );
+                window_id_iter += 1;
             }
         }
     }
@@ -1689,12 +2141,19 @@ fn push_scalar_entry(out: &mut String, id: u64, name: &str, num_args: i32, det: 
     ));
 }
 
-fn push_aggregate_entry(out: &mut String, id: u64, name: &str, num_args: i32) {
+fn push_aggregate_entry(
+    out: &mut String,
+    id: u64,
+    name: &str,
+    num_args: i32,
+    is_window: bool,
+) {
     out.push_str(&format!(
-        "            AggregateFunctionSpec {{ id: {id}, name: \"{name}\".into(), num_args: {num_args}, func_flags: FunctionFlags::empty(), is_window: false }},\n",
+        "            AggregateFunctionSpec {{ id: {id}, name: \"{name}\".into(), num_args: {num_args}, func_flags: FunctionFlags::empty(), is_window: {is_window} }},\n",
         id = id,
         name = name.replace('"', "\\\""),
         num_args = num_args,
+        is_window = is_window,
     ));
 }
 

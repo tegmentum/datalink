@@ -118,6 +118,14 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let (udtf_entries, udtf_unwired) =
         interface_db::build_udtf_registry(plan, &shim_wit_dir, &records)?;
 
+    // #616 Phase 3: window entries — wires postgis cluster window
+    // functions against datafission's `window-function-registry@1.0.0`
+    // `compute-partition(name, args-rows) -> list<scalar-value>`
+    // surface. Whole-partition compute matches the upstream WIT
+    // shape 1:1 — the cleanest fit among the three targets.
+    let (window_entries, window_unwired) =
+        interface_db::build_window_registry(plan, &shim_wit_dir)?;
+
     // Report on what fell through so the maintainer sees coverage
     // at codegen time.
     let total_unwired = scalar_unwired.len();
@@ -144,6 +152,15 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             udtf_unwired.len(),
         );
         for u in &udtf_unwired {
+            eprintln!("  - {}: {}", u.sql_name, u.reason);
+        }
+    }
+    if !window_unwired.is_empty() {
+        eprintln!(
+            "[datafission-target] {} window function(s) not wired:",
+            window_unwired.len(),
+        );
+        for u in &window_unwired {
             eprintln!("  - {}: {}", u.sql_name, u.reason);
         }
     }
@@ -207,6 +224,13 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     }
     // UDTF WIT modules
     for entry in &udtf_entries {
+        used_aliases
+            .entry(entry.shape.wit_module.clone())
+            .or_insert_with(|| entry.shape.wit_package.clone());
+    }
+    // #616: window WIT modules — typically `pg_cluster`
+    // (postgis-clustering).
+    for entry in &window_entries {
         used_aliases
             .entry(entry.shape.wit_module.clone())
             .or_insert_with(|| entry.shape.wit_package.clone());
@@ -615,8 +639,17 @@ use bindings::datafission::function_plugin::types as types;
         s.push_str(&build_aggregate_registry_impl(&aggregate_entries, plan));
     }
 
-    // ---- window-function-registry: stub ----
-    s.push_str(WINDOW_STUB);
+    // ---- window-function-registry: WIRED (#616 Phase 3) ----
+    // Empty surface (mobilitydb, etc.) falls back to the stub —
+    // `WindowFunctionMeta::list_functions()` advertises nothing,
+    // per-call methods return `UnknownFunction`. Non-empty surface
+    // (postgis: 4 functions) emits the dispatching impl with one
+    // `compute_partition` arm per canonical-or-alias name.
+    if window_entries.is_empty() {
+        s.push_str(WINDOW_STUB);
+    } else {
+        s.push_str(&build_window_registry_impl(&window_entries, primary));
+    }
 
     // ---- table-function-registry: WIRED ----
     // Same conditional pattern as aggregates: empty surface uses
@@ -1252,6 +1285,245 @@ fn alloc_accumulator(arm_idx: usize, extras: Vec<String>) -> u64 {
 }
 
 "##;
+
+/// #616 Phase 3: build the `window_function_registry::Guest` impl
+/// block. Datafission's window contract is whole-partition compute
+/// (DD2 in PLAN-window-substrate.md) which matches the postgis
+/// `func(list<borrow<geometry>>, ...) -> list<Y>` upstream 1:1 —
+/// the cleanest fit among the three targets.
+///
+/// One arm per canonical-or-alias name:
+///   1. Walk `args_rows`, decode each row's column 0 (binary WKB)
+///      via `Geometry::from_wkb`.
+///   2. Read extras from `args_rows[0]` (SQL window constants are
+///      uniform across the partition).
+///   3. Build a `Vec<&Geometry>` borrow slice.
+///   4. Call the upstream cluster function.
+///   5. Marshal each per-row Y back to a `ftypes::ScalarValue` per
+///      the classified `WindowReturn` shape (Null for option<u32>
+///      noise points, etc.).
+fn build_window_registry_impl(
+    window_entries: &[interface_db::WindowEntry],
+    primary: &str,
+) -> String {
+    let mut metas_block = String::new();
+    let mut return_arms = String::new();
+    let mut compute_arms = String::new();
+    let mut emitted_compute: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut seen_meta: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for entry in window_entries {
+        let escaped = entry.sql_name.replace('"', "\\\"");
+
+        if seen_meta.insert(entry.sql_name.clone()) {
+            // ---- metadata entry ----
+            let mut sig_block = String::new();
+            sig_block.push_str("vec![vec![");
+            // Streaming partition arg: Binary (WKB).
+            sig_block.push_str("ftypes::LogicalType::Binary, ");
+            for p in &entry.shape.extra_args {
+                let lt = dispatch::paramshape_to_logicaltype(p);
+                sig_block.push_str(&lt);
+                sig_block.push_str(", ");
+            }
+            sig_block.push_str("]]");
+            metas_block.push_str(&format!(
+                "        ftypes::WindowFunctionMeta {{\n\
+                 \x20           name: \"{escaped}\".to_string(),\n\
+                 \x20           aliases: Vec::new(),\n\
+                 \x20           param_types: {sig_block},\n\
+                 \x20       }},\n",
+            ));
+
+            // ---- return_type arm ----
+            let ret_logical = match &entry.shape.returns {
+                interface_db::WindowReturn::OptionU32
+                | interface_db::WindowReturn::U32 => "types::LogicalType::Int64",
+                interface_db::WindowReturn::GeomBlob => "types::LogicalType::Binary",
+            };
+            return_arms.push_str(&format!(
+                "            \"{escaped}\" => Ok({ret_logical}),\n",
+            ));
+        }
+
+        if emitted_compute.insert(entry.sql_name.clone()) {
+            let body = emit_window_compute_arm_body(&entry.sql_name, &entry.shape);
+            compute_arms.push_str(&format!(
+                "            \"{escaped}\" => {{\n{body}\n            }}\n",
+            ));
+        }
+    }
+
+    format!(
+        r##"impl window_function_registry::Guest for Component {{
+    fn list_functions() -> Vec<ftypes::WindowFunctionMeta> {{
+        vec![
+{metas_block}        ]
+    }}
+
+    fn return_type(
+        name: String,
+        _input_types: Vec<ftypes::LogicalType>,
+    ) -> Result<ftypes::LogicalType, ftypes::FunctionError> {{
+        match name.as_str() {{
+{return_arms}            other => Err(ftypes::FunctionError::UnknownFunction(other.into())),
+        }}
+    }}
+
+    fn compute_partition(
+        name: String,
+        args_rows: Vec<Vec<ftypes::ScalarValue>>,
+    ) -> Result<Vec<ftypes::ScalarValue>, ftypes::FunctionError> {{
+        if args_rows.is_empty() {{
+            return Ok(Vec::new());
+        }}
+        match name.as_str() {{
+{compute_arms}            other => Err(ftypes::FunctionError::UnknownFunction(other.into())),
+        }}
+    }}
+}}
+
+// {primary}: window-function-registry wired (#616 Phase 3) —
+// whole-partition compute matches the postgis-clustering upstream
+// 1:1.
+
+"##,
+    )
+}
+
+/// #616: emit the body of one window-function `compute_partition`
+/// match arm. Takes the SQL name + classified `WindowShape`; produces
+/// Rust code that decodes the partition rows, calls the upstream
+/// cluster function, and marshals the per-row results back to
+/// `ftypes::ScalarValue`.
+fn emit_window_compute_arm_body(
+    sql_name: &str,
+    shape: &interface_db::WindowShape,
+) -> String {
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let i = "                ";
+
+    // Decode the streaming geometry column.
+    let mut s = String::new();
+    s.push_str(&format!(
+        "{i}let mut geoms: Vec<Geometry> = Vec::with_capacity(args_rows.len());\n\
+         {i}for row in &args_rows {{\n\
+         {i}    let bytes = dfv_blob(row, 0, \"{sql_name}\")?;\n\
+         {i}    geoms.push(\n\
+         {i}        Geometry::from_wkb(bytes)\n\
+         {i}            .map_err(|e| ftypes::FunctionError::Internal(format!(\"{sql_name}: row decode: {{:?}}\", e)))?,\n\
+         {i}    );\n\
+         {i}}}\n",
+    ));
+
+    // Decode extras from row 0 (SQL window constants are uniform).
+    let mut call_extras: Vec<String> = Vec::new();
+    for (j, p) in shape.extra_args.iter().enumerate() {
+        let arg_index = j + 1;
+        let (decode_line, var_expr) = match p {
+            interface_db::ParamShape::F64 => (
+                format!(
+                    "{i}let extra{j} = match args_rows[0].get({arg_index}) {{\n\
+                     {i}    Some(ftypes::ScalarValue::Float64(v)) => *v,\n\
+                     {i}    Some(ftypes::ScalarValue::Int64(v)) => *v as f64,\n\
+                     {i}    other => return Err(ftypes::FunctionError::Internal(\n\
+                     {i}        format!(\"{sql_name}: arg {arg_index} expects Float64; got {{:?}}\", other),\n\
+                     {i}    )),\n\
+                     {i}}};\n",
+                ),
+                format!("extra{j}"),
+            ),
+            interface_db::ParamShape::S32
+            | interface_db::ParamShape::S64
+            | interface_db::ParamShape::U32
+            | interface_db::ParamShape::U64
+            | interface_db::ParamShape::Bool => {
+                let cast = match p {
+                    interface_db::ParamShape::S32 => "as i32",
+                    interface_db::ParamShape::S64 => "as i64",
+                    interface_db::ParamShape::U32 => "as u32",
+                    interface_db::ParamShape::U64 => "as u64",
+                    interface_db::ParamShape::Bool => "!= 0",
+                    _ => unreachable!(),
+                };
+                (
+                    format!(
+                        "{i}let raw{j}: i64 = match args_rows[0].get({arg_index}) {{\n\
+                         {i}    Some(ftypes::ScalarValue::Int64(v)) => *v,\n\
+                         {i}    Some(ftypes::ScalarValue::Uint64(v)) => *v as i64,\n\
+                         {i}    Some(ftypes::ScalarValue::Int32(v)) => *v as i64,\n\
+                         {i}    other => return Err(ftypes::FunctionError::Internal(\n\
+                         {i}        format!(\"{sql_name}: arg {arg_index} expects integer; got {{:?}}\", other),\n\
+                         {i}    )),\n\
+                         {i}}};\n\
+                         {i}let extra{j} = raw{j} {cast};\n",
+                    ),
+                    format!("extra{j}"),
+                )
+            }
+            other => {
+                return format!(
+                    "{i}// ERROR: window {sql_name} has unsupported extra arg shape {other:?}\n\
+                     {i}return Err(ftypes::FunctionError::Internal(\"{sql_name}: extra arg unsupported\".into()));\n",
+                );
+            }
+        };
+        s.push_str(&decode_line);
+        call_extras.push(var_expr);
+    }
+
+    let call_extras_lit = if call_extras.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", call_extras.join(", "))
+    };
+
+    // Upstream call + error map.
+    let map_err = if shape.fallible {
+        format!(".map_err(|e| ftypes::FunctionError::Internal(format!(\"{sql_name}: {{:?}}\", e)))?")
+    } else {
+        String::new()
+    };
+    s.push_str(&format!(
+        "{i}let geom_refs: Vec<&Geometry> = geoms.iter().collect();\n\
+         {i}let labels = {module}::{func}(&geom_refs{call_extras_lit}){map_err};\n",
+    ));
+
+    // Per-row return -> ftypes::ScalarValue marshaling.
+    match &shape.returns {
+        interface_db::WindowReturn::OptionU32 => {
+            s.push_str(&format!(
+                "{i}Ok(labels\n\
+                 {i}    .into_iter()\n\
+                 {i}    .map(|opt| match opt {{\n\
+                 {i}        Some(id) => ftypes::ScalarValue::Uint32(id),\n\
+                 {i}        None => ftypes::ScalarValue::Null,\n\
+                 {i}    }})\n\
+                 {i}    .collect())\n",
+            ));
+        }
+        interface_db::WindowReturn::U32 => {
+            s.push_str(&format!(
+                "{i}Ok(labels\n\
+                 {i}    .into_iter()\n\
+                 {i}    .map(ftypes::ScalarValue::Uint32)\n\
+                 {i}    .collect())\n",
+            ));
+        }
+        interface_db::WindowReturn::GeomBlob => {
+            s.push_str(&format!(
+                "{i}Ok(labels\n\
+                 {i}    .into_iter()\n\
+                 {i}    .map(|g| ftypes::ScalarValue::Binary(g.as_wkb().into()))\n\
+                 {i}    .collect())\n",
+            ));
+        }
+    }
+    s
+}
 
 /// Build the `table_function_registry::Guest` impl block. Emits
 /// per-name metadata, output_schema arm, begin arm that calls the
