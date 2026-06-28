@@ -1011,6 +1011,27 @@ pub fn emit_udtf_begin_body(
     let func = &shape.wit_func;
     let mut s = String::new();
 
+    // Same early-bail as duckdb-emit: a mid-body `return Err(...)`
+    // from emit_udtf_param_marshal_df would still leave the
+    // upstream call site with the wrong arg count under rustc's
+    // unreachable-code type-check. Detect unsupported list shapes
+    // up front and emit only the error return.
+    if let Some((idx, shape_name)) = shape.params.iter().enumerate().find_map(|(idx, p)| {
+        match p {
+            ParamShape::ListGeom => Some((idx, "list<geometry>")),
+            ParamShape::ListRecord { .. } => Some((idx, "list<record>")),
+            ParamShape::ListTuple { .. } => Some((idx, "list<tuple>")),
+            ParamShape::ListPrim(_) => Some((idx, "list<primitive>")),
+            ParamShape::Enum { .. } => Some((idx, "enum")),
+            _ => None,
+        }
+    }) {
+        return format!(
+            "{i}Err(ftypes::FunctionError::ExecutionError(format!(\
+             \"{sql_name}: UDTF param #{idx} ({shape_name}) not wired\")))",
+        );
+    }
+
     let (decls, call_args) =
         emit_udtf_param_marshal_df(&shape.params, sql_name, i);
     s.push_str(&decls);
@@ -1126,7 +1147,7 @@ pub fn emit_udtf_column_info(shape: &UdtfShape) -> String {
     match &shape.output_row {
         UdtfOutputRow::SingleGeom => {
             s.push_str(&format!(
-                "ftypes::ColumnInfo {{ name: \"{single_geom_col_name}\".into(), logical_type: ftypes::LogicalType::Binary }},",
+                "ftypes::ColumnInfo {{ name: \"{single_geom_col_name}\".into(), ty: ftypes::LogicalType::Binary }},",
             ));
         }
         UdtfOutputRow::SinglePrimitive { affinity } => {
@@ -1137,7 +1158,7 @@ pub fn emit_udtf_column_info(shape: &UdtfShape) -> String {
                 ColumnAffinity::Blob => "ftypes::LogicalType::Binary",
             };
             s.push_str(&format!(
-                "ftypes::ColumnInfo {{ name: \"value\".into(), logical_type: {logical} }},",
+                "ftypes::ColumnInfo {{ name: \"value\".into(), ty: {logical} }},",
             ));
         }
         UdtfOutputRow::Record { fields } => {
@@ -1160,13 +1181,13 @@ pub fn emit_udtf_column_info(shape: &UdtfShape) -> String {
                 };
                 let col_name = f.name.replace('"', "\\\"");
                 s.push_str(&format!(
-                    "ftypes::ColumnInfo {{ name: \"{col_name}\".into(), logical_type: {logical} }},",
+                    "ftypes::ColumnInfo {{ name: \"{col_name}\".into(), ty: {logical} }},",
                 ));
             }
         }
         UdtfOutputRow::Unwired { .. } => {
             s.push_str(
-                "ftypes::ColumnInfo { name: \"value\".into(), logical_type: ftypes::LogicalType::Binary },",
+                "ftypes::ColumnInfo { name: \"value\".into(), ty: ftypes::LogicalType::Binary },",
             );
         }
     }

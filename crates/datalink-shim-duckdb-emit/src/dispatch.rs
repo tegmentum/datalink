@@ -905,10 +905,30 @@ pub fn emit_udtf_call_body(
     let func = &shape.wit_func;
     let mut s = String::new();
 
+    // Detect any params whose shape we can't marshal — if found,
+    // short-circuit the whole arm to an error return. Mid-body
+    // `return Err(...)` from emit_udtf_param_marshal would still
+    // produce code rustc type-checks (unreachable code is still
+    // checked), so a partial arg list would mismatch the upstream
+    // signature. Bail out cleanly here instead.
+    if let Some((idx, shape_name)) = shape.params.iter().enumerate().find_map(|(idx, p)| {
+        match p {
+            ParamShape::ListGeom => Some((idx, "list<geometry>")),
+            ParamShape::ListRecord { .. } => Some((idx, "list<record>")),
+            ParamShape::ListTuple { .. } => Some((idx, "list<tuple>")),
+            ParamShape::ListPrim(_) => Some((idx, "list<primitive>")),
+            _ => None,
+        }
+    }) {
+        return format!(
+            "{i}Err(types::Duckerror::Unsupported(format!(\
+             \"{sql_name}: UDTF param #{idx} ({shape_name}) not wired\")))",
+        );
+    }
+
     // ── Param marshalling — covers the subset that postgis +
     // mobilitydb UDTF call sites use today (primitives, Geom /
-    // Geog / Raster / Topology, WitValueRecord, Enum). Shapes the
-    // emit doesn't cover bail with a clear error.
+    // Geog / Raster / Topology, WitValueRecord, Enum).
     let (decls, call_args) =
         emit_udtf_param_marshal(&shape.params, sql_name, i);
     s.push_str(&decls);
