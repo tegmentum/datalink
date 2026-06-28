@@ -36,6 +36,7 @@ pub fn render(
     plan: &BridgePlan,
     has_aggregates: bool,
     has_tables: bool,
+    has_casts: bool,
 ) -> String {
     let primary = plan
         .extensions
@@ -57,12 +58,17 @@ pub fn render(
     } else {
         ""
     };
+    let cast_call = if has_casts {
+        "        register_casts()?;\n"
+    } else {
+        ""
+    };
     format!(
         r##"
 impl guest::Guest for {bridge_struct} {{
     fn load() -> Result<types::Loadresult, types::Duckerror> {{
         register_scalars()?;
-{aggregate_call}{table_call}        Ok(types::Loadresult {{
+{aggregate_call}{table_call}{cast_call}        Ok(types::Loadresult {{
             name: "{primary}".into(),
             version: Some("{version}".into()),
             requires: Vec::new().into(),

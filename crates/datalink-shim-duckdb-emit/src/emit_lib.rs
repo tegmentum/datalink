@@ -287,6 +287,7 @@ mod bindings {{
 
 use bindings::duckdb::extension::types;
 use bindings::duckdb::extension::runtime;
+use bindings::duckdb::extension::catalog;
 use bindings::exports::duckdb::extension::callback_dispatch;
 use bindings::exports::duckdb::extension::guest;
 
@@ -398,12 +399,22 @@ use bindings::exports::duckdb::extension::guest;
 
     s.push_str(&helpers_block);
 
+    // Cast surface — drives both lifecycle's `register_casts()?;`
+    // call AND the call_cast forwarder below. Empty surface keeps
+    // the original Unsupported stub so an unwired bridge stays
+    // load-safe.
+    let has_casts = plan
+        .extensions
+        .iter()
+        .any(|e| !e.cast_rewrites.is_empty());
+
     s.push_str(handle_table::render());
     s.push_str(&lifecycle::render(
         &bridge_struct,
         plan,
         !aggregate_entries.is_empty(),
         !udtf_entries.is_empty(),
+        has_casts,
     ));
 
     // call_scalar dispatch: build the per-arm match
@@ -516,21 +527,45 @@ impl callback_dispatch::Guest for {bridge_struct} {{
             format!("{primary}: pragmas not wired (Step 4 scalar-first cut)")
         ))
     }}
-    fn call_cast(
-        _handle: u32,
-        _value: types::Duckvalue,
-    ) -> Result<types::Duckvalue, types::Duckerror> {{
-        Err(types::Duckerror::Unsupported(
-            format!("{primary}: casts not wired (Step 4 scalar-first cut)")
-        ))
-    }}
-}}
+{cast_arm}}}
 "##,
         bridge_struct = bridge_struct,
         scalar_arms = scalar_arms,
         aggregate_arms = aggregate_arms,
         table_arms = table_arms,
         primary = primary,
+        cast_arm = if has_casts {
+            // #624: call_cast forwards into call_scalar at the
+            // matching arm. `register_casts()` slotted the cast
+            // handle into the SAME scalar `handle_table` so the
+            // forward looks up arm_idx via the existing lookup.
+            // One arm-index space; cast is just an alternate entry
+            // point for the same scalar body.
+            String::from(
+                "    fn call_cast(\n\
+                 \x20       handle: u32,\n\
+                 \x20       value: types::Duckvalue,\n\
+                 \x20   ) -> Result<types::Duckvalue, types::Duckerror> {\n\
+                 \x20       <Self as callback_dispatch::Guest>::call_scalar(\n\
+                 \x20           handle,\n\
+                 \x20           alloc::vec![value],\n\
+                 \x20           types::Invokeinfo { rowindex: None, iswindow: false },\n\
+                 \x20       )\n\
+                 \x20   }\n",
+            )
+        } else {
+            format!(
+                "    fn call_cast(\n\
+                 \x20       _handle: u32,\n\
+                 \x20       _value: types::Duckvalue,\n\
+                 \x20   ) -> Result<types::Duckvalue, types::Duckerror> {{\n\
+                 \x20       Err(types::Duckerror::Unsupported(\n\
+                 \x20           format!(\"{primary}: casts not wired (no cast_rewrites in IR)\")\n\
+                 \x20       ))\n\
+                 \x20   }}\n",
+                primary = primary,
+            )
+        },
     ));
 
     // register_scalars() body. Threading `scalar_entries` here
@@ -550,6 +585,14 @@ impl callback_dispatch::Guest for {bridge_struct} {{
     // `Capabilitykind::Table` registry.
     if !udtf_entries.is_empty() {
         s.push_str(&register::render_tables(plan, &udtf_entries)?);
+    }
+    // register_casts() body (#624). Walks plan.extensions[*].
+    // cast_rewrites and registers each with the host's catalog
+    // interface; each cast handle slots into the shared scalar
+    // `handle_table` so call_cast forwards into call_scalar at the
+    // matching arm.
+    if has_casts {
+        s.push_str(&register::render_casts(plan, &scalar_entries)?);
     }
 
     // Export macro at file scope

@@ -594,3 +594,148 @@ fn register_tables() -> Result<(), types::Duckerror> {
         }
     };
 "##;
+
+// ─── Cast registration (#624) ───
+//
+// Per-cast `catalog::register-cast` against the `duckdb:extension`
+// catalog interface. Each cast wraps an already-wired scalar
+// (`cast.function_name` is a SQL function name that the scalar
+// dispatch has an arm for). At register time we allocate a new
+// handle, slot it into the SAME `handle_table` the scalars use —
+// mapping `cast_handle -> scalar_arm_idx` — and register a
+// `CastCallback::new(cast_handle)` with the host. At dispatch time
+// `call_cast(handle, value)` forwards into `call_scalar(handle,
+// vec![value], ctx)` which reads the same `handle_table`, finds
+// the scalar arm, and runs the existing scalar body. One arm-index
+// space; the cast contract just provides an alternate entry point.
+//
+// `source_kind` drives the cast-spec shape:
+//   * `castsourcekind::stringliteral`  -> kind=Implicit, from=VARCHAR
+//     (DuckDB auto-promotes literals).
+//   * `castsourcekind::any`            -> kind=Explicit, from=BLOB
+//     (any-expr cast over the bridge's BLOB-backed custom types).
+//   * `castsourcekind::geographycolumn`-> kind=Explicit, from=GEOGRAPHY
+//     (column-typed geography cast to geometry).
+//
+// `to` is the cast's target_type uppercased to match the SQL-side
+// type name the bridge advertises via column_types / catalog
+// aliases.
+//
+// A cast whose `function_name` is NOT a wired scalar is skipped
+// with an `[duckdb-target]` diagnostic at codegen time. The
+// caller is responsible for surfacing the count back to the
+// maintainer (mirrors the scalar/aggregate/UDTF unwired-reason
+// pattern).
+pub fn render_casts(
+    plan: &BridgePlan,
+    scalar_entries: &[(DispatchEntry, bool)],
+) -> anyhow::Result<String> {
+    // Build (sql_name -> scalar_arm_idx) mirroring `render`'s
+    // dedupe so the cast's slot lookup lines up with the dispatch
+    // arm `call_scalar` will route through.
+    let mut name_to_arm: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut arm_idx: usize = 0;
+    for (entry, _fallible) in scalar_entries {
+        if !seen.insert(entry.sql_name.clone()) {
+            continue;
+        }
+        name_to_arm.insert(entry.sql_name.clone(), arm_idx);
+        arm_idx += 1;
+    }
+
+    let mut s = String::new();
+    s.push_str(CAST_REGISTER_PRELUDE);
+
+    let mut unwired: Vec<(String, String, String)> = Vec::new();
+    for ext in &plan.extensions {
+        for cast in &ext.cast_rewrites {
+            let scalar_arm = match name_to_arm.get(&cast.function_name) {
+                Some(&i) => i,
+                None => {
+                    unwired.push((
+                        cast.target_type.clone(),
+                        cast.source_kind.clone(),
+                        cast.function_name.clone(),
+                    ));
+                    continue;
+                }
+            };
+            push_cast_registration(&mut s, scalar_arm, cast);
+        }
+    }
+
+    if !unwired.is_empty() {
+        eprintln!(
+            "[duckdb-target] {} cast(s) not wired (function not in scalar registry):",
+            unwired.len()
+        );
+        for (t, k, f) in &unwired {
+            eprintln!("  - CAST(<{}> AS {}) -> {}", k, t, f);
+        }
+    }
+
+    s.push_str("    Ok(())\n}\n");
+    Ok(s)
+}
+
+const CAST_REGISTER_PRELUDE: &str = r##"
+fn register_casts() -> Result<(), types::Duckerror> {
+"##;
+
+fn push_cast_registration(
+    out: &mut String,
+    scalar_arm_idx: usize,
+    cast: &shim_bridge_codegen_core::CastRewrite,
+) {
+    let (kind_variant, from_type) = match cast.source_kind.as_str() {
+        // PostGIS / mobilitydb extraction surfaces these as
+        // `castsourcekind::<variant>` values from the shim
+        // interface DB. Map each to a (CastKind, from-type) pair.
+        "castsourcekind::stringliteral" => ("Implicit", "VARCHAR"),
+        "castsourcekind::any" => ("Explicit", "BLOB"),
+        "castsourcekind::geographycolumn" => ("Explicit", "GEOGRAPHY"),
+        // Unknown source-kind: assume explicit, BLOB-typed source.
+        // The host's cast registry will reject the spec if the
+        // type names don't resolve; the diagnostic surfaces at
+        // load() time rather than silently dropping the cast.
+        _ => ("Explicit", "BLOB"),
+    };
+    let to_type = cast.target_type.to_uppercase();
+    let fn_name = cast.function_name.replace('"', "\\\"");
+    let source_kind = cast.source_kind.replace('"', "\\\"");
+    out.push_str(&format!(
+        r##"    {{
+        // CAST(<{source_kind}> AS {to_type}) -> {fn_name}
+        let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Slot the cast handle into the SCALAR handle table so
+        // call_cast can forward into call_scalar at the matching
+        // arm. One arm-index space; the cast contract just
+        // provides an alternate entry point.
+        handle_table()
+            .lock()
+            .expect("scalar handle mutex poisoned")
+            .insert(handle, {scalar_arm_idx}usize);
+        let callback = runtime::CastCallback::new(handle);
+        let spec = catalog::CastSpec {{
+            from: "{from_type}".into(),
+            to: "{to_type}".into(),
+            kind: catalog::CastKind::{kind_variant},
+        }};
+        catalog::register_cast(&spec, callback).map_err(|e| {{
+            types::Duckerror::Internal(format!(
+                "register-cast({fn_name}: {from_type} -> {to_type}): {{}}", e
+            ))
+        }})?;
+    }}
+"##,
+        source_kind = source_kind,
+        to_type = to_type,
+        fn_name = fn_name,
+        scalar_arm_idx = scalar_arm_idx,
+        from_type = from_type,
+        kind_variant = kind_variant,
+    ));
+}
