@@ -478,6 +478,20 @@ fn render_return_expr(
              {i}    )))\n\
              {i}}}"
         ),
+        // Round (#608): bbox3d return — PostGIS-conventional text
+        // representation `BOX3D(xmin ymin zmin,xmax ymax zmax)`.
+        // The bbox3d record's wit-bindgen Rust shape is
+        // `{ min_x, min_y, min_z, max_x, max_y, max_z }` (six f64).
+        RetShape::Bbox3dText => format!(
+            "{{\n\
+             {i}    let __bb = {call_expr}{unwrap_chain};\n\
+             {i}    Ok(types::Duckvalue::Text(format!(\n\
+             {i}        \"BOX3D({{}} {{}} {{}},{{}} {{}} {{}})\",\n\
+             {i}        __bb.min_x, __bb.min_y, __bb.min_z,\n\
+             {i}        __bb.max_x, __bb.max_y, __bb.max_z,\n\
+             {i}    )))\n\
+             {i}}}"
+        ),
         RetShape::Enum {
             wit_module,
             kebab_name,
@@ -869,6 +883,18 @@ pub fn emit_aggregate_arm_body(
                  {i}    Some(Some(v)) => Ok(types::Duckvalue::Int64(*v as i64)),\n\
                  {i}    Some(None) | None => Ok(types::Duckvalue::Null),\n\
                  {i}}}",
+            ));
+        }
+        // Round (#608): bbox3d return as PostGIS-conventional text.
+        // Non-fallible upstream (`st-extent-threed -> bbox3d`).
+        RetShape::Bbox3dText => {
+            s.push_str(&format!(
+                "{i}let __bb = {module}::{func}({call_args});\n\
+                 {i}Ok(types::Duckvalue::Text(format!(\n\
+                 {i}    \"BOX3D({{}} {{}} {{}},{{}} {{}} {{}})\",\n\
+                 {i}    __bb.min_x, __bb.min_y, __bb.min_z,\n\
+                 {i}    __bb.max_x, __bb.max_y, __bb.max_z,\n\
+                 {i})))",
             ));
         }
         _ => {

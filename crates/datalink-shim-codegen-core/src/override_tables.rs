@@ -1,6 +1,6 @@
 //! Hand-curated SQL-name → WIT-function overrides.
 //!
-//! Two tables today:
+//! Three tables today:
 //!
 //! - `operator_function_overrides`: SQL names whose canonical
 //!   resolver misses (the standard snake/kebab path fails because
@@ -9,6 +9,12 @@
 //! - `tuple_pick_overrides`: SQL-side accessor names that route
 //!   to a tuple-returning WIT function and surface a single
 //!   element of the tuple as the SQL return.
+//! - `aggregate_function_overrides`: SQL aggregate names whose
+//!   canonical name + alias list shares no stem with the upstream
+//!   WIT aggregate function. Routes to a specific
+//!   `(interface, kebab-name)` pair. Sibling to
+//!   `operator_function_overrides` but consulted on the aggregate
+//!   path inside `build_aggregate_registry`. Round (#608).
 //!
 //! `RetShape` rewrite for tuple-pick lives in
 //! `emit_sqlite::dispatch` because it consumes the dispatch-IR
@@ -103,4 +109,47 @@ pub fn tuple_pick_override_for<'a>(
         .iter()
         .find(|f| f.interface == entry.1 && f.kebab_name == entry.2)?;
     Some((f, entry.3))
+}
+
+/// Round (#608): aggregate-function name overrides — SQL aggregate
+/// names whose canonical name + alias list share no stem with the
+/// upstream WIT aggregate function.
+///
+/// Sibling to `operator_function_overrides`: same hand-curated
+/// `(sql_name, wit_interface, wit_kebab_name)` shape, but consulted
+/// in `build_aggregate_registry` BEFORE the regular candidate-list
+/// name match. Each routed entry feeds the standard
+/// `classify_aggregate_shape` pipeline downstream, so the override
+/// only fixes the WIT-function lookup — return-shape classification
+/// (e.g. `bbox3d` → `Bbox3dText`) is still computed from the WIT
+/// signature.
+///
+/// Today's surface:
+/// - `st_3dextent` → `postgis-aggregates::st-extent-threed`. The
+///   WIT identifier was renamed from `st-3d-extent` to
+///   `st-extent-threed` (per `aggregates.wit` comment) to satisfy
+///   wit-bindgen 0.37+'s "each hyphen segment must start with a
+///   letter" rule. The interface DB's `st_3d_extent` alias bridges
+///   the prefix style but not the trailing rename, so name-match
+///   misses; this entry routes it directly.
+pub fn aggregate_function_overrides() -> &'static [(&'static str, &'static str, &'static str)] {
+    // (sql_name, wit_interface, wit_kebab_name)
+    &[
+        ("st_3dextent", "postgis-aggregates", "st-extent-threed"),
+    ]
+}
+
+/// Round (#608): look up an aggregate-function override. Returns the
+/// matching `WitFunction` (by walking `wit_fns`) if the SQL name has
+/// a hand-curated route. Sibling to `override_for`.
+pub fn aggregate_override_for<'a>(
+    sql_name: &str,
+    wit_fns: &'a [WitFunction],
+) -> Option<&'a WitFunction> {
+    let entry = aggregate_function_overrides()
+        .iter()
+        .find(|(name, _, _)| *name == sql_name)?;
+    wit_fns
+        .iter()
+        .find(|f| f.interface == entry.1 && f.kebab_name == entry.2)
 }
