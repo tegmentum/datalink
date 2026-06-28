@@ -11,6 +11,7 @@
 //! emit crates that depend on this one (`datalink-shim-sqlite-emit`,
 //! `datalink-shim-duckdb-emit`).
 
+pub mod compose_emit;
 pub mod force_link;
 pub mod interface_db;
 pub mod name_match;
