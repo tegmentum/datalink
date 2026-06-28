@@ -521,6 +521,20 @@ fn render_ret_to_scalarvalue(
              {i}    )))\n\
              {i}}}"
         ),
+        // Round (#608): bbox3d return — PostGIS-conventional text
+        // representation `BOX3D(xmin ymin zmin,xmax ymax zmax)`.
+        // The bbox3d record's wit-bindgen Rust shape is
+        // `{ min_x, min_y, min_z, max_x, max_y, max_z }` (six f64).
+        RetShape::Bbox3dText => format!(
+            "{{\n\
+             {i}    let __bb = {call_expr}{unwrap_chain};\n\
+             {i}    Ok(types::ScalarValue::Utf8(format!(\n\
+             {i}        \"BOX3D({{}} {{}} {{}},{{}} {{}} {{}})\",\n\
+             {i}        __bb.min_x, __bb.min_y, __bb.min_z,\n\
+             {i}        __bb.max_x, __bb.max_y, __bb.max_z,\n\
+             {i}    )))\n\
+             {i}}}"
+        ),
         RetShape::Enum {
             wit_module,
             kebab_name,
@@ -692,6 +706,8 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
         | RetShape::FirstRasterBlob
         | RetShape::FirstTopologyBlob => "types::LogicalType::Binary".to_string(),
         RetShape::IsValidDetailText => "types::LogicalType::Utf8".to_string(),
+        // Round (#608): bbox3d returns surface as `BOX3D(...)` text.
+        RetShape::Bbox3dText => "types::LogicalType::Utf8".to_string(),
         RetShape::OptionText => "types::LogicalType::Utf8".to_string(),
         RetShape::OptionReal => "types::LogicalType::Float64".to_string(),
         RetShape::OptionInt | RetShape::FirstOptionU32Int | RetShape::FirstInt => {
@@ -960,6 +976,18 @@ pub fn emit_aggregate_finalize_body(
                  {i}    Some(Some(v)) => Ok(ftypes::ScalarValue::Int64(*v as i64)),\n\
                  {i}    Some(None) | None => Ok(ftypes::ScalarValue::Null),\n\
                  {i}}}",
+            ));
+        }
+        // Round (#608): bbox3d return as PostGIS-conventional text.
+        // Non-fallible upstream (`st-extent-threed -> bbox3d`).
+        RetShape::Bbox3dText => {
+            s.push_str(&format!(
+                "{i}let __bb = {module}::{func}({call_args});\n\
+                 {i}Ok(ftypes::ScalarValue::Utf8(format!(\n\
+                 {i}    \"BOX3D({{}} {{}} {{}},{{}} {{}} {{}})\",\n\
+                 {i}    __bb.min_x, __bb.min_y, __bb.min_z,\n\
+                 {i}    __bb.max_x, __bb.max_y, __bb.max_z,\n\
+                 {i})))",
             ));
         }
         _ => {

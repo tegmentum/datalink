@@ -30,7 +30,7 @@ use crate::name_match::{
     index_wit_fns_nohyphen, resolve_function_aliases, sql_name_candidates,
     table_fn_name_candidates, AGGREGATE_NAME_SUFFIXES, EnumWithPackage,
 };
-use crate::override_tables::{override_for, tuple_pick_override_for};
+use crate::override_tables::{aggregate_override_for, override_for, tuple_pick_override_for};
 use crate::record_registry::RecordType;
 use crate::wit_parse::{
     self, WitEnumDecl, WitFunction, WitParam, WitRet, WitType, WitTypeAlias,
@@ -380,6 +380,16 @@ pub enum RetShape {
     /// `(valid, "reason", "<wkt-location>")` so the interface DB's
     /// `text` return type is honoured. Round 3.
     IsValidDetailText,
+    /// `bbox3d` record (6 f64s: min-x, min-y, min-z, max-x, max-y,
+    /// max-z). Round (#608). Rendered as the PostGIS-conventional
+    /// text representation `BOX3D(xmin ymin zmin,xmax ymax zmax)`
+    /// so the interface DB's `text` return type is honoured. Today's
+    /// only producer is `postgis-aggregates::st-extent-threed`
+    /// (the `st_3dextent` SQL aggregate). Parallels `BboxBlob` for
+    /// the 2D shape but uses text rather than WKB envelope because
+    /// no upstream WIT constructor builds a 3D bounding box geometry
+    /// today.
+    Bbox3dText,
     /// Phase E: record-typed return. The bridge encodes the
     /// UPSTREAM record via a ciborium round-trip into the LOCAL
     /// serde-ops record (same canon-CBOR bytes — round-trip works
@@ -591,10 +601,20 @@ pub fn build_aggregate_registry(
         for ag in &ext.aggregates {
             let candidates = aggregate_name_candidates(ag);
             let mut matched = None;
-            for cand in &candidates {
-                if let Some(f) = agg_index.get(cand) {
-                    matched = Some(*f);
-                    break;
+            // Round (#608): hand-curated overrides win before
+            // candidate-list lookup so a SQL aggregate whose
+            // canonical/alias forms share no stem with the upstream
+            // WIT kebab still wires. Sibling to `override_for` on
+            // the scalar path.
+            if let Some(f) = aggregate_override_for(&ag.canonical_name, &wit_fns) {
+                matched = Some(f);
+            }
+            if matched.is_none() {
+                for cand in &candidates {
+                    if let Some(f) = agg_index.get(cand) {
+                        matched = Some(*f);
+                        break;
+                    }
                 }
             }
             if matched.is_none() {
@@ -930,6 +950,9 @@ pub fn affinity_for(ty: &WitType) -> ColumnAffinity {
         WitType::Geometry { .. } | WitType::Geography { .. } => ColumnAffinity::Blob,
         WitType::Raster { .. } | WitType::Topology { .. } => ColumnAffinity::Blob,
         WitType::Bbox => ColumnAffinity::Blob,
+        // Round (#608): bbox3d renders as `BOX3D(...)` text via
+        // `RetShape::Bbox3dText`, so its column affinity is Text.
+        WitType::Bbox3d => ColumnAffinity::Text,
         WitType::ListGeomBorrow | WitType::ListGeomOwned => ColumnAffinity::Blob,
         WitType::ListRasterBorrow => ColumnAffinity::Blob,
         WitType::ListOptionU32 => ColumnAffinity::Text, // JSON-encoded
@@ -1342,6 +1365,14 @@ pub fn classify_param(
                 "param type not in dispatcher alphabet: bbox (returns only)"
             ));
         }
+        WitType::Bbox3d => {
+            // Round (#608): bbox3d only appears as a return today
+            // (`st-extent-threed`); reject in param position so a
+            // future shape that takes it surfaces a named diagnostic.
+            return Err(format!(
+                "param type not in dispatcher alphabet: bbox3d (returns only)"
+            ));
+        }
         WitType::List(inner) => {
             // W2 Phase 1 (#542): primitive-element `list<X>` param
             // via JSON-as-TEXT marshaling. SQL passes a JSON array
@@ -1635,6 +1666,11 @@ pub fn classify_return(
         // ymax)` constructor. Covers `st-make-box2d` and
         // `st-box-from-geohash`.
         WitType::Bbox => RetShape::BboxBlob,
+        // Round (#608): bbox3d returns (today: `st-extent-threed`)
+        // are rendered as `BOX3D(...)` text rather than a 3D-envelope
+        // WKB. Parallels `Bbox => BboxBlob` but uses text since no
+        // 3D-envelope constructor exists in the postgis-wasm WIT.
+        WitType::Bbox3d => RetShape::Bbox3dText,
         // Round 3: the specific tuple shape that
         // `st-is-valid-detail` returns — `tuple<bool,
         // option<string>, option<geometry>>` — is rendered as a
@@ -1783,6 +1819,7 @@ pub fn type_label_dbg(t: &WitType) -> String {
             format!("tuple<{}>", parts.join(", "))
         }
         WitType::Bbox => "bbox".into(),
+        WitType::Bbox3d => "bbox3d".into(),
         WitType::List(inner) => format!("list<{}>", type_label_dbg(inner)),
         WitType::Result(ok, _err) => format!("result<{}>", type_label_dbg(ok)),
         WitType::Unsupported(s) => s.clone(),

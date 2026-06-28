@@ -259,6 +259,16 @@ pub enum WitType {
     /// projects to a WKB POLYGON envelope so the interface DB's
     /// `binary` return type is honoured.
     Bbox,
+    /// `bbox3d` record from postgis-aggregates — `{min-x, min-y,
+    /// min-z, max-x, max-y, max-z}` of 6 f64s. Round (#608) extension.
+    /// Returned only by `st-extent-threed`; the dispatcher renders it
+    /// as a PostGIS-conventional text representation
+    /// `BOX3D(xmin ymin zmin,xmax ymax zmax)` via the
+    /// `RetShape::Bbox3dText` path. Parallels the `Bbox` variant for
+    /// the 2D shape but routes through text rather than WKB envelope
+    /// because no upstream WIT constructor builds a 3D bounding box
+    /// geometry today.
+    Bbox3d,
     /// Generic `list<T>` over any non-specialized element type.
     /// Phase F (#522). The specialized variants above (`ListU8`,
     /// `ListGeomBorrow`, `ListGeomOwned`, `ListOptionU32`) take
@@ -1446,6 +1456,9 @@ fn parse_type(s: &str) -> WitType {
         "u8" => WitType::U8,
         "bool" => WitType::Bool,
         "bbox" => WitType::Bbox,
+        // Round (#608): `bbox3d` record from postgis-aggregates,
+        // dispatched via `RetShape::Bbox3dText`.
+        "bbox3d" => WitType::Bbox3d,
         other => WitType::Unsupported(other.to_string()),
     }
 }
@@ -1523,6 +1536,7 @@ fn type_label(ty: &WitType) -> String {
             format!("tuple<{}>", parts.join(", "))
         }
         WitType::Bbox => "bbox".into(),
+        WitType::Bbox3d => "bbox3d".into(),
         WitType::List(inner) => format!("list<{}>", type_label(inner)),
         WitType::Result(ok, _err) => format!("result<{}>", type_label(ok)),
         WitType::Unsupported(s) => s.clone(),
@@ -1861,6 +1875,7 @@ pub fn reachable_primary_types(
 fn collect_named_types(ty: &WitType, out: &mut Vec<String>) {
     match ty {
         WitType::Bbox => out.push("bbox".to_string()),
+        WitType::Bbox3d => out.push("bbox3d".to_string()),
         WitType::Unsupported(name) => out.push(name.clone()),
         WitType::Option(inner) => collect_named_types(inner, out),
         WitType::List(inner) => collect_named_types(inner, out),

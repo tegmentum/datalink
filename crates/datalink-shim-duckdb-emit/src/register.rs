@@ -254,6 +254,8 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
         | RetShape::FirstRasterBlob
         | RetShape::FirstTopologyBlob => "types::Logicaltype::Blob".to_string(),
         RetShape::IsValidDetailText => "types::Logicaltype::Text".to_string(),
+        // Round (#608): bbox3d returns surface as `BOX3D(...)` text.
+        RetShape::Bbox3dText => "types::Logicaltype::Text".to_string(),
         RetShape::OptionText => "types::Logicaltype::Text".to_string(),
         RetShape::OptionReal => "types::Logicaltype::Float64".to_string(),
         RetShape::OptionInt | RetShape::FirstOptionU32Int | RetShape::FirstInt => {

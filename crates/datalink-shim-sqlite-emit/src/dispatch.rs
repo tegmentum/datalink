@@ -532,6 +532,21 @@ pub fn emit_arm_body(
              {i}    )))\n\
              {i}}}"
         ),
+        // Round (#608): bbox3d return — PostGIS-conventional text
+        // representation `BOX3D(xmin ymin zmin,xmax ymax zmax)`.
+        // The bbox3d record's wit-bindgen Rust shape is
+        // `{ min_x, min_y, min_z, max_x, max_y, max_z }` (six f64).
+        // No external interface alias required.
+        RetShape::Bbox3dText => format!(
+            "{{\n\
+             {i}    let __bb = {call_expr}{unwrap_chain};\n\
+             {i}    Ok(SqlValue::Text(format!(\n\
+             {i}        \"BOX3D({{}} {{}} {{}},{{}} {{}} {{}})\",\n\
+             {i}        __bb.min_x, __bb.min_y, __bb.min_z,\n\
+             {i}        __bb.max_x, __bb.max_y, __bb.max_z,\n\
+             {i}    )))\n\
+             {i}}}"
+        ),
         // Phase E: record-typed return — wrap as WitValue. Helper
         // `ret_to_witvalue_<snake>` is emitted once per record at
         // the lib.rs top scope; see `emit_lib::emit_wit_value_helpers`.
@@ -951,6 +966,21 @@ pub fn emit_aggregate_finalize_body(
                  {i}    Some(Some(v)) => Ok(SqlValue::Integer(*v as i64)),\n\
                  {i}    Some(None) | None => Ok(SqlValue::Null),\n\
                  {i}}}",
+            ));
+        }
+        // Round (#608): bbox3d return — PostGIS-conventional text
+        // representation. Today's only producer is the
+        // `st_3dextent` aggregate (`postgis-aggregates::st-extent-threed`),
+        // which is non-fallible (returns `bbox3d` directly, no
+        // `result<...>`), so no `.map_err(...)` thread.
+        RetShape::Bbox3dText => {
+            s.push_str(&format!(
+                "{i}let __bb = {module}::{func}({call_args});\n\
+                 {i}Ok(SqlValue::Text(format!(\n\
+                 {i}    \"BOX3D({{}} {{}} {{}},{{}} {{}} {{}})\",\n\
+                 {i}    __bb.min_x, __bb.min_y, __bb.min_z,\n\
+                 {i}    __bb.max_x, __bb.max_y, __bb.max_z,\n\
+                 {i})))",
             ));
         }
         _ => {
