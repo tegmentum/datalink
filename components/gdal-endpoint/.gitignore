@@ -1,0 +1,6 @@
+/target
+/harness-rs/target
+Cargo.lock
+harness-rs/Cargo.lock
+# Composed resident provider artifact (large, GDAL-bundled; rebuilt by build.sh).
+/gdal-provider.wasm

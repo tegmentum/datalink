@@ -1,0 +1,40 @@
+package compose:dynlink@0.1.0;
+
+/// The resident GDAL provider, BEFORE composition.
+///
+/// It exports the uniform message endpoint and imports the typed GDAL
+/// spatial-reference / coordinate-transform interface `gdal:core/srs`.
+/// That import is satisfied ONCE, at build time, by `wac`-composing this
+/// component with the prebuilt `gdal.component.wasm` (which embeds PROJ +
+/// proj.db). The composed artifact (`gdal-provider.wasm`) then matches the
+/// plain `dynlink-provider` shape below — it exports only
+/// `compose:dynlink/endpoint` and imports WASI — so a host loads it once and
+/// shares it as a resident provider (the orchestrator "Guice for Wasm"
+/// runtime-DI model), instead of GDAL being wac-inlined into each geo
+/// extension at build time.
+world gdal-provider {
+  export endpoint;
+
+  // The typed GDAL dependency, satisfied at composition time.
+  import gdal:core/srs@0.1.0;
+}
+
+/// A component that can be dynamically loaded by others (POST-composition
+/// shape). Used to bind the composed `gdal-provider.wasm`, whose GDAL import
+/// is already satisfied, in the standalone harness and by the host.
+world dynlink-provider {
+  export endpoint;
+}
+
+/// A consumer component whose single `endpoint` import is satisfied at exec
+/// time by a host-resolved provider.
+world endpoint-consumer {
+  import endpoint;
+}
+
+/// A guest that dynamically links other components at runtime (resolves a
+/// resident provider by id and invokes its endpoint). This is the world the
+/// deferred `spatialproj-component` rewrite will target.
+world dynlink-guest {
+  import linker;
+}

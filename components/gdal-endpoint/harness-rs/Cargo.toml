@@ -1,0 +1,18 @@
+[package]
+name = "gdal-endpoint-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
+wasmtime = { version = "46.0.1", features = ["component-model"] }
+wasmtime-wasi = "46.0.1"
+anyhow = "1"
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }

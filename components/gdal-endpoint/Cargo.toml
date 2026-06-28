@@ -1,0 +1,41 @@
+[package]
+name = "gdal-endpoint"
+version = "0.1.0"
+edition = "2021"
+description = """
+DB-agnostic resident GDAL provider for the compose:dynlink/endpoint contract.
+A thin endpoint wrapper around the typed `gdal:core/srs` interface: it decodes
+a msgpack reprojection request, drives GDAL/PROJ (SpatialRef::from_epsg + a
+coordinate Transform + a geo/wkt coordinate walk), and returns a msgpack reply.
+The `gdal:core/srs` import is satisfied ONCE, at build time, by wac-composing
+this component with the prebuilt gdal.component.wasm (which embeds PROJ +
+proj.db), yielding a single resident `gdal-provider.wasm` loaded once and
+shared by every geo extension via the orchestrator's runtime-DI model —
+instead of GDAL being wac-inlined into each consumer at build time. The
+reprojection logic is moved from ducklink's spatialproj-component.
+"""
+license = "MIT"
+publish = false
+
+# Detached from any parent workspace — built standalone via
+# `cargo build --release --target wasm32-wasip2` in this dir.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinned to the same wit-bindgen that successfully bound gdal:core in
+# ducklink's spatialproj-component.
+wit-bindgen = "0.41"
+# msgpack request/response envelope (the wire shape the deferred spatialproj
+# rewrite will encode/decode against).
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+# WKT parse/emit + geometry model, identical to spatialproj's stack.
+wkt = "0.10"
+geo-types = "0.7"
+
+[profile.release]
+opt-level = "s"
+lto = true

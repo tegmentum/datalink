@@ -1,0 +1,22 @@
+/// Blobs interface - content-addressed storage
+interface blobs {
+  use types.{error, digest};
+
+  /// Store blob and return its digest
+  put: func(bytes: list<u8>) -> result<digest, error>;
+
+  /// Retrieve blob by digest
+  get: func(digest: digest) -> result<list<u8>, error>;
+
+  /// Check if blob exists
+  has: func(digest: digest) -> bool;
+
+  /// Get blob size without retrieving content
+  size: func(digest: digest) -> option<u64>;
+
+  /// Delete blob by digest (may fail if referenced)
+  delete: func(digest: digest) -> result<_, error>;
+
+  /// List all blob digests (for debugging/admin)
+  list-all: func() -> list<digest>;
+}
