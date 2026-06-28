@@ -50,14 +50,16 @@ crate-type = ["cdylib"]
 [dependencies]
 wit-bindgen = {{ version = "0.41", features = ["macros"] }}
 wit-bindgen-rt = {{ version = "0.41", features = ["bitflags"] }}
-# Scalar-first cut: serde + serde_json are present for parity
-# with sqlite-emit's JSON-as-TEXT helpers (`list<f64>` args parsed
-# from `'[1.0, 2.0]'` TEXT). The datafission-target dispatch arms
-# in this cut don't currently exercise them, but the build needs
-# them on the dependency manifest for any future serde_json
-# references in the generated prelude to resolve.
+# Per-shape arms: serde + serde_json drive the JSON-as-TEXT helpers
+# (`list<f64>` args parsed from `'[1.0, 2.0]'` TEXT, `JsonText`
+# returns serialized via serde_json). `ciborium` ferries WitValue
+# records through the WTV magic-prefix Binary scheme (4-byte magic
+# + 32-byte type_id + canonical-CBOR payload). All three with
+# `default-features = false` so they compile clean to wasm32-wasip2.
 serde = {{ version = "1", default-features = false, features = ["derive", "alloc"] }}
 serde_json = {{ version = "1", default-features = false, features = ["alloc"] }}
+ciborium = {{ version = "0.2", default-features = false }}
+ciborium-io = {{ version = "0.2", default-features = false }}
 
 [profile.release]
 opt-level = "s"

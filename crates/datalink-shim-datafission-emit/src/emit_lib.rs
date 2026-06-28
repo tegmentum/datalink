@@ -46,6 +46,29 @@ use datalink_shim_codegen_core::record_registry::{self, RecordType};
 use crate::dispatch;
 use crate::emit_wit;
 
+/// Snake → PascalCase converter mirroring wit-bindgen's ident
+/// conversion. Used for resource-type idents (Geometry, Raster,
+/// Topology) and for per-record Rust type names.
+fn pascal_case(s: &str) -> String {
+    let mut out = String::new();
+    let mut up = true;
+    for c in s.chars() {
+        if c == '-' || c == '_' || c.is_whitespace() {
+            up = true;
+            continue;
+        }
+        if up {
+            for u in c.to_uppercase() {
+                out.push(u);
+            }
+            up = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Generate `src/lib.rs`.
 pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let primary = plan
@@ -104,7 +127,182 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         used_aliases
             .entry(entry.shape.wit_module.clone())
             .or_insert_with(|| entry.shape.wit_package.clone());
+        // Some return shapes reference helper interfaces (BboxBlob
+        // uses `pg_ctor::st_make_envelope`, IsValidDetailText uses
+        // `pg_out::st_as_text`) and Enum returns reference the
+        // declaring interface's alias. Register those aliases so
+        // their `use` lines get emitted.
+        match &entry.shape.ret {
+            interface_db::RetShape::BboxBlob => {
+                used_aliases
+                    .entry("pg_ctor".to_string())
+                    .or_insert_with(|| "postgis:wasm".to_string());
+            }
+            interface_db::RetShape::IsValidDetailText => {
+                used_aliases
+                    .entry("pg_out".to_string())
+                    .or_insert_with(|| "postgis:wasm".to_string());
+            }
+            interface_db::RetShape::Enum {
+                wit_module,
+                wit_package,
+                ..
+            } => {
+                used_aliases
+                    .entry(wit_module.clone())
+                    .or_insert_with(|| wit_package.clone());
+            }
+            _ => {}
+        }
+        for p in &entry.shape.params {
+            if let interface_db::ParamShape::Enum {
+                wit_module,
+                wit_package,
+                ..
+            } = p
+            {
+                used_aliases
+                    .entry(wit_module.clone())
+                    .or_insert_with(|| wit_package.clone());
+            }
+        }
     }
+
+    // Collect referenced records: any scalar with a WitValueRecord
+    // (param or ret) / OptionWitValueRecord / FirstWitValueRecord /
+    // ListRecord param contributes its record kebab-name to the set.
+    // Only those records get per-record helpers emitted (otherwise
+    // wit-bindgen's elision of unreferenced upstream types would
+    // make the helpers fail to compile).
+    let mut referenced_records: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for (entry, _f) in &scalar_entries {
+        for p in &entry.shape.params {
+            match p {
+                interface_db::ParamShape::WitValueRecord { kebab_name, .. }
+                | interface_db::ParamShape::ListRecord { kebab_name, .. } => {
+                    referenced_records.insert(kebab_name.clone());
+                }
+                _ => {}
+            }
+        }
+        match &entry.shape.ret {
+            interface_db::RetShape::WitValueRecord { kebab_name, .. }
+            | interface_db::RetShape::OptionWitValueRecord { kebab_name, .. }
+            | interface_db::RetShape::FirstWitValueRecord { kebab_name, .. } => {
+                referenced_records.insert(kebab_name.clone());
+            }
+            _ => {}
+        }
+    }
+    let helper_records: Vec<RecordType> = records
+        .iter()
+        .filter(|r| referenced_records.contains(&r.kebab_name))
+        .cloned()
+        .collect();
+
+    // Per-signature tuple-list helpers (one `parse_json_list_tuple_<sig>`
+    // helper per unique element-list signature referenced by a
+    // wired arm).
+    let mut tuple_sigs: std::collections::BTreeSet<Vec<interface_db::ListPrimElem>> =
+        std::collections::BTreeSet::new();
+    for (entry, _f) in &scalar_entries {
+        for p in &entry.shape.params {
+            if let Some(sig) = p.list_tuple_sig() {
+                tuple_sigs.insert(sig.to_vec());
+            }
+        }
+    }
+
+    // Discover whether the primary shim's WIT declares
+    // geometry/raster/topology resource + matching error variant.
+    // The per-resource helper bodies (`from_wkb`, `from_raster_binary`,
+    // `from_topology_bytes` and their err formatters) are emitted only
+    // when both halves are present so non-postgis shims stay slim.
+    let shim_pkg = shim_packages
+        .iter()
+        .find(|p| emit_wit::package_belongs_to_primary(&p.ns_name, primary))
+        .cloned();
+    let shim_has_geometry_resource = shim_pkg
+        .as_ref()
+        .map(|p| p.resources.iter().any(|r| r.kebab_name == "geometry"))
+        .unwrap_or(false);
+    let shim_has_postgis_error = shim_pkg
+        .as_ref()
+        .map(|p| p.variants.iter().any(|v| v.kebab_name == "postgis-error"))
+        .unwrap_or(false);
+    let shim_has_raster_resource = shim_pkg
+        .as_ref()
+        .map(|p| p.resources.iter().any(|r| r.kebab_name == "raster"))
+        .unwrap_or(false);
+    let shim_has_raster_error = shim_pkg
+        .as_ref()
+        .map(|p| p.variants.iter().any(|v| v.kebab_name == "raster-error"))
+        .unwrap_or(false);
+    let shim_has_topology_resource = shim_pkg
+        .as_ref()
+        .map(|p| p.resources.iter().any(|r| r.kebab_name == "topology"))
+        .unwrap_or(false);
+    let shim_has_topology_error = shim_pkg
+        .as_ref()
+        .map(|p| p.variants.iter().any(|v| v.kebab_name == "topology-error"))
+        .unwrap_or(false);
+
+    // wit-bindgen `additional_derives_ignore` list. Datafission
+    // contract packages and helper-shim packages don't ship serde
+    // impls (their variants/flags use macros that don't auto-derive),
+    // so we explicitly exclude their types from the
+    // Serialize/Deserialize derives. Primary-shim records — the ones
+    // we WANT to round-trip — stay off the ignore list.
+    let mut derives_ignore: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let datafission_pkgs = emit_wit::discover_datafission_packages()
+        .unwrap_or_default();
+    for pkg in &datafission_pkgs {
+        for r in &pkg.records {
+            derives_ignore.insert(r.kebab_name.clone());
+        }
+        for v in &pkg.variants {
+            derives_ignore.insert(v.kebab_name.clone());
+        }
+        for e in &pkg.enums {
+            derives_ignore.insert(e.kebab_name.clone());
+        }
+        for f in &pkg.flags {
+            derives_ignore.insert(f.kebab_name.clone());
+        }
+    }
+    for pkg in &shim_packages {
+        if emit_wit::package_belongs_to_primary(&pkg.ns_name, primary) {
+            // Primary-shim variants + flags can't derive serde out
+            // of the box. Records stay off the ignore list — they're
+            // exactly the types we WANT serde for.
+            for v in &pkg.variants {
+                derives_ignore.insert(v.kebab_name.clone());
+            }
+            for f in &pkg.flags {
+                derives_ignore.insert(f.kebab_name.clone());
+            }
+        } else {
+            for r in &pkg.records {
+                derives_ignore.insert(r.kebab_name.clone());
+            }
+            for v in &pkg.variants {
+                derives_ignore.insert(v.kebab_name.clone());
+            }
+            for e in &pkg.enums {
+                derives_ignore.insert(e.kebab_name.clone());
+            }
+            for f in &pkg.flags {
+                derives_ignore.insert(f.kebab_name.clone());
+            }
+        }
+    }
+    let derives_ignore_lits: String = derives_ignore
+        .iter()
+        .map(|n| format!("            \"{n}\",\n"))
+        .collect::<Vec<_>>()
+        .join("");
 
     let mut s = String::new();
     s.push_str(HEADER);
@@ -142,6 +340,16 @@ mod bindings {{
         path: "wit",
         world: "bridge",
         generate_all,
+        // Per-shape arms: derive serde::Serialize + Deserialize on
+        // every wit-bindgen-generated record so ciborium can ferry
+        // upstream records through the WTV magic-prefix Binary
+        // envelope. The contract / helper-shim types listed in
+        // `additional_derives_ignore` don't ship serde impls (their
+        // variants/flags use macros that don't auto-derive); only
+        // primary-shim records get the derives.
+        additional_derives: [serde::Serialize, serde::Deserialize],
+        additional_derives_ignore: [
+{derives_ignore_lits}        ],
     }});
 }}
 
@@ -175,6 +383,7 @@ use bindings::exports::datafission::index_plugin::index;
 use bindings::datafission::function_plugin::types as types;
 
 "##,
+        derives_ignore_lits = derives_ignore_lits,
     ));
     let _ = primary;
 
@@ -194,9 +403,74 @@ use bindings::datafission::function_plugin::types as types;
             ));
         }
     }
+    // Per-resource `use` lines for the primary shim's
+    // Geometry/Raster/Topology + matching error variants. Each is
+    // emitted only when the WIT declares both the resource and the
+    // error type so non-postgis shims stay slim.
+    if shim_has_geometry_resource && shim_has_postgis_error {
+        if let Some(p) = shim_pkg.as_ref() {
+            let (pkg_ns, pkg_name) = split_pkg(&p.ns_name);
+            s.push_str(&format!(
+                "use bindings::{pkg_ns}::{pkg_name}::postgis_types::{{Geography, Geometry, PostgisError}};\n",
+                pkg_ns = sanitize_module(&pkg_ns),
+                pkg_name = sanitize_module(&pkg_name),
+            ));
+        }
+    }
+    if shim_has_raster_resource && shim_has_raster_error {
+        if let Some(p) = shim_pkg.as_ref() {
+            let (pkg_ns, pkg_name) = split_pkg(&p.ns_name);
+            s.push_str(&format!(
+                "use bindings::{pkg_ns}::{pkg_name}::postgis_raster_types::{{Raster, RasterError}};\n",
+                pkg_ns = sanitize_module(&pkg_ns),
+                pkg_name = sanitize_module(&pkg_name),
+            ));
+        }
+    }
+    if shim_has_topology_resource && shim_has_topology_error {
+        if let Some(p) = shim_pkg.as_ref() {
+            let (pkg_ns, pkg_name) = split_pkg(&p.ns_name);
+            s.push_str(&format!(
+                "use bindings::{pkg_ns}::{pkg_name}::postgis_topology_types::{{Topology, TopologyError}};\n",
+                pkg_ns = sanitize_module(&pkg_ns),
+                pkg_name = sanitize_module(&pkg_name),
+            ));
+        }
+    }
     s.push('\n');
 
     s.push_str(SCALARVALUE_HELPERS);
+
+    // Compose the helper-prelude body from the per-resource flags
+    // computed above. Each is independent: a postgis bridge gets
+    // all three (geometry + raster + topology); a raster-only shim
+    // would get just the raster helpers; etc.
+    if shim_has_geometry_resource && shim_has_postgis_error {
+        s.push_str(POSTGIS_HELPERS_BODY);
+    }
+    if shim_has_raster_resource && shim_has_raster_error {
+        if let Some(p) = shim_pkg.as_ref() {
+            let (pkg_ns, pkg_name) = split_pkg(&p.ns_name);
+            s.push_str(&render_raster_helpers(
+                &sanitize_module(&pkg_ns),
+                &sanitize_module(&pkg_name),
+            ));
+        }
+    }
+    if shim_has_topology_resource && shim_has_topology_error {
+        if let Some(p) = shim_pkg.as_ref() {
+            let (pkg_ns, pkg_name) = split_pkg(&p.ns_name);
+            s.push_str(&render_topology_helpers(
+                &sanitize_module(&pkg_ns),
+                &sanitize_module(&pkg_name),
+            ));
+        }
+    }
+    s.push_str(JSON_LIST_PRIM_HELPERS);
+    s.push_str(&render_tuple_list_helpers(&tuple_sigs));
+    if !helper_records.is_empty() {
+        s.push_str(&emit_wit_value_helpers(&helper_records));
+    }
 
     s.push_str("struct Component;\n\n");
 
@@ -839,4 +1113,364 @@ fn split_pkg(pkg: &str) -> (String, String) {
 
 fn sanitize_module(s: &str) -> String {
     s.replace('-', "_")
+}
+
+/// Postgis-specific helpers — emitted only when the shim's WIT
+/// declares `resource geometry` + `variant postgis-error`. For
+/// non-postgis shims the dispatcher never references these so the
+/// helpers can be omitted without breaking compilation.
+const POSTGIS_HELPERS_BODY: &str = r#"
+// ─── Postgis resource helpers ───
+
+fn from_wkb(bytes: &[u8], name: &str) -> Result<Geometry, types::FunctionError> {
+    Geometry::from_wkb(bytes).map_err(|e| {
+        types::FunctionError::ExecutionError(format!("{name}: {}", postgis_err_string(e)))
+    })
+}
+
+fn geog_from_wkb(bytes: &[u8], name: &str) -> Result<Geography, types::FunctionError> {
+    Geography::from_wkb(bytes).map_err(|e| {
+        types::FunctionError::ExecutionError(format!("{name}: {}", postgis_err_string(e)))
+    })
+}
+
+/// Format a `postgis-error` variant back to a string the SQL
+/// caller can read.
+fn postgis_err_string(e: PostgisError) -> String {
+    match e {
+        PostgisError::InvalidGeometry(s)
+        | PostgisError::ParseError(s)
+        | PostgisError::UnsupportedOperation(s)
+        | PostgisError::NumericError(s)
+        | PostgisError::SridMismatch(s)
+        | PostgisError::General(s) => s,
+    }
+}
+"#;
+
+/// Raster prelude helpers. Mirror of POSTGIS_HELPERS_BODY for the
+/// raster resource. Emitted only when the shim's WIT declares
+/// `resource raster` + `variant raster-error`.
+fn render_raster_helpers(pkg_ns: &str, pkg_name: &str) -> String {
+    format!(
+        r#"
+// ─── Raster resource helpers ───
+
+fn from_raster_binary(bytes: &[u8], name: &str) -> Result<Raster, types::FunctionError> {{
+    bindings::{pkg_ns}::{pkg_name}::postgis_raster_types::from_binary(bytes)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{{}}: {{}}", name, raster_err_string(e))))
+}}
+
+fn raster_err_string(e: RasterError) -> String {{
+    match e {{
+        RasterError::ParseError(s)
+        | RasterError::OutOfBounds(s)
+        | RasterError::TypeMismatch(s)
+        | RasterError::General(s) => s,
+    }}
+}}
+"#,
+        pkg_ns = pkg_ns,
+        pkg_name = pkg_name,
+    )
+}
+
+/// Topology prelude helpers. Mirror of POSTGIS_HELPERS_BODY for
+/// the topology resource. Emitted only when the shim's WIT
+/// declares `resource topology` + `variant topology-error`.
+fn render_topology_helpers(pkg_ns: &str, pkg_name: &str) -> String {
+    format!(
+        r#"
+// ─── Topology resource helpers ───
+
+fn from_topology_bytes(bytes: &[u8], name: &str) -> Result<Topology, types::FunctionError> {{
+    bindings::{pkg_ns}::{pkg_name}::postgis_topology_types::from_bytes(bytes)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{{}}: {{}}", name, topology_err_string(e))))
+}}
+
+fn topology_err_string(e: TopologyError) -> String {{
+    match e {{
+        TopologyError::InvalidTopology(s) | TopologyError::General(s) => s,
+        TopologyError::NodeNotFound(id) => format!("node not found: {{}}", id),
+        TopologyError::EdgeNotFound(id) => format!("edge not found: {{}}", id),
+        TopologyError::FaceNotFound(id) => format!("face not found: {{}}", id),
+    }}
+}}
+"#,
+        pkg_ns = pkg_ns,
+        pkg_name = pkg_name,
+    )
+}
+
+/// Primitive `list<X>` param helpers. Each
+/// `ParamShape::ListPrim(elem)` dispatch arm calls one of these
+/// `parse_json_list_<T>` helpers. The SQL caller passes a JSON-array
+/// literal in the TEXT arg; the helper decodes via serde_json into
+/// a `Vec<T>` which the arm then passes to the WIT function as
+/// `&[T]`.
+const JSON_LIST_PRIM_HELPERS: &str = r##"
+// ─── JSON-as-TEXT list<prim> helpers ───
+
+#[allow(dead_code)]
+fn parse_json_list_f64(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<f64>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<f64>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of f64 ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_i32(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<i32>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<i32>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of s32 ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_i64(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<i64>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<i64>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of s64 ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_u32(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<u32>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<u32>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of u32 ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_u64(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<u64>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<u64>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of u64 ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_u8(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<u8>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<u8>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of u8 ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_bool(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<bool>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<bool>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of bool ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_string(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<String>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<String>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of string ({e})")))
+}
+"##;
+
+/// Render each tuple-list helper into the bridge prelude. Each
+/// helper:
+///   - Reads the SQL TEXT arg as JSON.
+///   - Parses via `serde_json::from_str::<Vec<(T1, T2, ...)>>` —
+///     serde renders Rust tuples as fixed-length JSON arrays.
+fn render_tuple_list_helpers(
+    sigs: &std::collections::BTreeSet<Vec<interface_db::ListPrimElem>>,
+) -> String {
+    if sigs.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push_str(
+        "\n// ─── list<tuple<...>> param helpers ───\n\
+         // One per unique tuple-element signature referenced by a wired\n\
+         // dispatch arm. SQL passes a JSON-array of arrays as the TEXT\n\
+         // arg (e.g. `'[[1, 10], [20, 30]]'`); serde_json parses tuples\n\
+         // as fixed-length JSON arrays so the upstream\n\
+         // `Vec<(T1, T2, ...)>` binding round-trips directly.\n",
+    );
+    for elements in sigs {
+        let suffix = dispatch::list_tuple_sig_suffix(elements);
+        let elems_joined = elements
+            .iter()
+            .map(|e| e.rust_elem())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rust_tuple = if elements.len() == 1 {
+            format!("({},)", elems_joined)
+        } else {
+            format!("({})", elems_joined)
+        };
+        let wit_label = elements
+            .iter()
+            .map(|e| match e {
+                interface_db::ListPrimElem::F64 => "f64",
+                interface_db::ListPrimElem::F32 => "f32",
+                interface_db::ListPrimElem::S32 => "s32",
+                interface_db::ListPrimElem::S64 => "s64",
+                interface_db::ListPrimElem::U32 => "u32",
+                interface_db::ListPrimElem::U64 => "u64",
+                interface_db::ListPrimElem::U8 => "u8",
+                interface_db::ListPrimElem::Bool => "bool",
+                interface_db::ListPrimElem::String => "string",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "#[allow(dead_code)]\n\
+             fn parse_json_list_tuple_{suffix}(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<{rust_tuple}>, types::FunctionError> {{\n\
+             \x20   let text = dfv_text(args, idx, name)?;\n\
+             \x20   serde_json::from_str::<Vec<{rust_tuple}>>(text)\n\
+             \x20       .map_err(|e| types::FunctionError::ExecutionError(\n\
+             \x20           format!(\"{{name}}: arg {{idx}} must be JSON array of [{wit_label}] tuples ({{e}})\")))\n\
+             }}\n\n",
+        ));
+    }
+    s
+}
+
+/// Per-record WitValue marshaling helpers using the magic-prefix
+/// Binary scheme. For each referenced record `R`, emits:
+///
+///   - `arg_witvalue_<snake>(args, idx, name) -> Result<UPSTREAM, FunctionError>`:
+///     reads `args[idx]` as `ScalarValue::Binary`, verifies the
+///     `b"WTV\x01"` magic + the baked-in 32-byte type_id, then
+///     ciborium-decodes the payload tail directly into the upstream
+///     record (records flagged `direct=false` instead surface an
+///     ExecutionError noting the deferral).
+///
+///   - `ret_to_witvalue_<snake>(upstream: UPSTREAM) -> Result<ScalarValue, FunctionError>`:
+///     ciborium-encodes the upstream record into a buffer prefixed
+///     with the WTV magic + type_id; returns
+///     `ScalarValue::Binary(buf)`.
+///
+///   - `parse_json_list_record_<snake>(args, idx, name) -> Result<Vec<UPSTREAM>, FunctionError>`:
+///     JSON-array fallback for `ListRecord` params; the WIT-bindgen
+///     `additional_derives: [serde::Deserialize]` makes UPSTREAM
+///     deserialisable directly, so no LOCAL→UPSTREAM ciborium
+///     round-trip is needed.
+fn emit_wit_value_helpers(records: &[RecordType]) -> String {
+    let mut s = String::new();
+    s.push_str("\n// ─── WIT-value record marshaling helpers ───\n");
+    s.push_str("// Per-record `arg_witvalue_<snake>` / `ret_to_witvalue_<snake>`\n");
+    s.push_str("// over the WTV magic-prefix Binary envelope:\n");
+    s.push_str("//   bytes[0..4]  = b\"WTV\\x01\"\n");
+    s.push_str("//   bytes[4..36] = 32-byte sha256 type_id (baked per record)\n");
+    s.push_str("//   bytes[36..]  = canonical-CBOR payload (ciborium).\n");
+    s.push_str("//\n");
+    s.push_str("// Records flagged `direct == false` decode UPSTREAM via a\n");
+    s.push_str("// LOCAL → UPSTREAM ciborium round-trip — the LOCAL serde-ops\n");
+    s.push_str("// codec the sqlite target ships isn't available on the\n");
+    s.push_str("// datafission surface, so we surface those as ExecutionError\n");
+    s.push_str("// with a self-describing message instead of restructuring\n");
+    s.push_str("// codegen-core.\n\n");
+    s.push_str("const WTV_MAGIC: [u8; 4] = *b\"WTV\\x01\";\n\n");
+
+    for r in records {
+        let snake = r.snake_name();
+        let pascal = pascal_case(&r.kebab_name);
+        let upstream_iface_snake = sanitize_module(&r.interface);
+        let (pkg_ns, pkg_name) = split_pkg(&r.package);
+        let upstream_path = format!(
+            "bindings::{ns}::{name}::{iface}::{pascal}",
+            ns = sanitize_module(&pkg_ns),
+            name = sanitize_module(&pkg_name),
+            iface = upstream_iface_snake,
+            pascal = pascal,
+        );
+        let type_id_bytes: Vec<String> =
+            r.type_id.iter().map(|b| format!("0x{:02x}", b)).collect();
+        let type_id_lits = type_id_bytes.join(", ");
+        let expected_hex: String = r
+            .type_id
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join("");
+
+        if r.direct {
+            s.push_str(&format!(
+                "#[allow(dead_code)]\n\
+                 fn arg_witvalue_{snake}(\n\
+                 \x20   args: &[ftypes::ScalarValue],\n\
+                 \x20   idx: usize,\n\
+                 \x20   name: &str,\n\
+                 ) -> Result<{upstream_path}, types::FunctionError> {{\n\
+                 \x20   let bytes = dfv_blob(args, idx, name)?;\n\
+                 \x20   if bytes.len() < 36 || &bytes[..4] != &WTV_MAGIC {{\n\
+                 \x20       return Err(types::FunctionError::ExecutionError(\n\
+                 \x20           format!(\"{{name}}: arg {{idx}} not a WTV-framed wit-value\")));\n\
+                 \x20   }}\n\
+                 \x20   const EXPECTED_TYPE_ID: [u8; 32] = [{type_id_lits}];\n\
+                 \x20   if &bytes[4..36] != &EXPECTED_TYPE_ID {{\n\
+                 \x20       return Err(types::FunctionError::ExecutionError(\n\
+                 \x20           format!(\"{{name}}: arg {{idx}} type_id mismatch (expected {expected_hex})\")));\n\
+                 \x20   }}\n\
+                 \x20   let payload = &bytes[36..];\n\
+                 \x20   ciborium::de::from_reader::<{upstream_path}, _>(payload)\n\
+                 \x20       .map_err(|e| types::FunctionError::ExecutionError(\n\
+                 \x20           format!(\"{{name}}: decode arg {{idx}}: {{}}\", e)))\n\
+                 }}\n\n",
+            ));
+        } else {
+            // Non-direct: the LOCAL serde-ops codec isn't available
+            // on the datafission target, so we report the deferral
+            // explicitly at call time rather than silently producing
+            // wrong bytes.
+            s.push_str(&format!(
+                "#[allow(dead_code)]\n\
+                 fn arg_witvalue_{snake}(\n\
+                 \x20   _args: &[ftypes::ScalarValue],\n\
+                 \x20   _idx: usize,\n\
+                 \x20   name: &str,\n\
+                 ) -> Result<{upstream_path}, types::FunctionError> {{\n\
+                 \x20   Err(types::FunctionError::ExecutionError(format!(\n\
+                 \x20       \"{{name}}: wit-value record {snake} is non-direct (LOCAL serde-ops codec required but not available on the datafission surface)\")))\n\
+                 }}\n\n",
+            ));
+        }
+
+        // `parse_json_list_record_<snake>` for ListRecord params.
+        s.push_str(&format!(
+            "#[allow(dead_code)]\n\
+             fn parse_json_list_record_{snake}(\n\
+             \x20   args: &[ftypes::ScalarValue],\n\
+             \x20   idx: usize,\n\
+             \x20   name: &str,\n\
+             ) -> Result<Vec<{upstream_path}>, types::FunctionError> {{\n\
+             \x20   let text = dfv_text(args, idx, name)?;\n\
+             \x20   serde_json::from_str::<Vec<{upstream_path}>>(text)\n\
+             \x20       .map_err(|e| types::FunctionError::ExecutionError(\n\
+             \x20           format!(\"{{name}}: arg {{idx}} must be JSON array of {kebab} ({{e}})\")))\n\
+             }}\n\n",
+            kebab = r.kebab_name,
+        ));
+
+        // Encoder: UPSTREAM → WTV-framed Binary.
+        s.push_str(&format!(
+            "#[allow(dead_code)]\n\
+             fn ret_to_witvalue_{snake}(\n\
+             \x20   upstream: {upstream_path},\n\
+             ) -> Result<ftypes::ScalarValue, types::FunctionError> {{\n\
+             \x20   let mut buf: Vec<u8> = alloc::vec::Vec::with_capacity(64);\n\
+             \x20   buf.extend_from_slice(&WTV_MAGIC);\n\
+             \x20   const TYPE_ID: [u8; 32] = [{type_id_lits}];\n\
+             \x20   buf.extend_from_slice(&TYPE_ID);\n\
+             \x20   ciborium::ser::into_writer(&upstream, &mut buf)\n\
+             \x20       .map_err(|e| types::FunctionError::ExecutionError(\n\
+             \x20           format!(\"encode {snake} wit-value: {{}}\", e)))?;\n\
+             \x20   Ok(ftypes::ScalarValue::Binary(buf))\n\
+             }}\n\n",
+        ));
+    }
+    s
 }

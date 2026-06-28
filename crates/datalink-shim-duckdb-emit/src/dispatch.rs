@@ -8,14 +8,6 @@
 //! `DispatchShape`, `ParamShape`, `RetShape`, ...) and renders the
 //! Rust source of each match-arm body the dispatch loop calls.
 //!
-//! ## Scalar-first cut
-//!
-//! Step 4 of PLAN-shim-codegen-datalink-migration wires only the
-//! scalar arms (`call_scalar` / `call_scalar_batch`). Aggregates,
-//! UDTFs, pragmas, and casts emit as `Duckerror::Unsupported` so
-//! the bridge stays loadable; they are picked up in follow-up
-//! steps once a ducklink-loader smoke harness exists.
-//!
 //! ## Marshaling shape
 //!
 //! `Duckvalue` differs from `SqlValue` in two structural ways the
@@ -27,13 +19,20 @@
 //!     propagation matches PostGIS scalar semantics).
 //!   * Integer arms split into `Int64` / `Int32` / `Uint64` /
 //!     `Uint32` / `Int16` / `Int8` / `Uint16` / `Uint8`. The
-//!     scalar-first emit unpacks all of these into `i64` (or `as
-//!     i32` / `as u32` / etc.) since the underlying interface DB
-//!     declares the function param type and the emit just routes
-//!     to the matching upstream WIT arg.
+//!     scalar emit unpacks all of these into `i64` (or `as
+//!     i32` / `as u32` / etc.) via the shared `dv_i64` helper.
+//!   * Record-typed wit-value payloads ride on `Duckvalue::Complex
+//!     { type_expr, json }` — the JSON-direct path described in the
+//!     duckdb-emit AGENTS notes. The bridge has no LOCAL serde-ops
+//!     codec (`SerdeOpsGuest` is not emitted on the duckdb target),
+//!     so the per-record helpers `serde_json::from_str::<UPSTREAM>`
+//!     straight into the upstream type. wit-bindgen's
+//!     `additional_derives: [serde::Deserialize, serde::Serialize]`
+//!     makes UPSTREAM serdeable.
 
 use datalink_shim_codegen_core::interface_db::{
-    DispatchShape, ParamShape, RetShape,
+    list_tuple_sig_suffix, DispatchShape, JsonRetKind, ListPrimElem,
+    ParamShape, RetShape,
 };
 
 /// Emit the body of one match arm of `call_scalar`. The body
@@ -68,9 +67,6 @@ pub fn emit_scalar_arm_body(
                 s.push_str(&format!(
                     "{i}let arg{idx} = dv_text(&args, {idx}, \"{sql_name}\")?;\n",
                 ));
-                // `dv_text` returns `&str` already; pass directly.
-                // `.as_str()` on `&str` is an unstable nightly
-                // feature (`str_as_str`, rust-lang/rust#130366).
                 call_args.push(format!("arg{idx}"));
             }
             ParamShape::F64 => {
@@ -115,148 +111,512 @@ pub fn emit_scalar_arm_body(
                 ));
                 call_args.push(format!("arg{idx}"));
             }
+            ParamShape::Geom => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = from_wkb(dv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Geog => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = geog_from_wkb(dv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Raster => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = from_raster_binary(dv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Topology => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = from_topology_bytes(dv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
             ParamShape::OptionNone => {
-                // Mirror sqlite-emit: pass `None` for an
-                // option<T> param the codegen elects to default.
                 call_args.push("None".to_string());
             }
-            // Step 4 scalar-first cut: shapes below need either a
-            // helper that hasn't been defined here yet
-            // (Geom/Geog/Raster/Topology need `from_wkb` /
-            // `geog_from_wkb` / `from_raster_binary` /
-            // `from_topology_bytes` analogs of sqlite-emit's per-
-            // resource decoders), or ducklink-loader integration
-            // that isn't ready (WitValueRecord / ListGeom / Enum /
-            // ListPrim / ListRecord / ListTuple). Emit a stub
-            // return so the bridge still compiles; the function
-            // reports as unsupported at call time.
-            other => {
-                let shape_dbg = format!("{:?}", other)
-                    .replace('"', "\\\"")
-                    .replace('{', "{{")
-                    .replace('}', "}}");
-                return format!(
-                    "{i}let _ = args; // suppress unused-warning when arms expand to a single Err\n\
-                     {i}return Err(types::Duckerror::Unsupported(format!(\n\
-                     {i}    \"{sql_name}: DuckDB param shape not yet wired in Step 4 cut ({shape_dbg})\"\n\
-                     {i})));\n",
-                );
+            ParamShape::ListGeom => {
+                // Mirrors sqlite-emit: variadic when this is the last
+                // param, single-element list otherwise.
+                let is_variadic = idx + 1 == shape.params.len();
+                if is_variadic {
+                    s.push_str(&format!(
+                        "{i}let arg{idx}_owned: Vec<Geometry> = args[{idx}..]\n\
+                         {i}    .iter()\n\
+                         {i}    .enumerate()\n\
+                         {i}    .map(|(j, v)| match v {{\n\
+                         {i}        types::Duckvalue::Blob(b) => Geometry::from_wkb(b.as_slice())\n\
+                         {i}            .map_err(|e| types::Duckerror::Invalidargument(\n\
+                         {i}                format!(\"{sql_name}: arg {{}}: {{}}\", {idx} + j, postgis_err_string(e)))),\n\
+                         {i}        types::Duckvalue::Text(t) => Geometry::from_wkb(t.as_bytes())\n\
+                         {i}            .map_err(|e| types::Duckerror::Invalidargument(\n\
+                         {i}                format!(\"{sql_name}: arg {{}}: {{}}\", {idx} + j, postgis_err_string(e)))),\n\
+                         {i}        _ => Err(types::Duckerror::Invalidargument(\n\
+                         {i}            format!(\"{sql_name}: arg {{}} must be BLOB\", {idx} + j))),\n\
+                         {i}    }})\n\
+                         {i}    .collect::<Result<Vec<_>, _>>()?;\n\
+                         {i}let arg{idx}: Vec<&Geometry> = arg{idx}_owned.iter().collect();\n",
+                    ));
+                } else {
+                    s.push_str(&format!(
+                        "{i}let arg{idx}_one = from_wkb(dv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n\
+                         {i}let arg{idx}_owned: Vec<Geometry> = alloc::vec![arg{idx}_one];\n\
+                         {i}let arg{idx}: Vec<&Geometry> = arg{idx}_owned.iter().collect();\n",
+                    ));
+                }
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Enum {
+                wit_module,
+                kebab_name,
+                cases,
+                ..
+            } => {
+                let type_pascal = kebab_to_pascal(kebab_name);
+                let mut arms = String::new();
+                for (n, case) in cases.iter().enumerate() {
+                    let case_pascal = kebab_to_pascal(case);
+                    arms.push_str(&format!(
+                        "{i}    {n} => {wit_module}::{type_pascal}::{case_pascal},\n"
+                    ));
+                }
+                let max = cases.len();
+                s.push_str(&format!(
+                    "{i}let arg{idx} = match dv_i64(&args, {idx}, \"{sql_name}\")? {{\n{arms}{i}    other => return Err(types::Duckerror::Invalidargument(format!(\n\
+                     {i}        \"{sql_name}: arg {idx} ({kebab_name}) out of range: {{}} (valid 0..{max})\",\n\
+                     {i}        other,\n\
+                     {i}    ))),\n\
+                     {i}}};\n"
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::ListRecord { kebab_name, .. } => {
+                let snake = kebab_name.replace('-', "_");
+                s.push_str(&format!(
+                    "{i}let arg{idx} = parse_json_list_record_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::ListPrim(elem) => {
+                let suffix = elem.helper_suffix();
+                let rust_ty = elem.rust_elem();
+                s.push_str(&format!(
+                    "{i}let arg{idx}: Vec<{rust_ty}> = parse_json_list_{suffix}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::ListTuple { elements } => {
+                let suffix = list_tuple_sig_suffix(elements);
+                let elems_joined = elements
+                    .iter()
+                    .map(|e| e.rust_elem())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let rust_tuple = if elements.len() == 1 {
+                    format!("({},)", elems_joined)
+                } else {
+                    format!("({})", elems_joined)
+                };
+                s.push_str(&format!(
+                    "{i}let arg{idx}: Vec<{rust_tuple}> = parse_json_list_tuple_{suffix}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::WitValueRecord {
+                kebab_name,
+                upstream_by_value,
+                ..
+            } => {
+                let snake = kebab_name.replace('-', "_");
+                s.push_str(&format!(
+                    "{i}let arg{idx} = arg_witvalue_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                if *upstream_by_value {
+                    call_args.push(format!("arg{idx}"));
+                } else {
+                    call_args.push(format!("&arg{idx}"));
+                }
             }
         }
     }
 
-    // Decide the return-wrap shape before emitting the call. Some
-    // RetShape variants emit a `return Err(...)` (deferred wit-
-    // value shapes etc.); for those we skip the upstream call
-    // entirely to avoid an unreachable-code lint.
-    let ret_expr_opt = render_ret_to_duckvalue(&shape.ret);
-    let Some(ret_expr) = ret_expr_opt else {
-        let shape_dbg = format!("{:?}", &shape.ret)
-            .replace('"', "\\\"")
-            .replace('{', "{{")
-            .replace('}', "}}");
-        return format!(
-            "{i}let _ = args; // suppress unused-warning\n\
-             {i}return Err(types::Duckerror::Unsupported(format!(\n\
-             {i}    \"{sql_name}: DuckDB return shape not yet wired in Step 4 cut ({shape_dbg})\"\n\
-             {i})));\n",
-        );
-    };
-
+    // Compose the call expression (handles `method_call` for
+    // constructors and instance methods on WIT resources).
+    let call_args_str = call_args.join(", ");
     let module = &shape.wit_module;
     let func = &shape.wit_func;
-    let call_args_str = call_args.join(", ");
-    // MethodCall: this is a WIT resource method or constructor.
-    // Step 4 scalar-first cut defers method dispatch (it requires
-    // emitting the resource `use` line + per-resource decode
-    // helpers like sqlite-emit's `from_topology_bytes`); emit an
-    // Unsupported stub so the bridge still compiles.
-    if shape.method_call.is_some() {
-        let _ = (module, func, call_args_str, fallible, ret_expr);
-        return format!(
-            "{i}let _ = args; // suppress unused-warning\n\
-             {i}return Err(types::Duckerror::Unsupported(format!(\n\
-             {i}    \"{sql_name}: WIT resource method/constructor dispatch \
-not yet wired in Step 4 cut\"\n\
-             {i})));\n",
-        );
-    }
-    let call_line = if fallible {
+    let call_expr = if let Some(mc) = shape.method_call.as_ref() {
+        if mc.is_constructor {
+            let pascal = kebab_to_pascal(&mc.resource_kebab);
+            format!("{pascal}::new({call_args_str})")
+        } else {
+            let recv = call_args
+                .first()
+                .map(|s| s.trim_start_matches('&').to_string())
+                .unwrap_or_else(|| "arg0".to_string());
+            let rest = call_args
+                .iter()
+                .skip(1)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{recv}.{func}({rest})")
+        }
+    } else {
+        format!("{module}::{func}({call_args_str})")
+    };
+
+    let unwrap_chain = if fallible {
         format!(
-            "{i}let __ret = {module}::{func}({call_args_str})\n\
-             {i}    .map_err(|e| types::Duckerror::Invalidargument(\n\
-             {i}        format!(\"{sql_name}: {{}}\", shim_err_string(e))))?;\n",
+            ".map_err(|e| types::Duckerror::Invalidargument(format!(\"{sql_name}: {{}}\", shim_err_string(e))))?"
         )
     } else {
-        format!(
-            "{i}let __ret = {module}::{func}({call_args_str});\n",
-        )
+        String::new()
     };
-    s.push_str(&call_line);
 
-    // Wrap the return value into a Duckvalue.
-    s.push_str(&format!("{i}Ok({ret_expr})\n"));
+    let return_expr = render_return_expr(&shape.ret, &call_expr, &unwrap_chain, sql_name, i);
+    s.push_str(i);
+    s.push_str(&return_expr);
+    s.push('\n');
     s
 }
 
-/// Render the Rust expression that wraps the upstream `__ret`
-/// value into a `Duckvalue`. The scalar-first cut handles the
-/// primitive returns + a Blob fallback. Shapes that need
-/// per-record wit-value marshaling return `None` and the caller
-/// emits an `Unsupported` Duckerror without making the upstream
-/// call (so wit-bindgen doesn't elide the upstream import).
-fn render_ret_to_duckvalue(ret: &RetShape) -> Option<String> {
+/// Render the full Rust expression that wraps the upstream call
+/// into an `Ok(Duckvalue)` (or a block expression equivalent).
+fn render_return_expr(
+    ret: &RetShape,
+    call_expr: &str,
+    unwrap_chain: &str,
+    sql_name: &str,
+    i: &str,
+) -> String {
     match ret {
-        RetShape::Text => {
-            Some("types::Duckvalue::Text(__ret.into())".to_string())
-        }
-        RetShape::Real => Some("types::Duckvalue::Float64(__ret)".to_string()),
-        // The core IR collapses signed integer returns into a
-        // single `Int` arm that the SQLite emit promotes to i64
-        // (SqlValue::Integer is signed-i64-only). DuckDB has a
-        // wider integer family but we don't know the original WIT
-        // width here, so promote to Int64 for parity. Future
-        // refinement: extend the core IR with an Int<width> arm.
-        RetShape::Int => Some("types::Duckvalue::Int64(__ret as i64)".to_string()),
-        RetShape::BoolInt => Some("types::Duckvalue::Boolean(__ret)".to_string()),
-        RetShape::Blob => Some("types::Duckvalue::Blob(__ret.into())".to_string()),
-        // Geometry / Raster / Topology returns currently round-trip
-        // through `as_wkb()` / `as_binary()` / `to_bytes()` and emit
-        // as Blob. The scalar-first cut treats them all as opaque
-        // blobs the SQL surface can pass through to other functions.
-        // Once a follow-up adds typed-value-binding support, these
-        // become `Duckvalue::Complex(...)` entries.
+        RetShape::Text => format!(
+            "Ok(types::Duckvalue::Text(({call_expr}{unwrap_chain}).into()))"
+        ),
+        RetShape::Real => format!(
+            "Ok(types::Duckvalue::Float64({call_expr}{unwrap_chain}))"
+        ),
+        RetShape::Int => format!(
+            "Ok(types::Duckvalue::Int64({call_expr}{unwrap_chain} as i64))"
+        ),
+        RetShape::BoolInt => format!(
+            "Ok(types::Duckvalue::Boolean({call_expr}{unwrap_chain}))"
+        ),
+        RetShape::Blob => format!(
+            "Ok(types::Duckvalue::Blob(({call_expr}{unwrap_chain}).into()))"
+        ),
         RetShape::GeomBlob => {
-            Some("types::Duckvalue::Blob(__ret.as_wkb().into())".to_string())
+            if unwrap_chain.is_empty() {
+                format!("Ok(types::Duckvalue::Blob({call_expr}.as_wkb().into()))")
+            } else {
+                format!(
+                    "{{\n\
+                     {i}    let __r = {call_expr}{unwrap_chain};\n\
+                     {i}    Ok(types::Duckvalue::Blob(__r.as_wkb().into()))\n\
+                     {i}}}"
+                )
+            }
         }
         RetShape::RasterBlob => {
-            Some("types::Duckvalue::Blob(__ret.as_binary().into())".to_string())
+            if unwrap_chain.is_empty() {
+                format!("Ok(types::Duckvalue::Blob({call_expr}.as_binary().into()))")
+            } else {
+                format!(
+                    "{{\n\
+                     {i}    let __r = {call_expr}{unwrap_chain};\n\
+                     {i}    Ok(types::Duckvalue::Blob(__r.as_binary().into()))\n\
+                     {i}}}"
+                )
+            }
         }
         RetShape::TopologyBlob => {
-            Some("types::Duckvalue::Blob(__ret.to_bytes().into())".to_string())
+            if unwrap_chain.is_empty() {
+                format!("Ok(types::Duckvalue::Blob({call_expr}.to_bytes().into()))")
+            } else {
+                format!(
+                    "{{\n\
+                     {i}    let __r = {call_expr}{unwrap_chain};\n\
+                     {i}    Ok(types::Duckvalue::Blob(__r.to_bytes().into()))\n\
+                     {i}}}"
+                )
+            }
         }
-        RetShape::OptionText => Some(
-            "match __ret { Some(v) => types::Duckvalue::Text(v.into()), None => types::Duckvalue::Null }".to_string(),
+        RetShape::OptionText => format!(
+            "Ok(match {call_expr}{unwrap_chain} {{\n\
+             {i}    Some(v) => types::Duckvalue::Text(v.into()),\n\
+             {i}    None => types::Duckvalue::Null,\n\
+             {i}}})"
         ),
-        RetShape::OptionReal => Some(
-            "match __ret { Some(v) => types::Duckvalue::Float64(v), None => types::Duckvalue::Null }".to_string(),
+        RetShape::OptionReal => format!(
+            "Ok(match {call_expr}{unwrap_chain} {{\n\
+             {i}    Some(v) => types::Duckvalue::Float64(v as f64),\n\
+             {i}    None => types::Duckvalue::Null,\n\
+             {i}}})"
         ),
-        RetShape::OptionInt => Some(
-            "match __ret { Some(v) => types::Duckvalue::Int64(v as i64), None => types::Duckvalue::Null }".to_string(),
+        RetShape::OptionInt => format!(
+            "Ok(match {call_expr}{unwrap_chain} {{\n\
+             {i}    Some(v) => types::Duckvalue::Int64(v as i64),\n\
+             {i}    None => types::Duckvalue::Null,\n\
+             {i}}})"
         ),
-        RetShape::OptionBoolInt => Some(
-            "match __ret { Some(v) => types::Duckvalue::Boolean(v), None => types::Duckvalue::Null }".to_string(),
+        RetShape::OptionBoolInt => format!(
+            "Ok(match {call_expr}{unwrap_chain} {{\n\
+             {i}    Some(v) => types::Duckvalue::Boolean(v),\n\
+             {i}    None => types::Duckvalue::Null,\n\
+             {i}}})"
         ),
-        RetShape::OptionBlob => Some(
-            "match __ret { Some(v) => types::Duckvalue::Blob(v.into()), None => types::Duckvalue::Null }".to_string(),
+        RetShape::OptionBlob => format!(
+            "Ok(match {call_expr}{unwrap_chain} {{\n\
+             {i}    Some(v) => types::Duckvalue::Blob(v.into()),\n\
+             {i}    None => types::Duckvalue::Null,\n\
+             {i}}})"
         ),
-        RetShape::OptionGeomBlob => Some(
-            "match __ret { Some(g) => types::Duckvalue::Blob(g.as_wkb().into()), None => types::Duckvalue::Null }".to_string(),
+        RetShape::OptionGeomBlob => format!(
+            "Ok(match {call_expr}{unwrap_chain} {{\n\
+             {i}    Some(v) => types::Duckvalue::Blob(v.as_wkb().into()),\n\
+             {i}    None => types::Duckvalue::Null,\n\
+             {i}}})"
         ),
-        // WitValueRecord / Enum / JsonText / TuplePick / etc. —
-        // deferred to a follow-up step. Returning None tells the
-        // caller to emit an Unsupported Duckerror instead of
-        // making the upstream call.
-        _ => None,
+        RetShape::OptionRasterBlob => format!(
+            "Ok(match {call_expr}{unwrap_chain} {{\n\
+             {i}    Some(v) => types::Duckvalue::Blob(v.as_binary().into()),\n\
+             {i}    None => types::Duckvalue::Null,\n\
+             {i}}})"
+        ),
+        RetShape::OptionTopologyBlob => format!(
+            "Ok(match {call_expr}{unwrap_chain} {{\n\
+             {i}    Some(v) => types::Duckvalue::Blob(v.to_bytes().into()),\n\
+             {i}    None => types::Duckvalue::Null,\n\
+             {i}}})"
+        ),
+        RetShape::FirstGeomBlob => format!(
+            "{{\n\
+             {i}    let __r: Vec<Geometry> = {call_expr}{unwrap_chain};\n\
+             {i}    match __r.first() {{\n\
+             {i}        Some(g) => Ok(types::Duckvalue::Blob(g.as_wkb().into())),\n\
+             {i}        None => Ok(types::Duckvalue::Null),\n\
+             {i}    }}\n\
+             {i}}}"
+        ),
+        RetShape::FirstRasterBlob => format!(
+            "{{\n\
+             {i}    let __r = {call_expr}{unwrap_chain};\n\
+             {i}    match __r.into_iter().next() {{\n\
+             {i}        Some(r) => Ok(types::Duckvalue::Blob(r.as_binary().into())),\n\
+             {i}        None => Ok(types::Duckvalue::Null),\n\
+             {i}    }}\n\
+             {i}}}"
+        ),
+        RetShape::FirstTopologyBlob => format!(
+            "{{\n\
+             {i}    let __r = {call_expr}{unwrap_chain};\n\
+             {i}    match __r.into_iter().next() {{\n\
+             {i}        Some(t) => Ok(types::Duckvalue::Blob(t.to_bytes().into())),\n\
+             {i}        None => Ok(types::Duckvalue::Null),\n\
+             {i}    }}\n\
+             {i}}}"
+        ),
+        RetShape::FirstOptionU32Int => format!(
+            "{{\n\
+             {i}    let __r: Vec<Option<u32>> = {call_expr}{unwrap_chain};\n\
+             {i}    match __r.first() {{\n\
+             {i}        Some(Some(v)) => Ok(types::Duckvalue::Uint32(*v)),\n\
+             {i}        Some(None) | None => Ok(types::Duckvalue::Null),\n\
+             {i}    }}\n\
+             {i}}}"
+        ),
+        RetShape::FirstInt => format!(
+            "{{\n\
+             {i}    let __r = {call_expr}{unwrap_chain};\n\
+             {i}    match __r.first() {{\n\
+             {i}        Some(v) => Ok(types::Duckvalue::Int64(*v as i64)),\n\
+             {i}        None => Ok(types::Duckvalue::Null),\n\
+             {i}    }}\n\
+             {i}}}"
+        ),
+        RetShape::FirstReal => format!(
+            "{{\n\
+             {i}    let __r = {call_expr}{unwrap_chain};\n\
+             {i}    match __r.first() {{\n\
+             {i}        Some(v) => Ok(types::Duckvalue::Float64(*v as f64)),\n\
+             {i}        None => Ok(types::Duckvalue::Null),\n\
+             {i}    }}\n\
+             {i}}}"
+        ),
+        RetShape::FirstText => format!(
+            "{{\n\
+             {i}    let __r = {call_expr}{unwrap_chain};\n\
+             {i}    match __r.into_iter().next() {{\n\
+             {i}        Some(v) => Ok(types::Duckvalue::Text(v.into())),\n\
+             {i}        None => Ok(types::Duckvalue::Null),\n\
+             {i}    }}\n\
+             {i}}}"
+        ),
+        RetShape::BboxBlob => format!(
+            "{{\n\
+             {i}    let __bb = {call_expr}{unwrap_chain};\n\
+             {i}    let __env = pg_ctor::st_make_envelope(__bb.min_x, __bb.min_y, __bb.max_x, __bb.max_y);\n\
+             {i}    Ok(types::Duckvalue::Blob(__env.as_wkb().into()))\n\
+             {i}}}"
+        ),
+        RetShape::IsValidDetailText => format!(
+            "{{\n\
+             {i}    let (__valid, __reason, __loc) = {call_expr}{unwrap_chain};\n\
+             {i}    let __reason_s = __reason.unwrap_or_default();\n\
+             {i}    let __loc_s = match __loc {{\n\
+             {i}        Some(g) => pg_out::st_as_text(&g),\n\
+             {i}        None => alloc::string::String::new(),\n\
+             {i}    }};\n\
+             {i}    Ok(types::Duckvalue::Text(format!(\n\
+             {i}        \"({{}},\\\"{{}}\\\",\\\"{{}}\\\")\",\n\
+             {i}        __valid, __reason_s, __loc_s\n\
+             {i}    )))\n\
+             {i}}}"
+        ),
+        RetShape::Enum {
+            wit_module,
+            kebab_name,
+            cases,
+            ..
+        } => {
+            let type_pascal = kebab_to_pascal(kebab_name);
+            let mut arms = String::new();
+            for (n, case) in cases.iter().enumerate() {
+                let case_pascal = kebab_to_pascal(case);
+                arms.push_str(&format!(
+                    "{i}        {wit_module}::{type_pascal}::{case_pascal} => {n},\n"
+                ));
+            }
+            format!(
+                "{{\n\
+                 {i}    let __r = {call_expr}{unwrap_chain};\n\
+                 {i}    let __disc: i64 = match __r {{\n{arms}{i}    }};\n\
+                 {i}    Ok(types::Duckvalue::Int64(__disc))\n\
+                 {i}}}"
+            )
+        }
+        RetShape::JsonText { kind } => match kind {
+            JsonRetKind::ListListPrim(_)
+            | JsonRetKind::ListTuplePrim(_)
+            | JsonRetKind::TuplePrim(_) => format!(
+                "{{\n\
+                 {i}    let __r = {call_expr}{unwrap_chain};\n\
+                 {i}    let __json = serde_json::to_string(&__r)\n\
+                 {i}        .map_err(|e| types::Duckerror::Internal(format!(\"{sql_name}: encode JSON: {{}}\", e)))?;\n\
+                 {i}    Ok(types::Duckvalue::Text(__json))\n\
+                 {i}}}"
+            ),
+            JsonRetKind::OptionTuplePrim(_) => format!(
+                "{{\n\
+                 {i}    match {call_expr}{unwrap_chain} {{\n\
+                 {i}        Some(__t) => {{\n\
+                 {i}            let __json = serde_json::to_string(&__t)\n\
+                 {i}                .map_err(|e| types::Duckerror::Internal(format!(\"{sql_name}: encode JSON: {{}}\", e)))?;\n\
+                 {i}            Ok(types::Duckvalue::Text(__json))\n\
+                 {i}        }}\n\
+                 {i}        None => Ok(types::Duckvalue::Null),\n\
+                 {i}    }}\n\
+                 {i}}}"
+            ),
+            JsonRetKind::ListTupleGeomF64 => format!(
+                "{{\n\
+                 {i}    let __r = {call_expr}{unwrap_chain};\n\
+                 {i}    let mut __out = alloc::string::String::from(\"[\");\n\
+                 {i}    for (__i, (__g, __v)) in __r.into_iter().enumerate() {{\n\
+                 {i}        if __i > 0 {{ __out.push(','); }}\n\
+                 {i}        let __wkb = __g.as_wkb();\n\
+                 {i}        __out.push_str(\"[\\\"\");\n\
+                 {i}        for __b in __wkb {{\n\
+                 {i}            use core::fmt::Write as _;\n\
+                 {i}            let _ = write!(&mut __out, \"{{:02x}}\", __b);\n\
+                 {i}        }}\n\
+                 {i}        __out.push_str(\"\\\",\");\n\
+                 {i}        let __vj = serde_json::to_string(&__v)\n\
+                 {i}            .map_err(|e| types::Duckerror::Internal(format!(\"{sql_name}: encode JSON: {{}}\", e)))?;\n\
+                 {i}        __out.push_str(&__vj);\n\
+                 {i}        __out.push(']');\n\
+                 {i}    }}\n\
+                 {i}    __out.push(']');\n\
+                 {i}    Ok(types::Duckvalue::Text(__out))\n\
+                 {i}}}"
+            ),
+        },
+        RetShape::TuplePick { index, elem } => {
+            let (variant, expr_suffix) = match elem {
+                ListPrimElem::S32
+                | ListPrimElem::S64
+                | ListPrimElem::U32
+                | ListPrimElem::U64
+                | ListPrimElem::U8
+                | ListPrimElem::Bool => ("Int64", format!("__r.{index} as i64")),
+                ListPrimElem::F64 | ListPrimElem::F32 => {
+                    ("Float64", format!("__r.{index} as f64"))
+                }
+                ListPrimElem::String => ("Text", format!("__r.{index}.into()")),
+            };
+            format!(
+                "{{\n\
+                 {i}    let __r = {call_expr}{unwrap_chain};\n\
+                 {i}    Ok(types::Duckvalue::{variant}({expr_suffix}))\n\
+                 {i}}}"
+            )
+        }
+        RetShape::WitValueRecord { kebab_name, .. } => {
+            let snake = kebab_name.replace('-', "_");
+            // ret_to_witvalue_<snake> already returns
+            // `Result<Duckvalue, Duckerror>`, so emit it bare (no
+            // outer `Ok(...)` wrap).
+            format!("ret_to_witvalue_{snake}({call_expr}{unwrap_chain})")
+        }
+        RetShape::OptionWitValueRecord { kebab_name, .. } => {
+            let snake = kebab_name.replace('-', "_");
+            format!(
+                "match {call_expr}{unwrap_chain} {{\n\
+                 {i}    Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
+                 {i}    None => Ok(types::Duckvalue::Null),\n\
+                 {i}}}"
+            )
+        }
+        RetShape::FirstWitValueRecord { kebab_name, .. } => {
+            let snake = kebab_name.replace('-', "_");
+            format!(
+                "{{\n\
+                 {i}    let __r = {call_expr}{unwrap_chain};\n\
+                 {i}    let mut __it = __r.into_iter();\n\
+                 {i}    match __it.next() {{\n\
+                 {i}        Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
+                 {i}        None => Ok(types::Duckvalue::Null),\n\
+                 {i}    }}\n\
+                 {i}}}"
+            )
+        }
     }
+}
+
+/// kebab-case → PascalCase. wit-bindgen does the same transform
+/// when emitting Rust enum / resource idents, so the dispatch arm
+/// references `<module>::PixelType::Bool1` consistently with the
+/// generated bindings.
+fn kebab_to_pascal(s: &str) -> String {
+    let mut out = String::new();
+    let mut up = true;
+    for c in s.chars() {
+        if c == '-' || c == '_' {
+            up = true;
+            continue;
+        }
+        if up {
+            for u in c.to_uppercase() {
+                out.push(u);
+            }
+            up = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
