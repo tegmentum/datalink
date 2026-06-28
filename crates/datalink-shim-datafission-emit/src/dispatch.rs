@@ -811,9 +811,22 @@ pub fn emit_aggregate_finalize_body(
     let func = &shape.wit_func;
     let mut s = String::new();
 
+    // #607 Phase 1: Datafission target does NOT yet wire
+    // AccKind::Record aggregates (mobilitydb temporal-type
+    // aggregators). Emit a runtime-error stub so the dispatcher
+    // still compiles. Phase 2 of the aggregate-substrate plan
+    // adds the datafission finalize body.
+    if matches!(&shape.accumulator_kind, AccKind::Record { .. }) {
+        s.push_str(&format!(
+            "{i}return Err(ftypes::FunctionError::ExecutionError(\n\
+             {i}    format!(\"{sql_name}: AccKind::Record aggregate not yet wired for Datafission target (Phase 2 follow-up)\")));\n",
+        ));
+        return s;
+    }
+
     // Decode accumulated blobs into a typed Vec<Resource>; build
     // refs slice for the upstream call.
-    match shape.accumulator_kind {
+    match &shape.accumulator_kind {
         AccKind::Geom => {
             s.push_str(&format!(
                 "{i}let geoms: Vec<Geometry> = st.blobs.iter()\n\
@@ -834,6 +847,7 @@ pub fn emit_aggregate_finalize_body(
                  {i}let refs: Vec<&Raster> = rasters.iter().collect();\n",
             ));
         }
+        AccKind::Record { .. } => unreachable!("handled by Phase 2 stub above"),
     }
 
     // Marshal extras (configs passed at create-accumulator-with-

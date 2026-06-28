@@ -667,12 +667,25 @@ pub fn emit_aggregate_arm_body(
     let func = &shape.wit_func;
     let mut s = String::new();
 
+    // #607 Phase 1: DuckDB target does NOT yet wire AccKind::Record
+    // aggregates (mobilitydb temporal-type aggregators). Emit a
+    // runtime-error stub so the dispatcher still compiles and the
+    // unwired-symbol diagnostic surfaces clearly. Phase 2 of the
+    // aggregate-substrate plan adds the duckdb finalize body.
+    if matches!(&shape.accumulator_kind, AccKind::Record { .. }) {
+        s.push_str(&format!(
+            "{i}return Err(types::Duckerror::Invalidargument(\n\
+             {i}    format!(\"{sql_name}: AccKind::Record aggregate not yet wired for DuckDB target (Phase 2 follow-up)\")));\n",
+        ));
+        return s;
+    }
+
     // Accumulator iteration: walk `rows`, skip rows whose
     // streaming arg is NULL, collect raw blobs. Mirrors
     // sqlite-emit's per-row push semantics (#548 W3.2) but
     // performs the whole fold inline rather than across xStep
     // callbacks.
-    let (decode_call, resource_ty, err_helper) = match shape.accumulator_kind {
+    let (decode_call, resource_ty, err_helper) = match &shape.accumulator_kind {
         AccKind::Geom => (
             "Geometry::from_wkb(b)",
             "Geometry",
@@ -683,6 +696,7 @@ pub fn emit_aggregate_arm_body(
             "Raster",
             "raster_err_string",
         ),
+        AccKind::Record { .. } => unreachable!("handled above"),
     };
     let decode_call = decode_call.replace("AGG_NAME", sql_name);
 
@@ -728,7 +742,7 @@ pub fn emit_aggregate_arm_body(
     // Decode accumulated blobs. The decode helper differs by
     // accumulator kind; both produce a `Vec<&Resource>` so the
     // call site below is uniform.
-    match shape.accumulator_kind {
+    match &shape.accumulator_kind {
         AccKind::Geom => {
             s.push_str(&format!(
                 "{i}let resources: Vec<{resource_ty}> = blobs.iter()\n\
@@ -749,6 +763,7 @@ pub fn emit_aggregate_arm_body(
                  {i}let refs: Vec<&{resource_ty}> = resources.iter().collect();\n",
             ));
         }
+        AccKind::Record { .. } => unreachable!("handled by Phase 2 stub above"),
     }
 
     // Marshal extras (constant across rows) into Rust-typed
