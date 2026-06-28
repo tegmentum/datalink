@@ -1,0 +1,19 @@
+[package]
+name = "datalink-shim-sqlite-emit"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite-target emitter for the shim-bridge codegen. Consumes a database-agnostic BridgePlan (from shim-bridge-codegen-core) plus the database-agnostic substrate (datalink-shim-codegen-core) and emits a `wasm32-wasip2` cdylib crate whose component exports the `sqlite:extension/minimal`-shape contract and imports the upstream shim's WIT. Carved out of sqlink-shim-codegen in Step 3 of PLAN-shim-codegen-datalink-migration."
+license = "Apache-2.0"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "datalink_shim_sqlite_emit"
+path = "src/lib.rs"
+
+[dependencies]
+shim-bridge-codegen-core = { git = "https://github.com/tegmentum/shim-bridge-codegen-core.git", rev = "0e25c2929845b9051e8481746f63061a3944037a" }
+datalink-shim-codegen-core = { path = "../datalink-shim-codegen-core" }
+anyhow = "1"
+# Canonical-WIT shape hashing for wit-value type-id (32-byte
+# sha256 match key in `typed-value-binding`).
+sha2 = "0.10"
