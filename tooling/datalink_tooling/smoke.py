@@ -52,16 +52,30 @@ def ext_dir(cfg, name: str) -> Path:
     return cfg.repo_root / sc_dir / f"{bare(cfg, name)}{_suffix(cfg)}"
 
 
-def _lib_name(cfg, name: str) -> str | None:
-    """Custom [lib] name from the component's Cargo.toml, if it sets one."""
+def _cargo_toml(cfg, name: str) -> dict:
+    """Parse the component's Cargo.toml; {} if absent or unparseable."""
     cargo = ext_dir(cfg, name) / "Cargo.toml"
     if not cargo.exists():
-        return None
+        return {}
     try:
-        data = tomllib.loads(cargo.read_text())
+        return tomllib.loads(cargo.read_text())
     except (OSError, tomllib.TOMLDecodeError):
-        return None
-    return (data.get("lib") or {}).get("name")
+        return {}
+
+
+def _lib_name(cfg, name: str) -> str | None:
+    """Custom [lib] name from the component's Cargo.toml, if it sets one."""
+    return (_cargo_toml(cfg, name).get("lib") or {}).get("name")
+
+
+def _pkg_name(cfg, name: str) -> str | None:
+    """Actual [package] name from the component's Cargo.toml, if present.
+
+    The cargo package id is NOT always derivable from the directory name:
+    a few components' dirs use "_" while the package uses "-" (or vice
+    versa), so derive the build -p target from the manifest when we can.
+    """
+    return (_cargo_toml(cfg, name).get("package") or {}).get("name")
 
 
 def find_smoke_files(cfg) -> list[Path]:
@@ -189,7 +203,9 @@ def _run_cli(cfg, name: str, sql: str, timeout: int) -> subprocess.CompletedProc
 
 def build_component(cfg, name: str) -> tuple[bool, str]:
     target = cfg.get("smoke", "build_target", default="wasm32-wasip2")
-    pkg = f"{bare(cfg, name)}{_suffix(cfg)}"
+    # Prefer the manifest's real [package] name; the dir->pkg convention
+    # (bare+suffix) breaks for components whose dir/package separators differ.
+    pkg = _pkg_name(cfg, name) or f"{bare(cfg, name)}{_suffix(cfg)}"
     underscore = bare(cfg, name).replace("-", "_")
     argv = [t.replace("{PKG}", pkg).replace("{TARGET}", target)
             for t in cfg.get("smoke", "build_argv", default=[])]
