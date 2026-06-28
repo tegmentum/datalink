@@ -22,7 +22,7 @@
 use anyhow::Result;
 
 use shim_bridge_codegen_core::BridgePlan;
-use datalink_shim_codegen_core::interface_db;
+use datalink_shim_codegen_core::interface_db::{self, ListPrimElem, ParamShape, RetShape};
 use datalink_shim_codegen_core::record_registry::{self, RecordType};
 
 use crate::dispatch;
@@ -45,9 +45,10 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let shim_wit_dir = pick_primary_shim_dir(primary, &wit_deps_root, &shim_packages)
         .unwrap_or_else(|| wit_deps_root.clone());
 
-    // Records are kept only for symmetry with sqlite-emit — the
-    // dispatch arms in this cut don't reference them yet. A
-    // follow-up adds typed-value-binding via ducklink wit-value.
+    // Per-shim record-type registry. Drives the per-record wit-
+    // value marshaling helpers below (`arg_witvalue_<snake>`,
+    // `parse_json_list_record_<snake>`, `ret_to_witvalue_<snake>`)
+    // plus the wit-bindgen `additional_derives` ignore filter.
     let records: Vec<RecordType> = record_registry::build(&shim_packages, primary)
         .into_iter()
         .filter(|r| emit_wit::package_belongs_to_primary(&r.package, primary))
@@ -61,12 +62,64 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let total_unwired = scalar_unwired.len();
     if total_unwired > 0 {
         eprintln!(
-            "[duckdb-target] {total_unwired} scalar(s) not wired in Step 4 cut:"
+            "[duckdb-target] {total_unwired} scalar(s) not wired:"
         );
         for u in &scalar_unwired {
             eprintln!("  - {}: {}", u.sql_name, u.reason);
         }
     }
+
+    // wit-bindgen's `additional_derives` adds serde::Serialize +
+    // serde::Deserialize to EVERY generated type. Contract types
+    // (`duckdb:extension/*` flags / variants / records) and
+    // helper-component types can't derive serde out-of-the-box;
+    // pass their kebab names in `additional_derives_ignore` to
+    // restrict the derive to the primary shim's records.
+    let duckdb_contract_pkg = emit_wit::discover_duckdb_extension_package()?;
+    let mut derives_ignore: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for r in &duckdb_contract_pkg.records {
+        derives_ignore.insert(r.kebab_name.clone());
+    }
+    for v in &duckdb_contract_pkg.variants {
+        derives_ignore.insert(v.kebab_name.clone());
+    }
+    for e in &duckdb_contract_pkg.enums {
+        derives_ignore.insert(e.kebab_name.clone());
+    }
+    for f in &duckdb_contract_pkg.flags {
+        derives_ignore.insert(f.kebab_name.clone());
+    }
+    for pkg in &shim_packages {
+        if emit_wit::package_belongs_to_primary(&pkg.ns_name, primary) {
+            // Primary-shim variants + flags can't derive serde
+            // either; only primary records stay OFF the ignore
+            // list so they DO pick up Serialize/Deserialize.
+            for v in &pkg.variants {
+                derives_ignore.insert(v.kebab_name.clone());
+            }
+            for f in &pkg.flags {
+                derives_ignore.insert(f.kebab_name.clone());
+            }
+            continue;
+        }
+        for r in &pkg.records {
+            derives_ignore.insert(r.kebab_name.clone());
+        }
+        for v in &pkg.variants {
+            derives_ignore.insert(v.kebab_name.clone());
+        }
+        for e in &pkg.enums {
+            derives_ignore.insert(e.kebab_name.clone());
+        }
+        for f in &pkg.flags {
+            derives_ignore.insert(f.kebab_name.clone());
+        }
+    }
+    let derives_ignore_lits: String = derives_ignore
+        .iter()
+        .map(|n| format!("            \"{}\",\n", n))
+        .collect();
 
     // Track which WIT module aliases are referenced by the
     // emitted arms so the `use` lines align with what's actually
@@ -77,18 +130,87 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         used_aliases
             .entry(entry.shape.wit_module.clone())
             .or_insert_with(|| entry.shape.wit_package.clone());
+        // Some return shapes compose with other interfaces'
+        // helpers — record those aliases too. Both live in
+        // postgis:wasm.
+        match &entry.shape.ret {
+            interface_db::RetShape::BboxBlob => {
+                used_aliases
+                    .entry("pg_ctor".to_string())
+                    .or_insert_with(|| "postgis:wasm".to_string());
+            }
+            interface_db::RetShape::IsValidDetailText => {
+                used_aliases
+                    .entry("pg_out".to_string())
+                    .or_insert_with(|| "postgis:wasm".to_string());
+            }
+            interface_db::RetShape::Enum {
+                wit_module,
+                wit_package,
+                ..
+            } => {
+                used_aliases
+                    .entry(wit_module.clone())
+                    .or_insert_with(|| wit_package.clone());
+            }
+            _ => {}
+        }
+        for p in &entry.shape.params {
+            if let interface_db::ParamShape::Enum {
+                wit_module,
+                wit_package,
+                ..
+            } = p
+            {
+                used_aliases
+                    .entry(wit_module.clone())
+                    .or_insert_with(|| wit_package.clone());
+            }
+        }
     }
+
+    // Discover the primary shim package so we can gate resource
+    // type imports + per-resource helper emissions on its WIT
+    // surface (geometry/raster/topology).
+    let shim_pkg = shim_packages
+        .iter()
+        .find(|p| emit_wit::package_belongs_to_primary(&p.ns_name, primary))
+        .cloned();
+    let shim_has_geometry_resource = shim_pkg
+        .as_ref()
+        .map(|p| p.resources.iter().any(|r| r.kebab_name == "geometry"))
+        .unwrap_or(false);
+    let shim_has_postgis_error = shim_pkg
+        .as_ref()
+        .map(|p| p.variants.iter().any(|v| v.kebab_name == "postgis-error"))
+        .unwrap_or(false);
+    let shim_has_raster_resource = shim_pkg
+        .as_ref()
+        .map(|p| p.resources.iter().any(|r| r.kebab_name == "raster"))
+        .unwrap_or(false);
+    let shim_has_raster_error = shim_pkg
+        .as_ref()
+        .map(|p| p.variants.iter().any(|v| v.kebab_name == "raster-error"))
+        .unwrap_or(false);
+    let shim_has_topology_resource = shim_pkg
+        .as_ref()
+        .map(|p| p.resources.iter().any(|r| r.kebab_name == "topology"))
+        .unwrap_or(false);
+    let shim_has_topology_error = shim_pkg
+        .as_ref()
+        .map(|p| p.variants.iter().any(|v| v.kebab_name == "topology-error"))
+        .unwrap_or(false);
 
     let mut s = String::new();
     s.push_str(HEADER);
     s.push_str(&format!(
         r##"//! Generated by sqlink-shim-codegen (--target duckdb).
 //!
-//! Step 4 scalar-first cut: scalars are wired against the
-//! `duckdb:extension@2.2.0` contract; aggregates / table
-//! functions / pragmas / casts return `Duckerror::Unsupported`.
-//! See AGENTS.md (in datalink/crates/datalink-shim-duckdb-emit)
-//! for the migration plan that landed this target.
+//! Scalars are wired against the `duckdb:extension@2.2.0`
+//! contract; aggregates / table functions / pragmas / casts
+//! return `Duckerror::Unsupported`. See AGENTS.md (in
+//! datalink/crates/datalink-shim-duckdb-emit) for the migration
+//! plan that landed this target.
 
 #![allow(unused_imports, dead_code)]
 
@@ -103,6 +225,15 @@ mod bindings {{
         path: "wit",
         world: "bridge",
         generate_all,
+        // Derive serde::Serialize + serde::Deserialize on
+        // generated record types so the JSON-direct decode path
+        // in the per-record helpers below resolves against the
+        // upstream type (`serde_json::from_str::<UPSTREAM>(...)`).
+        additional_derives: [serde::Serialize, serde::Deserialize],
+        // Contract types + helper-component types + primary-shim
+        // variants/flags can't derive serde out-of-the-box.
+        additional_derives_ignore: [
+{derives_ignore_lits}        ],
     }});
 }}
 
@@ -112,6 +243,7 @@ use bindings::exports::duckdb::extension::callback_dispatch;
 use bindings::exports::duckdb::extension::guest;
 
 "##,
+        derives_ignore_lits = derives_ignore_lits,
     ));
     let _ = primary;
 
@@ -131,6 +263,39 @@ use bindings::exports::duckdb::extension::guest;
             ));
         }
     }
+    // Resource types + variant error idents pulled in only when
+    // the primary shim's WIT actually declares them. Same gating
+    // as sqlite-emit.
+    if shim_has_geometry_resource && shim_has_postgis_error {
+        if let Some(p) = shim_pkg.as_ref() {
+            let (pkg_ns, pkg_name) = split_pkg(&p.ns_name);
+            s.push_str(&format!(
+                "use bindings::{pkg_ns}::{pkg_name}::postgis_types::{{Geography, Geometry, PostgisError}};\n",
+                pkg_ns = sanitize_module(&pkg_ns),
+                pkg_name = sanitize_module(&pkg_name),
+            ));
+        }
+    }
+    if shim_has_raster_resource && shim_has_raster_error {
+        if let Some(p) = shim_pkg.as_ref() {
+            let (pkg_ns, pkg_name) = split_pkg(&p.ns_name);
+            s.push_str(&format!(
+                "use bindings::{pkg_ns}::{pkg_name}::postgis_raster_types::{{Raster, RasterError}};\n",
+                pkg_ns = sanitize_module(&pkg_ns),
+                pkg_name = sanitize_module(&pkg_name),
+            ));
+        }
+    }
+    if shim_has_topology_resource && shim_has_topology_error {
+        if let Some(p) = shim_pkg.as_ref() {
+            let (pkg_ns, pkg_name) = split_pkg(&p.ns_name);
+            s.push_str(&format!(
+                "use bindings::{pkg_ns}::{pkg_name}::postgis_topology_types::{{Topology, TopologyError}};\n",
+                pkg_ns = sanitize_module(&pkg_ns),
+                pkg_name = sanitize_module(&pkg_name),
+            ));
+        }
+    }
     s.push('\n');
 
     s.push_str(&format!(
@@ -140,6 +305,50 @@ use bindings::exports::duckdb::extension::guest;
     ));
 
     s.push_str(DUCKVALUE_HELPERS);
+
+    // Compose helper-prelude bodies driven by the shim's WIT
+    // surface. Each block is independent so a postgis bridge
+    // picks up all three; a non-resource shim gets none.
+    let mut helpers_block = String::new();
+    if shim_has_geometry_resource && shim_has_postgis_error {
+        helpers_block.push_str(POSTGIS_HELPERS_BODY);
+    }
+    if shim_has_raster_resource && shim_has_raster_error {
+        if let Some(p) = shim_pkg.as_ref() {
+            let (pkg_ns, pkg_name) = split_pkg(&p.ns_name);
+            helpers_block.push_str(&render_raster_helpers(
+                &sanitize_module(&pkg_ns),
+                &sanitize_module(&pkg_name),
+            ));
+        }
+    }
+    if shim_has_topology_resource && shim_has_topology_error {
+        if let Some(p) = shim_pkg.as_ref() {
+            let (pkg_ns, pkg_name) = split_pkg(&p.ns_name);
+            helpers_block.push_str(&render_topology_helpers(
+                &sanitize_module(&pkg_ns),
+                &sanitize_module(&pkg_name),
+            ));
+        }
+    }
+
+    // Tuple-list helpers — one per unique tuple-element signature
+    // referenced by a wired ListTuple param.
+    let tuple_sigs = collect_tuple_list_sigs(&scalar_entries);
+    helpers_block.push_str(&render_tuple_list_helpers(&tuple_sigs));
+
+    // Per-record wit-value helpers — only for records referenced
+    // by a wired param or return.
+    let referenced_records = collect_referenced_records(&scalar_entries);
+    let helper_records: Vec<RecordType> = records
+        .iter()
+        .filter(|r| referenced_records.contains(&r.kebab_name))
+        .cloned()
+        .collect();
+    helpers_block.push_str(&render_wit_value_helpers(&helper_records));
+
+    s.push_str(&helpers_block);
+
     s.push_str(handle_table::render());
     s.push_str(&lifecycle::render(&bridge_struct, plan));
 
@@ -417,7 +626,339 @@ fn shim_err_string<E: core::fmt::Debug>(e: E) -> String {
     format!("{:?}", e)
 }
 
+// ── JSON-as-TEXT primitive `list<X>` param helpers ──
+//
+// Mirror of sqlite-emit's `parse_json_list_<suffix>` set but
+// error-wrapped into `types::Duckerror::Invalidargument`. The SQL
+// caller passes a JSON-array literal in the TEXT/VARCHAR arg
+// (e.g. `'[1.0, 2.0, 3.0]'`); the helper decodes via serde_json
+// into a `Vec<T>` which the dispatch arm passes to the WIT
+// function as `&[T]`.
+
+fn parse_json_list_f64(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<f64>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<f64>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of f64 ({e})")))
+}
+
+fn parse_json_list_i32(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<i32>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<i32>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of s32 ({e})")))
+}
+
+fn parse_json_list_i64(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<i64>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<i64>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of s64 ({e})")))
+}
+
+fn parse_json_list_u32(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<u32>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<u32>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of u32 ({e})")))
+}
+
+fn parse_json_list_u64(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<u64>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<u64>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of u64 ({e})")))
+}
+
+fn parse_json_list_u8(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<u8>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<u8>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of u8 ({e})")))
+}
+
+fn parse_json_list_bool(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<bool>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<bool>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of bool ({e})")))
+}
+
+fn parse_json_list_string(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<String>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<String>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of string ({e})")))
+}
+
 "##;
+
+/// PostGIS-specific helpers — emitted only when the shim's WIT
+/// declares `resource geometry` + `variant postgis-error`. Mirror
+/// of sqlite-emit's `POSTGIS_HELPERS_BODY` but error-wrapped into
+/// `types::Duckerror::Invalidargument`.
+const POSTGIS_HELPERS_BODY: &str = r#"
+// ─── PostGIS WKB decoders ───
+
+fn from_wkb(bytes: &[u8], name: &str) -> Result<Geometry, types::Duckerror> {
+    Geometry::from_wkb(bytes).map_err(|e| types::Duckerror::Invalidargument(format!("{name}: {}", postgis_err_string(e))))
+}
+
+fn geog_from_wkb(bytes: &[u8], name: &str) -> Result<Geography, types::Duckerror> {
+    Geography::from_wkb(bytes).map_err(|e| types::Duckerror::Invalidargument(format!("{name}: {}", postgis_err_string(e))))
+}
+
+fn postgis_err_string(e: PostgisError) -> String {
+    match e {
+        PostgisError::InvalidGeometry(s)
+        | PostgisError::ParseError(s)
+        | PostgisError::UnsupportedOperation(s)
+        | PostgisError::NumericError(s)
+        | PostgisError::SridMismatch(s)
+        | PostgisError::General(s) => s,
+    }
+}
+"#;
+
+/// Raster-resource prelude helpers — gated on the shim WIT
+/// declaring `resource raster` + `variant raster-error`.
+fn render_raster_helpers(pkg_ns: &str, pkg_name: &str) -> String {
+    format!(
+        r#"
+// ─── PostGIS raster decoders ───
+
+fn from_raster_binary(bytes: &[u8], name: &str) -> Result<Raster, types::Duckerror> {{
+    bindings::{pkg_ns}::{pkg_name}::postgis_raster_types::from_binary(bytes)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{{}}: {{}}", name, raster_err_string(e))))
+}}
+
+fn raster_err_string(e: RasterError) -> String {{
+    match e {{
+        RasterError::ParseError(s)
+        | RasterError::OutOfBounds(s)
+        | RasterError::TypeMismatch(s)
+        | RasterError::General(s) => s,
+    }}
+}}
+"#,
+        pkg_ns = pkg_ns,
+        pkg_name = pkg_name,
+    )
+}
+
+/// Topology-resource prelude helpers — gated on the shim WIT
+/// declaring `resource topology` + `variant topology-error`.
+fn render_topology_helpers(pkg_ns: &str, pkg_name: &str) -> String {
+    format!(
+        r#"
+// ─── PostGIS topology decoders ───
+
+fn from_topology_bytes(bytes: &[u8], name: &str) -> Result<Topology, types::Duckerror> {{
+    bindings::{pkg_ns}::{pkg_name}::postgis_topology_types::from_bytes(bytes)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{{}}: {{}}", name, topology_err_string(e))))
+}}
+
+fn topology_err_string(e: TopologyError) -> String {{
+    match e {{
+        TopologyError::InvalidTopology(s) | TopologyError::General(s) => s,
+        TopologyError::NodeNotFound(id) => format!("node not found: {{}}", id),
+        TopologyError::EdgeNotFound(id) => format!("edge not found: {{}}", id),
+        TopologyError::FaceNotFound(id) => format!("face not found: {{}}", id),
+    }}
+}}
+"#,
+        pkg_ns = pkg_ns,
+        pkg_name = pkg_name,
+    )
+}
+
+/// Walk the wired entries and collect every record name that
+/// appears in a `WitValueRecord` / `ListRecord` param or
+/// `WitValueRecord` / `OptionWitValueRecord` /
+/// `FirstWitValueRecord` return. Drives the per-record helper
+/// emission filter.
+fn collect_referenced_records(
+    scalar_entries: &[(interface_db::DispatchEntry, bool)],
+) -> std::collections::BTreeSet<String> {
+    let mut out: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for (entry, _f) in scalar_entries {
+        for p in &entry.shape.params {
+            match p {
+                ParamShape::WitValueRecord { kebab_name, .. } => {
+                    out.insert(kebab_name.clone());
+                }
+                ParamShape::ListRecord { kebab_name, .. } => {
+                    out.insert(kebab_name.clone());
+                }
+                _ => {}
+            }
+        }
+        match &entry.shape.ret {
+            RetShape::WitValueRecord { kebab_name, .. }
+            | RetShape::OptionWitValueRecord { kebab_name, .. }
+            | RetShape::FirstWitValueRecord { kebab_name, .. } => {
+                out.insert(kebab_name.clone());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Collect every unique tuple-element signature that appears in a
+/// `ParamShape::ListTuple`. Drives `render_tuple_list_helpers`.
+fn collect_tuple_list_sigs(
+    scalar_entries: &[(interface_db::DispatchEntry, bool)],
+) -> std::collections::BTreeSet<Vec<ListPrimElem>> {
+    let mut out: std::collections::BTreeSet<Vec<ListPrimElem>> =
+        std::collections::BTreeSet::new();
+    for (entry, _f) in scalar_entries {
+        for p in &entry.shape.params {
+            if let Some(sig) = p.list_tuple_sig() {
+                out.insert(sig.to_vec());
+            }
+        }
+    }
+    out
+}
+
+/// Render `parse_json_list_tuple_<sig>` helpers — one per unique
+/// tuple-element signature referenced by a wired ListTuple param.
+fn render_tuple_list_helpers(
+    sigs: &std::collections::BTreeSet<Vec<ListPrimElem>>,
+) -> String {
+    if sigs.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push_str(
+        "\n// ─── list<tuple<...>> param helpers ───\n\
+         // One per unique tuple-element signature referenced by a wired\n\
+         // dispatch arm. SQL passes a JSON-array of arrays as the TEXT/VARCHAR\n\
+         // arg (e.g. `'[[1, 10], [20, 30]]'`); serde_json parses tuples\n\
+         // as fixed-length JSON arrays so the upstream\n\
+         // `Vec<(T1, T2, ...)>` binding round-trips directly.\n",
+    );
+    for elements in sigs {
+        let suffix = interface_db::list_tuple_sig_suffix(elements);
+        let elems_joined = elements
+            .iter()
+            .map(|e| e.rust_elem())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rust_tuple = if elements.len() == 1 {
+            format!("({},)", elems_joined)
+        } else {
+            format!("({})", elems_joined)
+        };
+        let wit_label = elements
+            .iter()
+            .map(|e| match e {
+                ListPrimElem::F64 => "f64",
+                ListPrimElem::F32 => "f32",
+                ListPrimElem::S32 => "s32",
+                ListPrimElem::S64 => "s64",
+                ListPrimElem::U32 => "u32",
+                ListPrimElem::U64 => "u64",
+                ListPrimElem::U8 => "u8",
+                ListPrimElem::Bool => "bool",
+                ListPrimElem::String => "string",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "fn parse_json_list_tuple_{suffix}(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<{rust_tuple}>, types::Duckerror> {{\n\
+             \x20   let text = dv_text(args, idx, name)?;\n\
+             \x20   serde_json::from_str::<Vec<{rust_tuple}>>(text)\n\
+             \x20       .map_err(|e| types::Duckerror::Invalidargument(format!(\"{{name}}: arg {{idx}} must be JSON array of [{wit_label}] tuples ({{e}})\")))\n\
+             }}\n\n",
+        ));
+    }
+    s
+}
+
+/// Render per-record wit-value marshaling helpers. Each record
+/// referenced by a wired dispatch arm gets:
+///
+///   - `arg_witvalue_<snake>(args, idx, name) -> Result<UPSTREAM, Duckerror>`
+///     unwraps a `Duckvalue::Complex` carrier, parses
+///     `serde_json::from_str::<UPSTREAM>(&cmplx.json)` straight
+///     into the upstream type. Works for any record whose upstream
+///     binding derives serde::Deserialize via the wit-bindgen
+///     `additional_derives` arg.
+///
+///   - `parse_json_list_record_<snake>(args, idx, name) -> Result<Vec<UPSTREAM>, Duckerror>`
+///     parses a JSON-array TEXT arg into `Vec<UPSTREAM>`.
+///
+///   - `ret_to_witvalue_<snake>(upstream) -> Result<Duckvalue, Duckerror>`
+///     serializes via serde_json and wraps in `Duckvalue::Complex`
+///     with the record's symbolic name in `type_expr`.
+fn render_wit_value_helpers(records: &[RecordType]) -> String {
+    if records.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push_str(
+        "\n// ─── Per-record wit-value marshaling helpers ───\n\
+         // Records ride on `Duckvalue::Complex { type_expr, json }`.\n\
+         // Decode parses `json` straight into UPSTREAM via\n\
+         // serde_json::from_str (UPSTREAM derives serde derives via\n\
+         // wit-bindgen's `additional_derives` arg above). Encode\n\
+         // round-trips UPSTREAM → JSON → Complex carrier.\n",
+    );
+    for r in records {
+        let snake = r.snake_name();
+        let pascal = pascal_case(&r.kebab_name);
+        let upstream_iface_snake = sanitize_module(&r.interface);
+        let (pkg_ns, pkg_name) = split_pkg(&r.package);
+        let upstream_path = format!(
+            "bindings::{ns}::{name}::{iface}::{pascal}",
+            ns = sanitize_module(&pkg_ns),
+            name = sanitize_module(&pkg_name),
+            iface = upstream_iface_snake,
+            pascal = pascal,
+        );
+        let symbolic = r.symbolic_name.replace('"', "\\\"");
+        let kebab = &r.kebab_name;
+        s.push_str(&format!(
+            "fn arg_witvalue_{snake}(\n\
+             \x20   args: &[types::Duckvalue],\n\
+             \x20   idx: usize,\n\
+             \x20   name: &str,\n\
+             ) -> Result<{upstream_path}, types::Duckerror> {{\n\
+             \x20   let cmplx = match args.get(idx) {{\n\
+             \x20       Some(types::Duckvalue::Complex(c)) => c,\n\
+             \x20       _ => return Err(types::Duckerror::Invalidargument(\n\
+             \x20           format!(\"{{name}}: arg {{idx}} must be COMPLEX (wit-value record)\"))),\n\
+             \x20   }};\n\
+             \x20   serde_json::from_str::<{upstream_path}>(&cmplx.json)\n\
+             \x20       .map_err(|e| types::Duckerror::Invalidargument(\n\
+             \x20           format!(\"{{name}}: decode arg {{idx}}: {{}}\", e)))\n\
+             }}\n\n",
+        ));
+        s.push_str(&format!(
+            "fn parse_json_list_record_{snake}(\n\
+             \x20   args: &[types::Duckvalue],\n\
+             \x20   idx: usize,\n\
+             \x20   name: &str,\n\
+             ) -> Result<Vec<{upstream_path}>, types::Duckerror> {{\n\
+             \x20   let text = dv_text(args, idx, name)?;\n\
+             \x20   serde_json::from_str::<Vec<{upstream_path}>>(text)\n\
+             \x20       .map_err(|e| types::Duckerror::Invalidargument(\n\
+             \x20           format!(\"{{name}}: arg {{idx}} must be JSON array of {kebab} ({{e}})\")))\n\
+             }}\n\n",
+            kebab = kebab,
+        ));
+        s.push_str(&format!(
+            "fn ret_to_witvalue_{snake}(\n\
+             \x20   upstream: {upstream_path},\n\
+             ) -> Result<types::Duckvalue, types::Duckerror> {{\n\
+             \x20   let json = serde_json::to_string(&upstream)\n\
+             \x20       .map_err(|e| types::Duckerror::Internal(format!(\"encode {snake} wit-value: {{}}\", e)))?;\n\
+             \x20   Ok(types::Duckvalue::Complex(types::Complexvalue {{\n\
+             \x20       type_expr: \"{symbolic}\".into(),\n\
+             \x20       json,\n\
+             \x20   }}))\n\
+             }}\n\n",
+            symbolic = symbolic,
+        ));
+    }
+    s
+}
+
 
 /// Discover which subdir of `wit_deps_root` holds the primary
 /// shim's upstream WIT package. Same heuristic as sqlite-emit's
