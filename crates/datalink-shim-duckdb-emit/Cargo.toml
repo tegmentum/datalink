@@ -1,0 +1,21 @@
+[package]
+name = "datalink-shim-duckdb-emit"
+version = "0.1.0"
+edition = "2021"
+description = "DuckDB-target emitter for the shim-bridge codegen. Consumes a database-agnostic BridgePlan (from shim-bridge-codegen-core) plus the database-agnostic substrate (datalink-shim-codegen-core) and emits a `wasm32-wasip2` cdylib crate whose component imports the upstream shim's WIT and exports the `duckdb:extension@2.2.0` contract (guest + callback-dispatch). Created in Step 4 of PLAN-shim-codegen-datalink-migration as the DuckDB-targeted sibling to datalink-shim-sqlite-emit."
+license = "Apache-2.0"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "datalink_shim_duckdb_emit"
+path = "src/lib.rs"
+
+[dependencies]
+shim-bridge-codegen-core = { git = "https://github.com/tegmentum/shim-bridge-codegen-core.git", rev = "0e25c2929845b9051e8481746f63061a3944037a" }
+datalink-shim-codegen-core = { path = "../datalink-shim-codegen-core" }
+anyhow = "1"
+# Canonical-WIT shape hashing — present here for symmetry with
+# datalink-shim-sqlite-emit even though Step 4's scalar-first cut
+# does not exercise typed-value-binding payloads yet. Ducklink
+# loader integration (deferred) will land the wit-value path.
+sha2 = "0.10"
