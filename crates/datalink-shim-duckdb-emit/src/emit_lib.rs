@@ -64,6 +64,13 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let (aggregate_entries, aggregate_unwired) =
         interface_db::build_aggregate_registry(plan, &shim_wit_dir, &records)?;
 
+    // UDTF (table-function) entries — Phase 3 of the batch. Wires
+    // the row-yielding table functions (st-dump, st-dump-points,
+    // st-subdivide, st-asx3d, mobilitydb temporal-joins, ...)
+    // against DuckDB's `call_table` whole-rowset return ABI.
+    let (udtf_entries, udtf_unwired) =
+        interface_db::build_udtf_registry(plan, &shim_wit_dir, &records)?;
+
     // Report on what fell through so the maintainer sees coverage
     // at codegen time.
     let total_unwired = scalar_unwired.len();
@@ -81,6 +88,15 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             aggregate_unwired.len(),
         );
         for u in &aggregate_unwired {
+            eprintln!("  - {}: {}", u.sql_name, u.reason);
+        }
+    }
+    if !udtf_unwired.is_empty() {
+        eprintln!(
+            "[duckdb-target] {} table function(s) not wired:",
+            udtf_unwired.len(),
+        );
+        for u in &udtf_unwired {
             eprintln!("  - {}: {}", u.sql_name, u.reason);
         }
     }
@@ -189,6 +205,13 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     // (postgis-raster-aggregates). Same package as the scalar set
     // but a distinct module alias.
     for entry in &aggregate_entries {
+        used_aliases
+            .entry(entry.shape.wit_module.clone())
+            .or_insert_with(|| entry.shape.wit_package.clone());
+    }
+    // UDTF WIT modules — typically `pg_table` / `pg_dump` /
+    // mobilitydb temporal-join modules.
+    for entry in &udtf_entries {
         used_aliases
             .entry(entry.shape.wit_module.clone())
             .or_insert_with(|| entry.shape.wit_package.clone());
@@ -379,7 +402,7 @@ use bindings::exports::duckdb::extension::guest;
         &bridge_struct,
         plan,
         !aggregate_entries.is_empty(),
-        false,
+        !udtf_entries.is_empty(),
     ));
 
     // call_scalar dispatch: build the per-arm match
@@ -392,6 +415,11 @@ use bindings::exports::duckdb::extension::guest;
     let aggregate_arm_count =
         build_aggregate_arms(&mut aggregate_arms, &aggregate_entries);
     let _ = aggregate_arm_count;
+
+    // call_table dispatch: build the per-arm match
+    let mut table_arms = String::new();
+    let table_arm_count = build_table_arms(&mut table_arms, &udtf_entries);
+    let _ = table_arm_count;
 
     s.push_str(&format!(
         r##"
@@ -444,12 +472,22 @@ impl callback_dispatch::Guest for {bridge_struct} {{
     }}
 
     fn call_table(
-        _handle: u32,
-        _args: Vec<types::Duckvalue>,
+        handle: u32,
+        args: Vec<types::Duckvalue>,
     ) -> Result<types::Resultset, types::Duckerror> {{
-        Err(types::Duckerror::Unsupported(
-            format!("{primary}: table functions not wired (Step 4 scalar-first cut)")
-        ))
+        let arm_idx = table_handle_table()
+            .lock()
+            .expect("table handle mutex poisoned")
+            .get(&handle)
+            .copied()
+            .ok_or_else(|| types::Duckerror::Internal(
+                "unknown table function handle".into()
+            ))?;
+        match arm_idx {{
+{table_arms}            _ => Err(types::Duckerror::Internal(format!(
+                "unknown table function arm index {{}}", arm_idx
+            ))),
+        }}
     }}
     fn call_aggregate(
         handle: u32,
@@ -490,6 +528,7 @@ impl callback_dispatch::Guest for {bridge_struct} {{
         bridge_struct = bridge_struct,
         scalar_arms = scalar_arms,
         aggregate_arms = aggregate_arms,
+        table_arms = table_arms,
         primary = primary,
     ));
 
@@ -505,6 +544,11 @@ impl callback_dispatch::Guest for {bridge_struct} {{
     // `Capabilitykind::Aggregate` registry.
     if !aggregate_entries.is_empty() {
         s.push_str(&register::render_aggregates(plan, &aggregate_entries)?);
+    }
+    // register_tables() body. Same shape as aggregates against the
+    // `Capabilitykind::Table` registry.
+    if !udtf_entries.is_empty() {
+        s.push_str(&register::render_tables(plan, &udtf_entries)?);
     }
 
     // Export macro at file scope
@@ -625,6 +669,46 @@ fn build_aggregate_arms(
             continue;
         }
         let body = dispatch::emit_aggregate_arm_body(
+            &entry.shape,
+            &entry.sql_name,
+            "                ",
+        );
+        out.push_str(&format!(
+            "            {arm_idx}usize => {{\n{body}\n            }}\n",
+        ));
+    }
+    next
+}
+
+/// Build the per-arm UDTF dispatch match arms. Same dedupe
+/// pattern as build_scalar_arms / build_aggregate_arms.
+fn build_table_arms(
+    out: &mut String,
+    udtf_entries: &[interface_db::UdtfEntry],
+) -> usize {
+    let mut arm_for: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    let mut next: usize = 0;
+    for entry in udtf_entries {
+        let key: &str = entry.sql_name.as_str();
+        arm_for.entry(key).or_insert_with(|| {
+            let i = next;
+            next += 1;
+            i
+        });
+    }
+    let mut emitted: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    for entry in udtf_entries {
+        let key: &str = entry.sql_name.as_str();
+        let arm_idx = match arm_for.get(key) {
+            Some(&i) => i,
+            None => continue,
+        };
+        if !emitted.insert(arm_idx) {
+            continue;
+        }
+        let body = dispatch::emit_udtf_call_body(
             &entry.shape,
             &entry.sql_name,
             "                ",

@@ -420,3 +420,160 @@ fn register_aggregates() -> Result<(), types::Duckerror> {
         }
     };
 "##;
+
+// ─── Table function (UDTF) registration ───
+//
+// Mirrors `render` but against `Capabilitykind::Table` and the
+// `table-callback` resource. Per-UDTF the codegen emits:
+//   * Funcarg list per param (Logicaltype derived from ParamShape)
+//   * Columndef list per output row column (derived from
+//     UdtfOutputRow + UdtfFieldShape)
+//   * register(name, args, columns, table_callback, opts)
+pub fn render_tables(
+    plan: &shim_bridge_codegen_core::BridgePlan,
+    udtf_entries: &[datalink_shim_codegen_core::interface_db::UdtfEntry],
+) -> anyhow::Result<String> {
+    use datalink_shim_codegen_core::interface_db::{
+        ColumnAffinity, UdtfFieldShape, UdtfOutputRow,
+    };
+    // TableFn doesn't carry an is_deterministic flag (UDTFs are
+    // assumed deterministic over their args; the runtime treats
+    // them as table sources rather than projections). `plan` is
+    // kept for symmetry with the scalar / aggregate render entry
+    // points but unused here.
+    let _ = plan;
+
+    let mut s = String::new();
+    s.push_str(TABLE_REGISTER_PRELUDE);
+
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut arm_idx: usize = 0;
+    for entry in udtf_entries {
+        if !seen.insert(entry.sql_name.clone()) {
+            continue;
+        }
+        // ── Funcarg list (one per WIT param)
+        let mut args_block = String::new();
+        for (i, p) in entry.shape.params.iter().enumerate() {
+            let logical = paramshape_to_logicaltype(p);
+            args_block.push_str(&format!(
+                "            runtime::Funcarg {{\n\
+                 \x20               name: Some(\"arg{i}\".into()),\n\
+                 \x20               logical: {logical},\n\
+                 \x20           }},\n",
+            ));
+        }
+        // ── Columndef list (one per visible output row column)
+        let mut cols_block = String::new();
+        match &entry.shape.output_row {
+            UdtfOutputRow::SingleGeom => {
+                let col_name = datalink_shim_codegen_core::interface_db
+                    ::single_geom_column_name_for(&entry.sql_name);
+                cols_block.push_str(&format!(
+                    "            runtime::Columndef {{\n\
+                     \x20               name: \"{col_name}\".into(),\n\
+                     \x20               logical: types::Logicaltype::Blob,\n\
+                     \x20           }},\n",
+                ));
+            }
+            UdtfOutputRow::SinglePrimitive { affinity } => {
+                let logical = match affinity {
+                    ColumnAffinity::Integer => "types::Logicaltype::Int64",
+                    ColumnAffinity::Real => "types::Logicaltype::Float64",
+                    ColumnAffinity::Text => "types::Logicaltype::Text",
+                    ColumnAffinity::Blob => "types::Logicaltype::Blob",
+                };
+                cols_block.push_str(&format!(
+                    "            runtime::Columndef {{\n\
+                     \x20               name: \"value\".into(),\n\
+                     \x20               logical: {logical},\n\
+                     \x20           }},\n",
+                ));
+            }
+            UdtfOutputRow::Record { fields } => {
+                for f in fields {
+                    let logical = match f.field_shape {
+                        UdtfFieldShape::Int | UdtfFieldShape::OptionInt => {
+                            "types::Logicaltype::Int64"
+                        }
+                        UdtfFieldShape::Real | UdtfFieldShape::OptionReal => {
+                            "types::Logicaltype::Float64"
+                        }
+                        UdtfFieldShape::Text | UdtfFieldShape::OptionText => {
+                            "types::Logicaltype::Text"
+                        }
+                        UdtfFieldShape::Blob
+                        | UdtfFieldShape::OptionBlob
+                        | UdtfFieldShape::GeomBlob
+                        | UdtfFieldShape::OptionGeomBlob
+                        | UdtfFieldShape::Unsupported => "types::Logicaltype::Blob",
+                    };
+                    let col_name = f.name.replace('"', "\\\"");
+                    cols_block.push_str(&format!(
+                        "            runtime::Columndef {{\n\
+                         \x20               name: \"{col_name}\".into(),\n\
+                         \x20               logical: {logical},\n\
+                         \x20           }},\n",
+                    ));
+                }
+            }
+            UdtfOutputRow::Unwired { .. } => {
+                // Still register a placeholder column so DuckDB
+                // can route the call to call_table; the dispatch
+                // arm will return Unsupported with the reason.
+                cols_block.push_str(
+                    "            runtime::Columndef {\n\
+                     \x20               name: \"value\".into(),\n\
+                     \x20               logical: types::Logicaltype::Blob,\n\
+                     \x20           },\n",
+                );
+            }
+        }
+        let sql_name = entry.sql_name.replace('"', "\\\"");
+        s.push_str(&format!(
+            r##"    {{
+        let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        table_handle_table()
+            .lock()
+            .expect("table handle mutex poisoned")
+            .insert(handle, {arm_idx}usize);
+        let callback = runtime::TableCallback::new(handle);
+        let args: Vec<runtime::Funcarg> = vec![
+{args_block}        ];
+        let columns: Vec<runtime::Columndef> = vec![
+{cols_block}        ];
+        registry.register(
+            "{sql_name}",
+            &args,
+            &columns,
+            callback,
+            None,
+        )?;
+    }}
+"##,
+        ));
+        arm_idx += 1;
+    }
+
+    s.push_str("    Ok(())\n}\n");
+    Ok(s)
+}
+
+const TABLE_REGISTER_PRELUDE: &str = r##"
+fn register_tables() -> Result<(), types::Duckerror> {
+    let capability = runtime::get_capability(types::Capabilitykind::Table)
+        .ok_or_else(|| {
+            types::Duckerror::Internal(
+                "host did not expose table capability".into(),
+            )
+        })?;
+    let registry = match capability {
+        runtime::Capability::Table(r) => r,
+        _ => {
+            return Err(types::Duckerror::Internal(
+                "table capability returned unexpected variant".into(),
+            ));
+        }
+    };
+"##;

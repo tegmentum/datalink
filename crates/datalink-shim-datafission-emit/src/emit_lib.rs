@@ -112,6 +112,12 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let (aggregate_entries, aggregate_unwired) =
         interface_db::build_aggregate_registry(plan, &shim_wit_dir, &records)?;
 
+    // UDTF entries — wires the row-yielding table functions
+    // against datafission's iterator-style
+    // `table_function_registry@1.0.0` (begin/next_row/end).
+    let (udtf_entries, udtf_unwired) =
+        interface_db::build_udtf_registry(plan, &shim_wit_dir, &records)?;
+
     // Report on what fell through so the maintainer sees coverage
     // at codegen time.
     let total_unwired = scalar_unwired.len();
@@ -129,6 +135,15 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             aggregate_unwired.len(),
         );
         for u in &aggregate_unwired {
+            eprintln!("  - {}: {}", u.sql_name, u.reason);
+        }
+    }
+    if !udtf_unwired.is_empty() {
+        eprintln!(
+            "[datafission-target] {} table function(s) not wired:",
+            udtf_unwired.len(),
+        );
+        for u in &udtf_unwired {
             eprintln!("  - {}: {}", u.sql_name, u.reason);
         }
     }
@@ -186,6 +201,12 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     // (postgis-aggregates) and `pg_rast_agg`
     // (postgis-raster-aggregates).
     for entry in &aggregate_entries {
+        used_aliases
+            .entry(entry.shape.wit_module.clone())
+            .or_insert_with(|| entry.shape.wit_package.clone());
+    }
+    // UDTF WIT modules
+    for entry in &udtf_entries {
         used_aliases
             .entry(entry.shape.wit_module.clone())
             .or_insert_with(|| entry.shape.wit_package.clone());
@@ -538,6 +559,17 @@ use bindings::datafission::function_plugin::types as types;
     let scalar_block = build_scalar_registry_impl(&scalar_entries, plan);
     s.push_str(&scalar_block);
 
+    // Shared handle-table prelude — emit once when either
+    // aggregates or UDTFs are wired (both families use the same
+    // `Cell` / `RefCell` / `BTreeMap` imports + the same handle
+    // counter shape; deduplicate the `use` lines here so both
+    // emit blocks below stay self-contained).
+    let needs_handle_prelude =
+        !aggregate_entries.is_empty() || !udtf_entries.is_empty();
+    if needs_handle_prelude {
+        s.push_str(HANDLE_TABLE_PRELUDE);
+    }
+
     // ---- aggregate-function-registry: WIRED ----
     // When any aggregate is classified, emit the AccState prelude
     // and the dispatching impl. Empty surface falls back to the
@@ -553,8 +585,17 @@ use bindings::datafission::function_plugin::types as types;
     // ---- window-function-registry: stub ----
     s.push_str(WINDOW_STUB);
 
-    // ---- table-function-registry: stub ----
-    s.push_str(TABLE_STUB);
+    // ---- table-function-registry: WIRED ----
+    // Same conditional pattern as aggregates: empty surface uses
+    // the original stub, non-empty surface emits the UDTF_STATE
+    // block + real Guest impl. HANDLE_TABLE_PRELUDE was emitted
+    // above if either family is wired.
+    if udtf_entries.is_empty() {
+        s.push_str(TABLE_STUB);
+    } else {
+        s.push_str(UDTF_STATE_BLOCK);
+        s.push_str(&build_table_registry_impl(&udtf_entries));
+    }
 
     // ---- multi-custom-type: stub ----
     // Note: the single-type `type-plugin/custom-type` interface is
@@ -1111,8 +1152,21 @@ fn build_aggregate_registry_impl(
     )
 }
 
+/// Shared handle-table prelude — imports + cells that aggregates
+/// and UDTFs both need. Emitted once when EITHER family is wired,
+/// so the per-family AGGREGATE_STATE_BLOCK / UDTF_STATE_BLOCK can
+/// reference `Cell` / `RefCell` / `BTreeMap` without duplicating
+/// the `use` lines (which would error at module scope).
+const HANDLE_TABLE_PRELUDE: &str = r##"// ─── Handle-table cell + map imports (shared by aggregates + UDTFs) ───
+
+use core::cell::{Cell, RefCell};
+use alloc::collections::BTreeMap;
+
+"##;
+
 /// Per-handle accumulator state + thread-local map. Emitted into
 /// the bridge's lib.rs prelude once when any aggregate is wired.
+/// Assumes `HANDLE_TABLE_PRELUDE` has been emitted first.
 const AGGREGATE_STATE_BLOCK: &str = r##"// ─── Aggregate accumulator state ───
 //
 // Datafission's aggregate_function_registry@1.0.0 contract is
@@ -1127,9 +1181,6 @@ const AGGREGATE_STATE_BLOCK: &str = r##"// ─── Aggregate accumulator state
 // thread_local because wit-bindgen's guest impl is per-instance
 // and each component instance handles its own host calls in its
 // own thread.
-
-use core::cell::{Cell, RefCell};
-use alloc::collections::BTreeMap;
 
 #[derive(Clone)]
 struct AccState {
@@ -1156,6 +1207,151 @@ fn alloc_accumulator(arm_idx: usize, extras: Vec<String>) -> u64 {
             blobs: Vec::new(),
             extras,
         });
+    });
+    h
+}
+
+"##;
+
+/// Build the `table_function_registry::Guest` impl block. Emits
+/// per-name metadata, output_schema arm, begin arm that calls the
+/// per-UDTF emit body (decoding args, calling upstream, materialising
+/// rows), plus next_row + end against the UDTF_STATE handle table.
+fn build_table_registry_impl(
+    udtf_entries: &[interface_db::UdtfEntry],
+) -> String {
+    let mut metas_block = String::new();
+    let mut output_schema_arms = String::new();
+    let mut begin_arms = String::new();
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for entry in udtf_entries {
+        if !seen.insert(entry.sql_name.clone()) {
+            continue;
+        }
+        let escaped = entry.sql_name.replace('"', "\\\"");
+
+        // ---- metadata entry ----
+        let mut sig_block = String::new();
+        sig_block.push_str("vec![vec![");
+        for p in &entry.shape.params {
+            let lt = dispatch::paramshape_to_logicaltype(p);
+            sig_block.push_str(&lt);
+            sig_block.push_str(", ");
+        }
+        sig_block.push_str("]]");
+        metas_block.push_str(&format!(
+            "        ftypes::TableFunctionMeta {{\n\
+             \x20           name: \"{escaped}\".to_string(),\n\
+             \x20           aliases: Vec::new(),\n\
+             \x20           param_types: {sig_block},\n\
+             \x20       }},\n",
+        ));
+
+        // ---- output_schema arm ----
+        let cols = dispatch::emit_udtf_column_info(&entry.shape);
+        output_schema_arms.push_str(&format!(
+            "            \"{escaped}\" => Ok(alloc::vec![{cols}]),\n",
+        ));
+
+        // ---- begin arm ----
+        let body = dispatch::emit_udtf_begin_body(
+            &entry.shape,
+            &entry.sql_name,
+            "                ",
+        );
+        begin_arms.push_str(&format!(
+            "            \"{escaped}\" => {{\n{body}\n            }}\n",
+        ));
+    }
+
+    format!(
+        r##"impl table_function_registry::Guest for Component {{
+    fn list_functions() -> Vec<ftypes::TableFunctionMeta> {{
+        vec![
+{metas_block}        ]
+    }}
+
+    fn output_schema(
+        name: String,
+        _input_types: Vec<ftypes::LogicalType>,
+    ) -> Result<Vec<ftypes::ColumnInfo>, ftypes::FunctionError> {{
+        match name.as_str() {{
+{output_schema_arms}            other => Err(ftypes::FunctionError::UnknownFunction(other.into())),
+        }}
+    }}
+
+    fn begin(
+        name: String,
+        args: Vec<ftypes::ScalarValue>,
+    ) -> Result<u64, ftypes::FunctionError> {{
+        match name.as_str() {{
+{begin_arms}            other => Err(ftypes::FunctionError::UnknownFunction(other.into())),
+        }}
+    }}
+
+    fn next_row(handle: u64) -> Option<Result<Vec<ftypes::ScalarValue>, ftypes::FunctionError>> {{
+        UDTF_STATE.with(|m| {{
+            let mut g = m.borrow_mut();
+            let st = g.get_mut(&handle)?;
+            if st.idx >= st.rows.len() {{
+                return None;
+            }}
+            let row = core::mem::take(&mut st.rows[st.idx]);
+            st.idx += 1;
+            Some(Ok(row))
+        }})
+    }}
+
+    fn end(handle: u64) {{
+        UDTF_STATE.with(|m| {{
+            m.borrow_mut().remove(&handle);
+        }});
+    }}
+}}
+
+"##,
+    )
+}
+
+/// Per-handle UDTF state + thread-local map. Emitted into the
+/// bridge's lib.rs prelude once when any table function is wired.
+/// Assumes `HANDLE_TABLE_PRELUDE` has been emitted first (for the
+/// `Cell` / `RefCell` / `BTreeMap` imports). The aggregate and
+/// UDTF families share that prelude when both are wired.
+const UDTF_STATE_BLOCK: &str = r##"// ─── UDTF iterator state ───
+//
+// `table_function_registry@1.0.0` uses an iterator model:
+// `begin(name, args)` returns a u64 handle after eagerly
+// materialising the rowset; `next_row(handle)` peels one row at
+// a time; `end(handle)` drops the state. The bridge keeps a
+// thread-local map: handle -> UdtfState { rows, idx }.
+//
+// ACCUMULATORS / NEXT_ACC_HANDLE (from the aggregate block) and
+// UDTF_STATE / NEXT_UDTF_HANDLE are independent — the handle
+// namespaces are per-family, so collisions are impossible.
+
+#[derive(Default)]
+struct UdtfState {
+    rows: Vec<Vec<ftypes::ScalarValue>>,
+    idx: usize,
+}
+
+thread_local! {
+    static UDTF_STATE: RefCell<BTreeMap<u64, UdtfState>> =
+        RefCell::new(BTreeMap::new());
+    static NEXT_UDTF_HANDLE: Cell<u64> = const { Cell::new(1) };
+}
+
+fn alloc_udtf_handle(rows: Vec<Vec<ftypes::ScalarValue>>) -> u64 {
+    let h = NEXT_UDTF_HANDLE.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    UDTF_STATE.with(|m| {
+        m.borrow_mut().insert(h, UdtfState { rows, idx: 0 });
     });
     h
 }

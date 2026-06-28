@@ -31,8 +31,9 @@
 //!     makes UPSTREAM serdeable.
 
 use datalink_shim_codegen_core::interface_db::{
-    list_tuple_sig_suffix, AccKind, AggregateShape, DispatchShape,
-    JsonRetKind, ListPrimElem, ParamShape, RetShape,
+    list_tuple_sig_suffix, AccKind, AggregateShape, ColumnAffinity,
+    DispatchShape, JsonRetKind, ListPrimElem, ParamShape, RetShape,
+    UdtfFieldShape, UdtfOutputRow, UdtfShape,
 };
 
 /// Emit the body of one match arm of `call_scalar`. The body
@@ -878,4 +879,275 @@ pub fn emit_aggregate_arm_body(
         }
     }
     s
+}
+
+// ─── UDTF (table function) dispatch ───
+//
+// DuckDB's table-function ABI calls the guest's `call-table`
+// dispatch with `args: list<duckvalue>` and expects back a
+// `result<resultset, duckerror>` where `resultset = list<list<
+// duckvalue>>` (outer = rows, inner = columns). Unlike the SQLite
+// vtab path, which streams via xColumn / xNext callbacks, the
+// DuckDB host eagerly materialises the whole rowset in one shot —
+// the bridge marshals args, calls the upstream Rust function ONCE,
+// transforms its `Vec<Row>` into a per-row `Vec<Duckvalue>`
+// according to `UdtfOutputRow`, and returns the whole table.
+//
+// The returned body goes inside `<arm_idx>usize => { ... }` in the
+// `call_table` match.
+pub fn emit_udtf_call_body(
+    shape: &UdtfShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let mut s = String::new();
+
+    // ── Param marshalling — covers the subset that postgis +
+    // mobilitydb UDTF call sites use today (primitives, Geom /
+    // Geog / Raster / Topology, WitValueRecord, Enum). Shapes the
+    // emit doesn't cover bail with a clear error.
+    let (decls, call_args) =
+        emit_udtf_param_marshal(&shape.params, sql_name, i);
+    s.push_str(&decls);
+    let call_args_str = call_args.join(", ");
+
+    // ── Upstream call. Always fully materialises into Vec<Row>.
+    let unwrap = if shape.fallible {
+        format!(
+            ".map_err(|e| types::Duckerror::Invalidargument(format!(\"{sql_name}: {{}}\", shim_err_string(e))))?"
+        )
+    } else {
+        String::new()
+    };
+    s.push_str(&format!(
+        "{i}let __upstream = {module}::{func}({call_args_str}){unwrap};\n",
+    ));
+
+    // ── Row materialiser. Each row → Vec<Duckvalue> (one per
+    // visible column). The four output_row variants drive the
+    // per-row encoding recipe.
+    match &shape.output_row {
+        UdtfOutputRow::SingleGeom => {
+            s.push_str(&format!(
+                "{i}let mut rows: Vec<Vec<types::Duckvalue>> = Vec::with_capacity(__upstream.len());\n\
+                 {i}for __g in __upstream.iter() {{\n\
+                 {i}    rows.push(alloc::vec![types::Duckvalue::Blob(__g.as_wkb())]);\n\
+                 {i}}}\n\
+                 {i}Ok(rows)",
+            ));
+        }
+        UdtfOutputRow::SinglePrimitive { affinity } => {
+            let (variant, expr) = match affinity {
+                ColumnAffinity::Integer => ("Int64", "*__v as i64"),
+                ColumnAffinity::Real => ("Float64", "*__v as f64"),
+                ColumnAffinity::Text => ("Text", "__v.clone()"),
+                ColumnAffinity::Blob => ("Blob", "__v.clone()"),
+            };
+            s.push_str(&format!(
+                "{i}let mut rows: Vec<Vec<types::Duckvalue>> = Vec::with_capacity(__upstream.len());\n\
+                 {i}for __v in __upstream.iter() {{\n\
+                 {i}    rows.push(alloc::vec![types::Duckvalue::{variant}({expr})]);\n\
+                 {i}}}\n\
+                 {i}Ok(rows)",
+            ));
+        }
+        UdtfOutputRow::Record { fields } => {
+            let mut row_exprs: Vec<String> = Vec::new();
+            for f in fields {
+                let snake = f.name.replace('-', "_");
+                let expr = match f.field_shape {
+                    UdtfFieldShape::Int => format!(
+                        "types::Duckvalue::Int64(__row.{snake} as i64)"
+                    ),
+                    UdtfFieldShape::Real => format!(
+                        "types::Duckvalue::Float64(__row.{snake} as f64)"
+                    ),
+                    UdtfFieldShape::Text => format!(
+                        "types::Duckvalue::Text(__row.{snake}.clone())"
+                    ),
+                    UdtfFieldShape::Blob => format!(
+                        "types::Duckvalue::Blob(__row.{snake}.clone())"
+                    ),
+                    UdtfFieldShape::GeomBlob => format!(
+                        "types::Duckvalue::Blob(__row.{snake}.as_wkb())"
+                    ),
+                    UdtfFieldShape::OptionInt => format!(
+                        "match __row.{snake} {{ Some(v) => types::Duckvalue::Int64(v as i64), None => types::Duckvalue::Null }}"
+                    ),
+                    UdtfFieldShape::OptionReal => format!(
+                        "match __row.{snake} {{ Some(v) => types::Duckvalue::Float64(v as f64), None => types::Duckvalue::Null }}"
+                    ),
+                    UdtfFieldShape::OptionText => format!(
+                        "match &__row.{snake} {{ Some(v) => types::Duckvalue::Text(v.clone()), None => types::Duckvalue::Null }}"
+                    ),
+                    UdtfFieldShape::OptionBlob => format!(
+                        "match &__row.{snake} {{ Some(v) => types::Duckvalue::Blob(v.clone()), None => types::Duckvalue::Null }}"
+                    ),
+                    UdtfFieldShape::OptionGeomBlob => format!(
+                        "match &__row.{snake} {{ Some(v) => types::Duckvalue::Blob(v.as_wkb()), None => types::Duckvalue::Null }}"
+                    ),
+                    UdtfFieldShape::Unsupported => {
+                        "types::Duckvalue::Null".to_string()
+                    }
+                };
+                row_exprs.push(expr);
+            }
+            let row_block = row_exprs.join(", ");
+            s.push_str(&format!(
+                "{i}let mut rows: Vec<Vec<types::Duckvalue>> = Vec::with_capacity(__upstream.len());\n\
+                 {i}for __row in __upstream.into_iter() {{\n\
+                 {i}    rows.push(alloc::vec![{row_block}]);\n\
+                 {i}}}\n\
+                 {i}Ok(rows)",
+            ));
+        }
+        UdtfOutputRow::Unwired { reason } => {
+            let r = reason.replace('"', "\\\"");
+            s.push_str(&format!(
+                "{i}Err(types::Duckerror::Unsupported(format!(\"{sql_name}: UDTF row shape unwired: {r}\")))",
+            ));
+        }
+    }
+
+    s
+}
+
+/// Marshal UDTF args from `Vec<Duckvalue>` into Rust-typed
+/// bindings. Mirrors the marshalling block in
+/// `emit_scalar_arm_body` but kept independent so a scalar emit
+/// refactor doesn't drag UDTF along. Returns the decl block + the
+/// list of `call_args` (each is the Rust expression to pass as
+/// the corresponding param at the upstream call site).
+fn emit_udtf_param_marshal(
+    params: &[ParamShape],
+    sql_name: &str,
+    i: &str,
+) -> (String, Vec<String>) {
+    let mut s = String::new();
+    let mut call_args: Vec<String> = Vec::with_capacity(params.len());
+
+    for (idx, p) in params.iter().enumerate() {
+        match p {
+            ParamShape::Text => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dv_text(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::F64 => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dv_f64(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::S32 => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dv_i64(&args, {idx}, \"{sql_name}\")? as i32;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::S64 => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dv_i64(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::U32 => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dv_i64(&args, {idx}, \"{sql_name}\")? as u32;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::U64 => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dv_i64(&args, {idx}, \"{sql_name}\")? as u64;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::Bool => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dv_bool(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::Blob => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dv_blob(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::Geom => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = from_wkb(dv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Geog => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = geog_from_wkb(dv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Raster => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = from_raster_binary(dv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Topology => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = from_topology_bytes(dv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::OptionNone => {
+                call_args.push("None".to_string());
+            }
+            ParamShape::WitValueRecord { kebab_name, .. } => {
+                let snake = kebab_name.replace('-', "_");
+                s.push_str(&format!(
+                    "{i}let arg{idx} = arg_witvalue_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Enum {
+                wit_module, kebab_name, cases, ..
+            } => {
+                let type_pascal = kebab_to_pascal(kebab_name);
+                let mut arms = String::new();
+                for (n, case) in cases.iter().enumerate() {
+                    let case_pascal = kebab_to_pascal(case);
+                    arms.push_str(&format!(
+                        "{i}    {n} => {wit_module}::{type_pascal}::{case_pascal},\n",
+                    ));
+                }
+                let max = cases.len();
+                s.push_str(&format!(
+                    "{i}let arg{idx} = match dv_i64(&args, {idx}, \"{sql_name}\")? {{\n{arms}{i}    other => return Err(types::Duckerror::Invalidargument(format!(\n\
+                     {i}        \"{sql_name}: arg {idx} ({kebab_name}) out of range: {{}} (valid 0..{max})\",\n\
+                     {i}        other,\n\
+                     {i}    ))),\n\
+                     {i}}};\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            // Param shapes UDTFs in the postgis+mobilitydb surfaces
+            // don't use (ListGeom / ListRecord / ListTuple / ListPrim).
+            // Emit a runtime error so the surface stays loadable
+            // and any future UDTF that does use them surfaces a
+            // clear unwired diagnostic.
+            ParamShape::ListGeom
+            | ParamShape::ListRecord { .. }
+            | ParamShape::ListTuple { .. }
+            | ParamShape::ListPrim(_) => {
+                s.push_str(&format!(
+                    "{i}return Err(types::Duckerror::Unsupported(format!(\"{sql_name}: UDTF list-param shape not wired\")));\n",
+                ));
+            }
+        }
+    }
+    (s, call_args)
 }
