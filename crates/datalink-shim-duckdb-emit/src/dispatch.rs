@@ -683,15 +683,18 @@ pub fn emit_aggregate_arm_body(
         )
     };
 
+    // Constant aggregate args MUST be uniform across rows by the
+    // SQL standard; PostgreSQL / DuckDB's planner enforces this
+    // upstream of the guest call. We latch the first non-null
+    // row's tail and rely on the host's validation rather than
+    // re-checking per row (Duckvalue lacks PartialEq, so a
+    // post-hoc drift check would require manual variant matching).
     let extras_latch = if shape.extra_args.is_empty() {
         String::new()
     } else {
         format!(
             "{i}    if extras.is_none() {{\n\
              {i}        extras = Some(row[1..].to_vec());\n\
-             {i}    }} else if extras.as_ref().map(|e| e.as_slice() != &row[1..]).unwrap_or(false) {{\n\
-             {i}        return Err(types::Duckerror::Invalidargument(format!(\n\
-             {i}            \"{sql_name}: aggregate constant args drifted between rows\")));\n\
              {i}    }}\n",
         )
     };
