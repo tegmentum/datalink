@@ -474,6 +474,20 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let to = dst.join(entry.file_name());
         if file_type.is_dir() {
             copy_tree(&from, &to)?;
+        } else if file_type.is_symlink() {
+            // #623: resolve symlinks so generated bridges are
+            // standalone (datafission per-extension wit/deps are
+            // symlink farms; without this, the codegen silently
+            // skipped them).
+            let resolved = fs::canonicalize(&from)
+                .with_context(|| format!("resolve symlink {}", from.display()))?;
+            if resolved.is_dir() {
+                copy_tree(&resolved, &to)?;
+            } else if resolved.is_file() {
+                if same_file(&resolved, &to) { continue; }
+                fs::copy(&resolved, &to)
+                    .with_context(|| format!("copy {} -> {}", resolved.display(), to.display()))?;
+            }
         } else if file_type.is_file() {
             if same_file(&from, &to) {
                 continue;
