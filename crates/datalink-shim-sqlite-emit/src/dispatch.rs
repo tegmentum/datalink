@@ -688,6 +688,23 @@ pub fn emit_arm_body(
                  {i}    }}\n\
                  {i}}}"
             ),
+            // #630: `option<list<R>>` for an all-primitive record R
+            // — Some(vec) → JSON array of objects via serde
+            // (`wit-bindgen`'s `additional_derives` supplies the
+            // `Serialize` impl); None → SQL NULL. Today's surface:
+            // mobilitydb `<date|float|int|tstz>-spanset-from-text`.
+            JsonRetKind::OptionListPrimRecord(_) => format!(
+                "{{\n\
+                 {i}    match {call_expr}{unwrap_chain} {{\n\
+                 {i}        Some(__v) => {{\n\
+                 {i}            let __json = serde_json::to_string(&__v)\n\
+                 {i}                .map_err(|e| format!(\"{sql_name}: encode JSON: {{}}\", e))?;\n\
+                 {i}            Ok(SqlValue::Text(__json))\n\
+                 {i}        }}\n\
+                 {i}        None => Ok(SqlValue::Null),\n\
+                 {i}    }}\n\
+                 {i}}}"
+            ),
             JsonRetKind::ListTupleGeomF64 => format!(
                 "{{\n\
                  {i}    let __r = {call_expr}{unwrap_chain};\n\

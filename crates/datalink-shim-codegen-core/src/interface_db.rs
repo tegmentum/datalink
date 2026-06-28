@@ -533,6 +533,24 @@ pub enum JsonRetKind {
     /// Some → JSON-array text; None → SQL NULL. Same serde tuple
     /// rendering as `TuplePrim`.
     OptionTuplePrim(Vec<ListPrimElem>),
+    /// #630: `option<list<R>>` where `R` is a same-package record
+    /// whose every field is a WIT primitive (`bool`, integer width,
+    /// `f32`/`f64`, `string`) or `option<primitive>`. Some →
+    /// `serde_json::to_string` on the inner `Vec<R>` (each element
+    /// renders as a JSON object via the record's
+    /// `serde::Serialize` derive, supplied by wit-bindgen's
+    /// `additional_derives`); None → SQL NULL. The carried string
+    /// is the record's kebab name — captured for diagnostics /
+    /// codec-helper lookup, not for the emit template itself.
+    /// Today's surface (mobilitydb):
+    ///   - `date-spanset-from-text -> option<list<date-span>>`
+    ///   - `float-spanset-from-text -> option<list<float-span>>`
+    ///   - `int-spanset-from-text -> option<list<int-span>>`
+    ///   - `tstz-spanset-from-text -> option<list<int-span>>`
+    /// — plus the 4 mobilitydb-ducklink-bridge casts that route to
+    /// these constructors and previously deferred because no scalar
+    /// arm existed.
+    OptionListPrimRecord(String),
 }
 
 /// Diagnostic: a scalar the codegen wanted to wire but couldn't.
@@ -1770,6 +1788,34 @@ pub fn classify_return(
                     parts.join(", ")
                 ));
             }
+            // #630: option<list<R>> where R is a record with
+            // all-primitive fields. Some → JSON array of objects via
+            // serde; None → SQL NULL. Mobilitydb surface today:
+            // `<date|float|int|tstz>-spanset-from-text`. The
+            // record-of-primitives constraint keeps the variant from
+            // silently expanding to records that nest other records
+            // (which `serde_json::to_string` would still encode but
+            // SQL callers can't unpack via simple JSON1 ops without
+            // matching the nested shape).
+            WitType::List(inner_list) => {
+                if let WitType::Unsupported(rec_kebab) = inner_list.as_ref() {
+                    if let Some(rec) =
+                        records.iter().find(|r| &r.kebab_name == rec_kebab)
+                    {
+                        if record_fields_all_primitive(rec) {
+                            return Ok(RetShape::JsonText {
+                                kind: JsonRetKind::OptionListPrimRecord(
+                                    rec.kebab_name.clone(),
+                                ),
+                            });
+                        }
+                    }
+                }
+                return Err(format!(
+                    "return type not in dispatcher alphabet: option<list<{}>> (inner not a primitive-only record)",
+                    type_label_dbg(inner_list)
+                ));
+            }
             // Phase F (#522): option<record>. Inner unsupported(name)
             // hits the record registry; if found, route to
             // `OptionWitValueRecord` — Some(rec)→wit-value,
@@ -2011,6 +2057,52 @@ pub fn list_tuple_sig_suffix(elements: &[ListPrimElem]) -> String {
         .map(|e| e.helper_suffix())
         .collect::<Vec<_>>()
         .join("_")
+}
+
+/// #630: true iff every field of `rec` is a WIT primitive
+/// (`bool`, integer width, `f32`/`f64`, `string`) or
+/// `option<primitive>`. Drives `JsonRetKind::OptionListPrimRecord`
+/// — the variant only fires when `serde_json::to_string(&Vec<R>)`
+/// produces a flat array of JSON objects (no nested records, no
+/// resources, no lists). `RecordType.fields` carries raw WIT type
+/// text (not the parsed `WitType` IR), so the check is structural
+/// over the field-text strings, matching the style of
+/// `record_registry::field_type_is_direct`.
+pub fn record_fields_all_primitive(rec: &crate::record_registry::RecordType) -> bool {
+    fn is_prim_text(t: &str) -> bool {
+        let t = t.trim();
+        matches!(
+            t,
+            "bool"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "s8"
+                | "s16"
+                | "s32"
+                | "s64"
+                | "f32"
+                | "f64"
+                | "char"
+                | "string"
+        )
+    }
+    fn is_prim_or_option_prim_text(t: &str) -> bool {
+        let t = t.trim();
+        if is_prim_text(t) {
+            return true;
+        }
+        if let Some(rest) = t.strip_prefix("option<") {
+            if let Some(inner) = rest.strip_suffix('>') {
+                return is_prim_text(inner.trim());
+            }
+        }
+        false
+    }
+    rec.fields
+        .iter()
+        .all(|(_, ft)| is_prim_or_option_prim_text(ft))
 }
 
 /// W2 (#542): classify the inner element of a `list<X>` param.
