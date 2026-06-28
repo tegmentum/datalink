@@ -811,17 +811,18 @@ pub fn emit_aggregate_finalize_body(
     let func = &shape.wit_func;
     let mut s = String::new();
 
-    // #607 Phase 1: Datafission target does NOT yet wire
-    // AccKind::Record aggregates (mobilitydb temporal-type
-    // aggregators). Emit a runtime-error stub so the dispatcher
-    // still compiles. Phase 2 of the aggregate-substrate plan
-    // adds the datafission finalize body.
-    if matches!(&shape.accumulator_kind, AccKind::Record { .. }) {
-        s.push_str(&format!(
-            "{i}return Err(ftypes::FunctionError::ExecutionError(\n\
-             {i}    format!(\"{sql_name}: AccKind::Record aggregate not yet wired for Datafission target (Phase 2 follow-up)\")));\n",
-        ));
-        return s;
+    // #607 Phase 2: AccKind::Record aggregates (mobilitydb
+    // temporal-type aggregators) carry per-row WTV-framed record
+    // payloads in `st.blobs` (the per-shape-arms WitValueRecord
+    // arm path encodes `ScalarValue::Binary` with the WTV magic
+    // prefix + 32-byte type-id + ciborium CBOR, and `accumulate`
+    // pushes those raw bytes verbatim into the accumulator state).
+    // Route to a dedicated emitter that decodes each blob via the
+    // per-record `arg_witvalue_<snake>` helper, runs the upstream
+    // aggregator, and frames the result back via the matching
+    // `ret_to_witvalue_<snake>` encoder.
+    if let AccKind::Record { .. } = &shape.accumulator_kind {
+        return emit_aggregate_finalize_body_record(shape, sql_name, arm_indent);
     }
 
     // Decode accumulated blobs into a typed Vec<Resource>; build
@@ -1020,6 +1021,75 @@ pub fn emit_aggregate_finalize_body(
 /// finalize encoder.
 pub fn aggregate_ret_logicaltype(shape: &AggregateShape) -> String {
     retshape_to_logicaltype(&shape.ret)
+}
+
+/// #607 Phase 2: Datafission-target aggregate finalize body for
+/// `AccKind::Record` — mobilitydb temporal-type aggregators.
+///
+/// Pattern (lazy decode per DD1):
+///   1. `st.blobs` holds the per-row WTV-framed wit-value bytes
+///      that `accumulate` collected via `ScalarValue::Binary`.
+///   2. For each blob, synthesise a one-element ScalarValue slice
+///      and call the existing per-record `arg_witvalue_<snake>`
+///      helper — that helper validates the magic + type-id and
+///      ciborium-decodes the CBOR payload straight into UPSTREAM.
+///   3. The upstream aggregator runs against the collected
+///      `&[UpstreamRecord]` slice.
+///   4. The `option<R>` result encodes back via the matching
+///      `ret_to_witvalue_<snake>` helper, which produces a
+///      `ScalarValue::Binary(framed_bytes)`.
+///
+/// Extras (config args passed at create-accumulator-with-configs
+/// time) are not supported on the AccKind::Record surface today —
+/// no known temporal-aggregate signature uses them. The body
+/// errors clearly if one materialises so the diagnostic is loud
+/// rather than emitting a half-wired body.
+fn emit_aggregate_finalize_body_record(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::Record { kebab_name, .. } = &shape.accumulator_kind else {
+        unreachable!("invariant: caller checks AccKind::Record");
+    };
+    let snake = kebab_name.replace('-', "_");
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "{i}let mut upstream_vec = Vec::with_capacity(st.blobs.len());\n\
+         {i}for b in &st.blobs {{\n\
+         {i}    // Slice trick: arg_witvalue_<snake> takes the standard\n\
+         {i}    // `&[ScalarValue]` / idx signature. Synthesise a\n\
+         {i}    // one-element slice so we can reuse the helper from\n\
+         {i}    // the aggregate finalize site. The helper validates\n\
+         {i}    // the WTV magic + type-id and ciborium-decodes the\n\
+         {i}    // CBOR payload into UPSTREAM.\n\
+         {i}    let __args = [ftypes::ScalarValue::Binary(b.clone())];\n\
+         {i}    upstream_vec.push(arg_witvalue_{snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}}}\n",
+    ));
+
+    // Phase 2 pilot doesn't support record-typed aggregates with
+    // extras — same posture as sqlite + duckdb. Surface clearly.
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}return Err(ftypes::FunctionError::ExecutionError(\n\
+             {i}    format!(\"{sql_name}: AccKind::Record aggregate with extra args not yet wired\")));\n",
+        ));
+        return s;
+    }
+
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}(&upstream_vec);\n\
+         {i}match __r {{\n\
+         {i}    Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
+         {i}    None => Ok(ftypes::ScalarValue::Null),\n\
+         {i}}}\n",
+    ));
+    s
 }
 
 // ─── UDTF (table function) dispatch ───

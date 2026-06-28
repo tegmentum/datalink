@@ -218,6 +218,11 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     // Only those records get per-record helpers emitted (otherwise
     // wit-bindgen's elision of unreferenced upstream types would
     // make the helpers fail to compile).
+    //
+    // #607 Phase 2: AccKind::Record aggregates also reference the
+    // per-record `arg_witvalue_<snake>` / `ret_to_witvalue_<snake>`
+    // helpers at the finalize site, so their accumulator kebab needs
+    // to be in the helper-emission set too.
     let mut referenced_records: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     for (entry, _f) in &scalar_entries {
@@ -229,6 +234,22 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
                 }
                 _ => {}
             }
+        }
+        match &entry.shape.ret {
+            interface_db::RetShape::WitValueRecord { kebab_name, .. }
+            | interface_db::RetShape::OptionWitValueRecord { kebab_name, .. }
+            | interface_db::RetShape::FirstWitValueRecord { kebab_name, .. } => {
+                referenced_records.insert(kebab_name.clone());
+            }
+            _ => {}
+        }
+    }
+    // #607 Phase 2: record-typed aggregate accumulator + return.
+    for entry in &aggregate_entries {
+        if let interface_db::AccKind::Record { kebab_name, .. } =
+            &entry.shape.accumulator_kind
+        {
+            referenced_records.insert(kebab_name.clone());
         }
         match &entry.shape.ret {
             interface_db::RetShape::WitValueRecord { kebab_name, .. }
