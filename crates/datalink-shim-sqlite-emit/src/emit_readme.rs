@@ -61,8 +61,7 @@ wac plug \
   --plug ~/git/postgis-wasm/postgis-composed.wasm \
   -o {primary}-sqlink-loadable.wasm \
   target/wasm32-wasip2/release/{crate_underscore}.wasm
-```
-"##,
+```"##,
             primary = primary,
             crate_underscore = crate_name.replace('-', "_"),
         )
