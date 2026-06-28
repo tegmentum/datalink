@@ -24,18 +24,19 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::name_match::{
-    aggregate_name_candidates, collect_package_aliases, collect_package_enums,
-    find_resource_method, find_same_interface_free_fn, find_wit_fn,
-    index_resource_interfaces, index_resource_methods, index_wit_fns,
-    index_wit_fns_nohyphen, resolve_function_aliases, sql_name_candidates,
-    table_fn_name_candidates, AGGREGATE_NAME_SUFFIXES, EnumWithPackage,
+    aggregate_name_candidates, candidates_sorted, collect_package_aliases,
+    collect_package_enums, find_resource_method, find_same_interface_free_fn,
+    find_wit_fn, index_resource_interfaces, index_resource_methods,
+    index_wit_fns, index_wit_fns_nohyphen, resolve_function_aliases,
+    sql_name_candidates, table_fn_name_candidates, AGGREGATE_NAME_SUFFIXES,
+    EnumWithPackage,
 };
 use crate::override_tables::{aggregate_override_for, override_for, tuple_pick_override_for};
 use crate::record_registry::RecordType;
 use crate::wit_parse::{
     self, WitEnumDecl, WitFunction, WitParam, WitRet, WitType, WitTypeAlias,
 };
-use shim_bridge_codegen_core::{BridgePlan, ScalarFn};
+use shim_bridge_codegen_core::{BridgePlan, ScalarFn, WindowFn};
 
 /// One dispatch arm the emitter will write into `lib.rs`.
 pub struct DispatchEntry {
@@ -2235,4 +2236,292 @@ pub fn build_full(
         }
     }
     Ok((entries, unwired))
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Window function substrate (#616 / PLAN-window-substrate.md).
+//
+// Window functions are a SEPARATE IR variant from aggregates (DD1):
+// the postgis-clustering family is structurally `list<X> -> list<Y>`
+// (whole-partition compute), not `list<X> -> single Y` (streaming
+// aggregate). Sharing `AggregateShape` would muddy `AccKind` and
+// blur the per-target dispatch shapes (sqlite buffer-and-peek,
+// duckdb per-frame slice, datafission whole-partition fan-out).
+//
+// Per DD2, the canonical model is whole-partition compute. The
+// sqlite-emit `value()` arm is an adapter (buffer-at-step, compute-
+// on-first-value, walk-cursor-on-subsequent-value, drop-at-finalize)
+// — frame range doesn't affect the precomputed labels.
+//
+// Pilot scope: the 4 postgis `st-cluster-*` upstream WIT functions
+// (clustering.wit). All share the `list<borrow<geometry>>, ...
+// -> list<Y>` shape; `Y` is one of `option<u32>`, `u32`, or
+// `geometry`.
+// ──────────────────────────────────────────────────────────────────
+
+/// One window-function dispatch arm. `sql_name` is the SQL-side
+/// name as the interface DB has it (canonical or alias); the
+/// emitter renders one match arm per entry.
+pub struct WindowEntry {
+    pub sql_name: String,
+    pub shape: WindowShape,
+}
+
+/// Whole-partition compute shape for one window function.
+///
+/// Mirrors the field layout of `AggregateShape` for the SHARED
+/// machinery (wit_module / wit_package / wit_func), but the
+/// per-row-decode + per-row-return semantics are window-specific:
+/// the input is the whole partition (rather than streaming rows
+/// folded into an accumulator) and the output is `list<Y>` with
+/// one entry per input row.
+#[derive(Debug, Clone)]
+pub struct WindowShape {
+    /// Rust binding alias for the owning WIT interface (e.g.
+    /// `pg_clust` for `postgis-clustering`). Resolved via
+    /// `interface_to_rust_alias`.
+    pub wit_module: String,
+    /// Owning WIT package (`postgis:wasm`).
+    pub wit_package: String,
+    /// Snake_case function name on the binding-module side
+    /// (e.g. `st_cluster_dbscan`).
+    pub wit_func: String,
+    /// Extra args after the streaming geometry list (constants,
+    /// in declaration order). For `st-cluster-dbscan(geoms, eps,
+    /// min-points)`: `[F64, U32]`. For `st-cluster-intersecting(
+    /// geoms)`: `[]`.
+    pub extra_args: Vec<ParamShape>,
+    /// Per-row output shape (the `Y` in `list<Y>`).
+    pub returns: WindowReturn,
+    /// Upstream-call fallibility: `true` when the WIT function
+    /// returns `result<list<Y>, error>` (postgis: always true).
+    pub fallible: bool,
+    /// OQ3 (locked): order-sensitive flag. Carried in the IR even
+    /// though the postgis cluster functions are order-insensitive,
+    /// so a future order-sensitive window function (MEOS `tcount`,
+    /// etc.) can opt in without IR churn.
+    pub order_sensitive: bool,
+}
+
+/// Per-row return shape for a window function. One classification
+/// per function, applied to every row's emitted value.
+///
+/// Pilot surface covers the 3 distinct return shapes in the postgis
+/// cluster family. Each maps to ONE emit-site recipe per target
+/// (sqlite SqlValue::Integer/Null/Blob, duckdb Duckvalue::*, df
+/// ScalarValue::*).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowReturn {
+    /// Per-row `option<u32>` — `st-cluster-dbscan` (cluster id or
+    /// NULL for noise points). NULL = SQL NULL.
+    OptionU32,
+    /// Per-row `u32` — `st-cluster-kmeans` (cluster id 0..k-1).
+    U32,
+    /// Per-row `geometry` blob — `st-cluster-intersecting`,
+    /// `st-cluster-within` (one GeometryCollection per cluster,
+    /// emitted as WKB). Sqlite/duckdb wrap as BLOB; datafission
+    /// wraps as `ScalarValue::Binary`.
+    GeomBlob,
+}
+
+/// Classify one upstream WIT function as a window-function shape.
+///
+/// Accepts the canonical `list<borrow<geometry>>` first param +
+/// trailing primitive constants, and one of three return shapes
+/// (`result<list<option<u32>>>`, `result<list<u32>>`,
+/// `result<list<geometry>>`). Other shapes are rejected with an
+/// informative error so the surface stays predictable.
+pub fn classify_window_shape(f: &WitFunction) -> Result<WindowShape, String> {
+    let alias = wit_parse::interface_to_rust_alias(&f.interface).ok_or_else(|| {
+        format!(
+            "window interface '{}' has no Rust-binding alias mapping",
+            f.interface
+        )
+    })?;
+    let wit_func = wit_parse::kebab_to_snake(&f.kebab_name);
+
+    // First param must be `list<borrow<geometry>>` — the partition
+    // input. DD2 locks whole-partition compute; sqlite-emit adapts.
+    let Some(first) = f.params.first() else {
+        return Err("window function has zero params".into());
+    };
+    if !matches!(first.ty, WitType::ListGeomBorrow) {
+        return Err(format!(
+            "window first param must be list<borrow<geometry>>; got {:?}",
+            first.ty,
+        ));
+    }
+
+    // Subsequent params are per-partition constants. The interface
+    // DB delivers them as positional SqlValue args at every row;
+    // the dispatcher unpacks the first-row args and ignores the
+    // rest (they're guaranteed constant across the partition).
+    let mut extra = Vec::with_capacity(f.params.len() - 1);
+    for (i, p) in f.params.iter().enumerate().skip(1) {
+        extra.push(window_extra_arg_shape(&p.ty).map_err(|why| {
+            format!("window extra param #{i}: {why}")
+        })?);
+    }
+
+    // Return must be `list<Y>` for one of the recognised `Y`.
+    // Codegen unwraps the `result<...>` engine-side and decodes
+    // the inner list.
+    let returns = match &f.ret.inner {
+        WitType::ListOptionU32 => WindowReturn::OptionU32,
+        WitType::ListGeomOwned => WindowReturn::GeomBlob,
+        WitType::List(inner) => match inner.as_ref() {
+            WitType::U32 => WindowReturn::U32,
+            other => {
+                return Err(format!(
+                    "window return must be list<option<u32>|u32|geometry>; got list<{:?}>",
+                    other,
+                ));
+            }
+        },
+        other => {
+            return Err(format!(
+                "window return must be list<option<u32>|u32|geometry>; got {:?}",
+                other,
+            ));
+        }
+    };
+
+    Ok(WindowShape {
+        wit_module: alias,
+        wit_package: f.package.clone(),
+        wit_func,
+        extra_args: extra,
+        returns,
+        fallible: f.ret.fallible,
+        // Postgis cluster functions are position-stable but not
+        // order-sensitive (clustering is order-invariant). Default
+        // false until a per-function override surfaces.
+        order_sensitive: false,
+    })
+}
+
+/// Per-row extra-arg classifier for window functions. A reduced
+/// subset of `classify_param` — windows take only primitive
+/// constants today (`f64`, `u32`, etc.). Reject anything fancier
+/// so a future complex-extras window function surfaces as a
+/// classifier error rather than silently misdecoding.
+fn window_extra_arg_shape(ty: &WitType) -> Result<ParamShape, String> {
+    Ok(match ty {
+        WitType::S32 => ParamShape::S32,
+        WitType::S64 => ParamShape::S64,
+        WitType::U32 => ParamShape::U32,
+        WitType::U64 => ParamShape::U64,
+        WitType::F64 => ParamShape::F64,
+        WitType::F32 => ParamShape::F64, // emit_arm uses arg_f64
+        WitType::Bool => ParamShape::Bool,
+        WitType::String => ParamShape::Text,
+        WitType::ListU8 => ParamShape::Blob,
+        other => {
+            return Err(format!(
+                "window extra args must be primitives; got {:?}",
+                other,
+            ));
+        }
+    })
+}
+
+/// Build the per-extension window-function dispatch registry. For
+/// each `BridgePlan::extensions[*].window_functions[*]` row, find
+/// the matching upstream WIT function (postgis-clustering interface
+/// for the pilot), classify it, and emit per-canonical + per-alias
+/// `WindowEntry`s the emit crates can iterate.
+///
+/// Suffix-strip rules (`win`/`_win`) mirror the postgis convention:
+/// `st_clusterintersectingwin` → match `st-cluster-intersecting`
+/// against the upstream WIT. 3 of 4 functions ALSO have an
+/// aggregate-side entry under the un-suffixed name (DD3 / OQ5);
+/// they share upstream entries cleanly because both registrations
+/// route through the same upstream function.
+pub fn build_window_registry(
+    plan: &BridgePlan,
+    wit_deps_dir: &Path,
+) -> Result<(Vec<WindowEntry>, Vec<UnwiredScalar>)> {
+    let wit_fns = wit_parse::parse_dir(wit_deps_dir)?;
+    let aliases = collect_package_aliases(wit_deps_dir);
+    let wit_fns = resolve_function_aliases(wit_fns, &aliases);
+
+    // Build a snake-name index over every upstream free function
+    // (skips resource methods + non-constructors — matches the
+    // scalar lookup convention).
+    let wit_index = index_wit_fns(&wit_fns);
+    let wit_nohyphen = index_wit_fns_nohyphen(&wit_fns);
+
+    let mut entries = Vec::new();
+    let mut unwired = Vec::new();
+    for ext in &plan.extensions {
+        for w in &ext.window_functions {
+            let candidates = window_name_candidates(w);
+            let matched = find_wit_fn(&candidates, &wit_index, &wit_nohyphen);
+            let Some(f) = matched else {
+                unwired.push(UnwiredScalar {
+                    sql_name: w.canonical_name.clone(),
+                    reason: format!(
+                        "no WIT function matches any of {:?} for window",
+                        candidates
+                    ),
+                });
+                continue;
+            };
+            match classify_window_shape(f) {
+                Ok(shape) => {
+                    entries.push(WindowEntry {
+                        sql_name: w.canonical_name.clone(),
+                        shape: shape.clone(),
+                    });
+                    for alias in &w.aliases {
+                        entries.push(WindowEntry {
+                            sql_name: alias.clone(),
+                            shape: shape.clone(),
+                        });
+                    }
+                }
+                Err(reason) => unwired.push(UnwiredScalar {
+                    sql_name: w.canonical_name.clone(),
+                    reason,
+                }),
+            }
+        }
+    }
+    Ok((entries, unwired))
+}
+
+/// Generate the candidate name list for a SQL window function.
+/// Adds the postgis `_win` / `win` suffix-strip variants AFTER the
+/// canonical + aliases so the upstream `st-cluster-intersecting` is
+/// reached from SQL `st_clusterintersectingwin`. The base helper
+/// reuses the scalar/aggregate candidate sort by Levenshtein.
+fn window_name_candidates(w: &WindowFn) -> Vec<String> {
+    let mut v = candidates_sorted(&w.canonical_name, &w.aliases);
+    // Suffix-strip rules: postgis SQL convention suffixes the WIN
+    // form (`st_clusterintersectingwin`); the WIT has the bare
+    // form (`st-cluster-intersecting`). Try every existing
+    // candidate with `win` / `_win` stripped.
+    let mut extra: Vec<String> = Vec::new();
+    for cand in &v {
+        if let Some(bare) = cand.strip_suffix("_win") {
+            extra.push(bare.to_string());
+        }
+        if let Some(bare) = cand.strip_suffix("win") {
+            // Only strip bare `win` if the result is a non-empty,
+            // identifier-shaped name (avoid mangling `win`-only or
+            // `awin`-style false positives).
+            if !bare.is_empty() && bare.ends_with(|c: char| c.is_ascii_alphanumeric()) {
+                extra.push(bare.to_string());
+            }
+        }
+    }
+    // Dedupe while preserving order (canonical first).
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for s in v.drain(..).chain(extra.into_iter()) {
+        if seen.insert(s.clone()) {
+            out.push(s);
+        }
+    }
+    out
 }
