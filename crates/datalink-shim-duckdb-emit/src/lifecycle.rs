@@ -25,7 +25,18 @@ use shim_bridge_codegen_core::BridgePlan;
 /// PascalCase struct name the bridge crate exports (e.g.
 /// `PostgisBridge`); `primary` is the SQL-side extension name
 /// (e.g. `postgis`); `version` is the extension version string.
-pub fn render(bridge_struct: &str, plan: &BridgePlan) -> String {
+///
+/// `has_aggregates` / `has_tables` gate the `register_aggregates()` /
+/// `register_tables()` calls so an empty surface (no IR entries)
+/// doesn't drag in a registry-fetch that the host might not
+/// expose. The emit always emits the body functions; lifecycle::
+/// load is what decides whether to call them.
+pub fn render(
+    bridge_struct: &str,
+    plan: &BridgePlan,
+    has_aggregates: bool,
+    has_tables: bool,
+) -> String {
     let primary = plan
         .extensions
         .first()
@@ -36,12 +47,22 @@ pub fn render(bridge_struct: &str, plan: &BridgePlan) -> String {
         .first()
         .map(|e| e.version.as_str())
         .unwrap_or("0.1.0");
+    let aggregate_call = if has_aggregates {
+        "        register_aggregates()?;\n"
+    } else {
+        ""
+    };
+    let table_call = if has_tables {
+        "        register_tables()?;\n"
+    } else {
+        ""
+    };
     format!(
         r##"
 impl guest::Guest for {bridge_struct} {{
     fn load() -> Result<types::Loadresult, types::Duckerror> {{
         register_scalars()?;
-        Ok(types::Loadresult {{
+{aggregate_call}{table_call}        Ok(types::Loadresult {{
             name: "{primary}".into(),
             version: Some("{version}".into()),
             requires: Vec::new().into(),

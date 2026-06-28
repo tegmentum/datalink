@@ -49,7 +49,9 @@
 //!     `ExecutionError`.
 
 use datalink_shim_codegen_core::interface_db::{
-    DispatchShape, JsonRetKind, ListPrimElem, ParamShape, RetShape,
+    AccKind, AggregateShape, ColumnAffinity, DispatchShape, JsonRetKind,
+    ListPrimElem, ParamShape, RetShape, UdtfFieldShape, UdtfOutputRow,
+    UdtfShape,
 };
 
 /// Emit the body of one match arm of the scalar dispatch by name
@@ -754,4 +756,547 @@ pub fn list_tuple_sig_suffix(elements: &[ListPrimElem]) -> String {
         .map(|e| e.helper_suffix())
         .collect::<Vec<_>>()
         .join("_")
+}
+
+// ─── Aggregate finalize dispatch ───
+//
+// Datafission's `aggregate_function_registry@1.0.0` contract is
+// handle-based, with a per-handle accumulator state on the guest
+// side:
+//
+//   create-accumulator(name)               -> u64                (init)
+//   accumulate(handle, value: scalar-value) -> ()                (per-row)
+//   merge(target, source)                  -> ()                 (combine)
+//   finalize(handle)                       -> scalar-value       (emit)
+//   reset(handle), destroy-accumulator(handle)
+//
+// The bridge maintains a global `BTreeMap<u64, AccState>` where
+// `AccState { arm_idx, blobs, extras }` carries the accumulator
+// arm-index, the streaming blobs collected via `accumulate`, and
+// any constant configs passed at `create-accumulator-with-configs`
+// time. `finalize` then dispatches by arm-index to the per-arm
+// body emitted here.
+//
+// Unlike the SQLite per-row step (which holds raw blobs in a
+// thread_local map keyed by context-id) the Datafission shape
+// holds them in the accumulator struct directly — handles are the
+// host's identity for the group.
+//
+// The per-arm body returned here is what goes inside the
+// `<arm_idx>usize => { ... }` finalize match. It expects bindings
+// `st: AccState` in scope (the popped accumulator).
+pub fn emit_aggregate_finalize_body(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let mut s = String::new();
+
+    // Decode accumulated blobs into a typed Vec<Resource>; build
+    // refs slice for the upstream call.
+    match shape.accumulator_kind {
+        AccKind::Geom => {
+            s.push_str(&format!(
+                "{i}let geoms: Vec<Geometry> = st.blobs.iter()\n\
+                 {i}    .map(|b| Geometry::from_wkb(b))\n\
+                 {i}    .collect::<Result<Vec<_>, _>>()\n\
+                 {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}let refs: Vec<&Geometry> = geoms.iter().collect();\n",
+            ));
+        }
+        AccKind::Raster => {
+            // from_raster_binary returns Result<Raster, FunctionError>;
+            // it already wraps the error so we propagate with `?`.
+            s.push_str(&format!(
+                "{i}let rasters: Vec<Raster> = st.blobs.iter()\n\
+                 {i}    .map(|b| from_raster_binary(b.as_slice(), \"{sql_name}\"))\n\
+                 {i}    .collect::<Result<Vec<_>, _>>()?;\n\
+                 {i}let refs: Vec<&Raster> = rasters.iter().collect();\n",
+            ));
+        }
+    }
+
+    // Marshal extras (configs passed at create-accumulator-with-
+    // configs time) into Rust-typed bindings. Each config is a
+    // JSON-encoded string; the host JSON-encodes constant arg slots
+    // when calling the constructor.
+    let mut call_extras: Vec<String> = Vec::new();
+    if !shape.extra_args.is_empty() {
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            let getc = format!(
+                "{i}let extra{j}_str = st.extras.get({j})\n\
+                 {i}    .ok_or_else(|| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: missing config arg #{j}\")))?;\n",
+            );
+            match p {
+                ParamShape::Text => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: &str = extra{j}_str.as_str();\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::F64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: f64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S32 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: i32 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: i64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U32 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: u32 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: u64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Bool => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: bool = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::OptionNone => {
+                    call_extras.push("None".to_string());
+                }
+                ParamShape::Blob
+                | ParamShape::Geom
+                | ParamShape::Geog
+                | ParamShape::Raster
+                | ParamShape::Topology
+                | ParamShape::ListGeom
+                | ParamShape::WitValueRecord { .. }
+                | ParamShape::Enum { .. }
+                | ParamShape::ListPrim(_)
+                | ParamShape::ListRecord { .. }
+                | ParamShape::ListTuple { .. } => {
+                    return format!(
+                        "{i}Err(ftypes::FunctionError::ExecutionError(\
+                         format!(\"{sql_name}: aggregate config arg #{j} shape not wired\")))",
+                    );
+                }
+            }
+        }
+    }
+
+    let call_args = if call_extras.is_empty() {
+        "&refs".to_string()
+    } else {
+        format!("&refs, {}", call_extras.join(", "))
+    };
+
+    match shape.ret {
+        RetShape::GeomBlob => {
+            s.push_str(&format!(
+                "{i}let r = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}Ok(ftypes::ScalarValue::Binary(r.as_wkb()))",
+            ));
+        }
+        RetShape::RasterBlob => {
+            s.push_str(&format!(
+                "{i}let r = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", shim_err_string(e))))?;\n\
+                 {i}Ok(ftypes::ScalarValue::Binary(r.as_binary()))",
+            ));
+        }
+        RetShape::FirstGeomBlob => {
+            s.push_str(&format!(
+                "{i}let r: Vec<Geometry> = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}match r.first() {{\n\
+                 {i}    Some(g) => Ok(ftypes::ScalarValue::Binary(g.as_wkb())),\n\
+                 {i}    None => Ok(ftypes::ScalarValue::Null),\n\
+                 {i}}}",
+            ));
+        }
+        RetShape::FirstOptionU32Int => {
+            s.push_str(&format!(
+                "{i}let r: Vec<Option<u32>> = {module}::{func}({call_args})\n\
+                 {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?;\n\
+                 {i}match r.first() {{\n\
+                 {i}    Some(Some(v)) => Ok(ftypes::ScalarValue::Int64(*v as i64)),\n\
+                 {i}    Some(None) | None => Ok(ftypes::ScalarValue::Null),\n\
+                 {i}}}",
+            ));
+        }
+        _ => {
+            s.push_str(&format!(
+                "{i}Err(ftypes::FunctionError::ExecutionError(\
+                 format!(\"{sql_name}: aggregate return shape not wired\")))",
+            ));
+        }
+    }
+    s
+}
+
+/// Map an `AggregateShape` ret to the LogicalType the
+/// `return_type` method should advertise. Same FROZEN logical-set
+/// rules as scalar `retshape_to_logicaltype`. Mirrors the per-arm
+/// finalize encoder.
+pub fn aggregate_ret_logicaltype(shape: &AggregateShape) -> String {
+    retshape_to_logicaltype(&shape.ret)
+}
+
+// ─── UDTF (table function) dispatch ───
+//
+// Datafission's `table_function_registry@1.0.0` contract is
+// iterator-based:
+//
+//   begin(name, args)               -> u64               (open)
+//   next-row(handle)                -> option<result<row>> (one row)
+//   end(handle)                     -> ()                (close)
+//
+// On `begin` the bridge marshals the args, calls the upstream WIT
+// function ONCE, materialises the rows into `Vec<Vec<scalar-value>>`,
+// stores them in a per-handle state, and returns the handle. Each
+// `next_row` call peels one row off the head; `end` drops the
+// state. This trades streaming for simplicity — the postgis +
+// mobilitydb UDTF surface returns bounded rowsets (typically <
+// 1K rows per call) so eager materialisation is acceptable.
+//
+// Returned body goes inside `"sql_name" => { ... }` in `begin`.
+// Expects the bridge prelude to have a `UDTF_STATE` thread-local
+// + an `alloc_udtf_handle()` allocator (both emitted by the
+// UDTF_STATE_BLOCK prelude).
+pub fn emit_udtf_begin_body(
+    shape: &UdtfShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let mut s = String::new();
+
+    // Same early-bail as duckdb-emit: a mid-body `return Err(...)`
+    // from emit_udtf_param_marshal_df would still leave the
+    // upstream call site with the wrong arg count under rustc's
+    // unreachable-code type-check. Detect unsupported list shapes
+    // up front and emit only the error return.
+    if let Some((idx, shape_name)) = shape.params.iter().enumerate().find_map(|(idx, p)| {
+        match p {
+            ParamShape::ListGeom => Some((idx, "list<geometry>")),
+            ParamShape::ListRecord { .. } => Some((idx, "list<record>")),
+            ParamShape::ListTuple { .. } => Some((idx, "list<tuple>")),
+            ParamShape::ListPrim(_) => Some((idx, "list<primitive>")),
+            ParamShape::Enum { .. } => Some((idx, "enum")),
+            _ => None,
+        }
+    }) {
+        return format!(
+            "{i}Err(ftypes::FunctionError::ExecutionError(format!(\
+             \"{sql_name}: UDTF param #{idx} ({shape_name}) not wired\")))",
+        );
+    }
+
+    let (decls, call_args) =
+        emit_udtf_param_marshal_df(&shape.params, sql_name, i);
+    s.push_str(&decls);
+    let call_args_str = call_args.join(", ");
+
+    let unwrap = if shape.fallible {
+        format!(
+            ".map_err(|e| ftypes::FunctionError::ExecutionError(format!(\"{sql_name}: {{}}\", shim_err_string(e))))?"
+        )
+    } else {
+        String::new()
+    };
+    s.push_str(&format!(
+        "{i}let __upstream = {module}::{func}({call_args_str}){unwrap};\n",
+    ));
+
+    match &shape.output_row {
+        UdtfOutputRow::SingleGeom => {
+            s.push_str(&format!(
+                "{i}let mut rows: Vec<Vec<ftypes::ScalarValue>> = Vec::with_capacity(__upstream.len());\n\
+                 {i}for __g in __upstream.iter() {{\n\
+                 {i}    rows.push(alloc::vec![ftypes::ScalarValue::Binary(__g.as_wkb())]);\n\
+                 {i}}}\n\
+                 {i}Ok(alloc_udtf_handle(rows))",
+            ));
+        }
+        UdtfOutputRow::SinglePrimitive { affinity } => {
+            let (variant, expr) = match affinity {
+                ColumnAffinity::Integer => ("Int64", "*__v as i64"),
+                ColumnAffinity::Real => ("Float64", "*__v as f64"),
+                ColumnAffinity::Text => ("Utf8", "__v.clone()"),
+                ColumnAffinity::Blob => ("Binary", "__v.clone()"),
+            };
+            s.push_str(&format!(
+                "{i}let mut rows: Vec<Vec<ftypes::ScalarValue>> = Vec::with_capacity(__upstream.len());\n\
+                 {i}for __v in __upstream.iter() {{\n\
+                 {i}    rows.push(alloc::vec![ftypes::ScalarValue::{variant}({expr})]);\n\
+                 {i}}}\n\
+                 {i}Ok(alloc_udtf_handle(rows))",
+            ));
+        }
+        UdtfOutputRow::Record { fields } => {
+            let mut row_exprs: Vec<String> = Vec::new();
+            for f in fields {
+                let snake = f.name.replace('-', "_");
+                let expr = match f.field_shape {
+                    UdtfFieldShape::Int => format!(
+                        "ftypes::ScalarValue::Int64(__row.{snake} as i64)"
+                    ),
+                    UdtfFieldShape::Real => format!(
+                        "ftypes::ScalarValue::Float64(__row.{snake} as f64)"
+                    ),
+                    UdtfFieldShape::Text => format!(
+                        "ftypes::ScalarValue::Utf8(__row.{snake}.clone())"
+                    ),
+                    UdtfFieldShape::Blob => format!(
+                        "ftypes::ScalarValue::Binary(__row.{snake}.clone())"
+                    ),
+                    UdtfFieldShape::GeomBlob => format!(
+                        "ftypes::ScalarValue::Binary(__row.{snake}.as_wkb())"
+                    ),
+                    UdtfFieldShape::OptionInt => format!(
+                        "match __row.{snake} {{ Some(v) => ftypes::ScalarValue::Int64(v as i64), None => ftypes::ScalarValue::Null }}"
+                    ),
+                    UdtfFieldShape::OptionReal => format!(
+                        "match __row.{snake} {{ Some(v) => ftypes::ScalarValue::Float64(v as f64), None => ftypes::ScalarValue::Null }}"
+                    ),
+                    UdtfFieldShape::OptionText => format!(
+                        "match &__row.{snake} {{ Some(v) => ftypes::ScalarValue::Utf8(v.clone()), None => ftypes::ScalarValue::Null }}"
+                    ),
+                    UdtfFieldShape::OptionBlob => format!(
+                        "match &__row.{snake} {{ Some(v) => ftypes::ScalarValue::Binary(v.clone()), None => ftypes::ScalarValue::Null }}"
+                    ),
+                    UdtfFieldShape::OptionGeomBlob => format!(
+                        "match &__row.{snake} {{ Some(v) => ftypes::ScalarValue::Binary(v.as_wkb()), None => ftypes::ScalarValue::Null }}"
+                    ),
+                    UdtfFieldShape::Unsupported => {
+                        "ftypes::ScalarValue::Null".to_string()
+                    }
+                };
+                row_exprs.push(expr);
+            }
+            let row_block = row_exprs.join(", ");
+            s.push_str(&format!(
+                "{i}let mut rows: Vec<Vec<ftypes::ScalarValue>> = Vec::with_capacity(__upstream.len());\n\
+                 {i}for __row in __upstream.into_iter() {{\n\
+                 {i}    rows.push(alloc::vec![{row_block}]);\n\
+                 {i}}}\n\
+                 {i}Ok(alloc_udtf_handle(rows))",
+            ));
+        }
+        UdtfOutputRow::Unwired { reason } => {
+            let r = reason.replace('"', "\\\"");
+            s.push_str(&format!(
+                "{i}Err(ftypes::FunctionError::ExecutionError(format!(\"{sql_name}: UDTF row shape unwired: {r}\")))",
+            ));
+        }
+    }
+    s
+}
+
+/// Emit per-UDTF column_info entries for `output_schema(name)`.
+/// Returns the inner list literal (no surrounding `vec![...]`).
+pub fn emit_udtf_column_info(shape: &UdtfShape) -> String {
+    let mut s = String::new();
+    let single_geom_col_name = match &shape.output_row {
+        UdtfOutputRow::SingleGeom => {
+            datalink_shim_codegen_core::interface_db
+                ::single_geom_column_name_for("geom")
+        }
+        _ => "value",
+    };
+    match &shape.output_row {
+        UdtfOutputRow::SingleGeom => {
+            s.push_str(&format!(
+                "ftypes::ColumnInfo {{ name: \"{single_geom_col_name}\".into(), ty: ftypes::LogicalType::Binary }},",
+            ));
+        }
+        UdtfOutputRow::SinglePrimitive { affinity } => {
+            let logical = match affinity {
+                ColumnAffinity::Integer => "ftypes::LogicalType::Int64",
+                ColumnAffinity::Real => "ftypes::LogicalType::Float64",
+                ColumnAffinity::Text => "ftypes::LogicalType::Utf8",
+                ColumnAffinity::Blob => "ftypes::LogicalType::Binary",
+            };
+            s.push_str(&format!(
+                "ftypes::ColumnInfo {{ name: \"value\".into(), ty: {logical} }},",
+            ));
+        }
+        UdtfOutputRow::Record { fields } => {
+            for f in fields {
+                let logical = match f.field_shape {
+                    UdtfFieldShape::Int | UdtfFieldShape::OptionInt => {
+                        "ftypes::LogicalType::Int64"
+                    }
+                    UdtfFieldShape::Real | UdtfFieldShape::OptionReal => {
+                        "ftypes::LogicalType::Float64"
+                    }
+                    UdtfFieldShape::Text | UdtfFieldShape::OptionText => {
+                        "ftypes::LogicalType::Utf8"
+                    }
+                    UdtfFieldShape::Blob
+                    | UdtfFieldShape::OptionBlob
+                    | UdtfFieldShape::GeomBlob
+                    | UdtfFieldShape::OptionGeomBlob
+                    | UdtfFieldShape::Unsupported => "ftypes::LogicalType::Binary",
+                };
+                let col_name = f.name.replace('"', "\\\"");
+                s.push_str(&format!(
+                    "ftypes::ColumnInfo {{ name: \"{col_name}\".into(), ty: {logical} }},",
+                ));
+            }
+        }
+        UdtfOutputRow::Unwired { .. } => {
+            s.push_str(
+                "ftypes::ColumnInfo { name: \"value\".into(), ty: ftypes::LogicalType::Binary },",
+            );
+        }
+    }
+    s
+}
+
+/// UDTF param marshalling — datafission flavour.
+fn emit_udtf_param_marshal_df(
+    params: &[ParamShape],
+    sql_name: &str,
+    i: &str,
+) -> (String, Vec<String>) {
+    let mut s = String::new();
+    let mut call_args: Vec<String> = Vec::with_capacity(params.len());
+
+    for (idx, p) in params.iter().enumerate() {
+        match p {
+            ParamShape::Text => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dfv_text(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::F64 => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dfv_f64(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::S32 => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dfv_i64(&args, {idx}, \"{sql_name}\")? as i32;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::S64 => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dfv_i64(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::U32 => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dfv_i64(&args, {idx}, \"{sql_name}\")? as u32;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::U64 => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dfv_i64(&args, {idx}, \"{sql_name}\")? as u64;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::Bool => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dfv_bool(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::Blob => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = dfv_blob(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("arg{idx}"));
+            }
+            ParamShape::Geom => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = from_wkb(dfv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Geog => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = geog_from_wkb(dfv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Raster => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = from_raster_binary(dfv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Topology => {
+                s.push_str(&format!(
+                    "{i}let arg{idx} = from_topology_bytes(dfv_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::OptionNone => {
+                call_args.push("None".to_string());
+            }
+            ParamShape::WitValueRecord { kebab_name, .. } => {
+                let snake = kebab_name.replace('-', "_");
+                s.push_str(&format!(
+                    "{i}let arg{idx} = arg_witvalue_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::Enum { .. }
+            | ParamShape::ListGeom
+            | ParamShape::ListRecord { .. }
+            | ParamShape::ListTuple { .. }
+            | ParamShape::ListPrim(_) => {
+                s.push_str(&format!(
+                    "{i}return Err(ftypes::FunctionError::ExecutionError(format!(\"{sql_name}: UDTF param shape not wired\")));\n",
+                ));
+            }
+        }
+    }
+    (s, call_args)
 }
