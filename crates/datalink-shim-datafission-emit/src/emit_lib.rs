@@ -630,12 +630,19 @@ use bindings::datafission::function_plugin::types as types;
         s.push_str(&build_table_registry_impl(&udtf_entries));
     }
 
-    // ---- multi-custom-type: stub ----
+    // ---- multi-custom-type: WIRED ----
     // Note: the single-type `type-plugin/custom-type` interface is
     // intentionally NOT exported by the generated world (see
     // `emit_wit::render_world`). Components register types through
     // `multi-custom-type` instead.
-    s.push_str(MULTI_CUSTOM_TYPE_STUB);
+    //
+    // #618: `list_types()` advertises one `CustomTypeMeta` per
+    // record in the primary-shim record_registry — every wit-value
+    // record the bridge knows about. The per-call ops
+    // (serialize/deserialize/compare/hash/display/parse) stay as
+    // stubs in this cut; they'll be wired in follow-ups once the
+    // canonical-CBOR round-trip on the multi-type path lands.
+    s.push_str(&build_multi_custom_type_impl(&records));
 
     // ---- spatial-index: stub ----
     s.push_str(&format!(
@@ -1575,31 +1582,85 @@ const TABLE_STUB: &str = r##"impl table_function_registry::Guest for Component {
 
 "##;
 
-const MULTI_CUSTOM_TYPE_STUB: &str = r##"impl multi_custom_type::Guest for Component {
-    fn list_types() -> Vec<multi_custom_type::CustomTypeMeta> {
-        Vec::new()
-    }
-    fn serialize(_type_id: u32, value: Vec<u8>) -> Vec<u8> { value }
-    fn deserialize(type_id: u32, _bytes: Vec<u8>) -> Result<Vec<u8>, ttypes::TypeError> {
-        Err(ttypes::TypeError::Internal(format!(
-            "no custom type at id {type_id} (multi-custom-type not wired in scalar-first cut)"
-        )))
-    }
-    fn compare(_type_id: u32, _a: Vec<u8>, _b: Vec<u8>) -> ttypes::Ordering {
-        ttypes::Ordering::Equal
-    }
-    fn hash_value(_type_id: u32, _value: Vec<u8>) -> u64 { 0 }
-    fn display(type_id: u32, _value: Vec<u8>) -> String {
-        format!("<type {type_id} (stub)>")
-    }
-    fn parse(type_id: u32, _input: String) -> Result<Vec<u8>, ttypes::TypeError> {
-        Err(ttypes::TypeError::Internal(format!(
-            "no custom type at id {type_id} (multi-custom-type not wired in scalar-first cut)"
-        )))
-    }
+/// Map a record's 32-byte canonical type_id (sha256) into the u32
+/// space the datafission `multi-custom-type` contract uses, with
+/// the host-side guard that type-id >= 1000 (built-in DuckDB-style
+/// types occupy [0, 1000)). The mapping is deterministic across
+/// regens so the same record gets the same advertised id every
+/// time.
+fn record_type_id_u32(type_id: &[u8; 32]) -> u32 {
+    let raw = u32::from_be_bytes([type_id[0], type_id[1], type_id[2], type_id[3]]);
+    1000u32.saturating_add(raw % (u32::MAX - 1000))
 }
 
-"##;
+/// #618: build the `multi_custom_type::Guest for Component` impl
+/// block with REAL advertisements from the record registry.
+///
+/// `list_types()` returns one `CustomTypeMeta` per record the
+/// bridge knows about (the same set already used to emit per-record
+/// `arg_witvalue_<snake>` / `ret_to_witvalue_<snake>` codecs). Each
+/// entry carries:
+///
+///   - `type_name`: the canonical symbolic name
+///     (`<package>@<version>/<interface>/<record>`) — fully
+///     qualified so two shims advertising similarly-named records
+///     can coexist in the same database without aliasing.
+///   - `type_id`: derived from the first 4 bytes of the record's
+///     canonical-WIT 32-byte sha256 type_id, mapped into
+///     [1000, u32::MAX] (the host requires type_id >= 1000).
+///   - `storage_size`: -1 (all wit-value records are
+///     variable-length under canonical-CBOR framing).
+///   - `cast_from` / `cast_to`: empty — custom types ride the WTV
+///     magic-prefix Binary envelope, not implicit built-in casts.
+///
+/// The per-call ops (serialize / deserialize / compare /
+/// hash_value / display / parse) stay as stubs — they no-op or
+/// return an Internal error tagged with the type_id. Wiring those
+/// against the bridge's serde-ops codecs is a follow-up task.
+fn build_multi_custom_type_impl(records: &[RecordType]) -> String {
+    let mut metas_block = String::new();
+    for r in records {
+        let type_id_u32 = record_type_id_u32(&r.type_id);
+        let escaped_name = r.symbolic_name.replace('"', "\\\"");
+        metas_block.push_str(&format!(
+            "        multi_custom_type::CustomTypeMeta {{\n\
+             \x20           type_name: \"{escaped_name}\".to_string(),\n\
+             \x20           type_id: {type_id_u32}u32,\n\
+             \x20           storage_size: -1,\n\
+             \x20           cast_from: Vec::new(),\n\
+             \x20           cast_to: Vec::new(),\n\
+             \x20       }},\n",
+        ));
+    }
+    format!(
+        r##"impl multi_custom_type::Guest for Component {{
+    fn list_types() -> Vec<multi_custom_type::CustomTypeMeta> {{
+        vec![
+{metas_block}        ]
+    }}
+    fn serialize(_type_id: u32, value: Vec<u8>) -> Vec<u8> {{ value }}
+    fn deserialize(type_id: u32, _bytes: Vec<u8>) -> Result<Vec<u8>, ttypes::TypeError> {{
+        Err(ttypes::TypeError::Internal(format!(
+            "no per-call codec wired for custom type id {{type_id}} (advertisement-only cut)"
+        )))
+    }}
+    fn compare(_type_id: u32, _a: Vec<u8>, _b: Vec<u8>) -> ttypes::Ordering {{
+        ttypes::Ordering::Equal
+    }}
+    fn hash_value(_type_id: u32, _value: Vec<u8>) -> u64 {{ 0 }}
+    fn display(type_id: u32, _value: Vec<u8>) -> String {{
+        format!("<type {{type_id}} (stub)>")
+    }}
+    fn parse(type_id: u32, _input: String) -> Result<Vec<u8>, ttypes::TypeError> {{
+        Err(ttypes::TypeError::Internal(format!(
+            "no per-call codec wired for custom type id {{type_id}} (advertisement-only cut)"
+        )))
+    }}
+}}
+
+"##,
+    )
+}
 
 /// Discover which subdir of `wit_deps_root` holds the primary
 /// shim's upstream WIT package. Same heuristic as sqlite-emit /
