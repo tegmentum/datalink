@@ -667,17 +667,20 @@ pub fn emit_aggregate_arm_body(
     let func = &shape.wit_func;
     let mut s = String::new();
 
-    // #607 Phase 1: DuckDB target does NOT yet wire AccKind::Record
-    // aggregates (mobilitydb temporal-type aggregators). Emit a
-    // runtime-error stub so the dispatcher still compiles and the
-    // unwired-symbol diagnostic surfaces clearly. Phase 2 of the
-    // aggregate-substrate plan adds the duckdb finalize body.
+    // #607 Phase 2 + #612 (OQ1): AccKind::Record aggregates
+    // (mobilitydb temporal-type aggregators) route to a dedicated
+    // emitter. DuckDB's whole-group fold ABI delivers every row in
+    // one `call_aggregate` invocation — no accumulator state across
+    // calls — so the body decodes column 0 of each row via the
+    // per-input-record `arg_witvalue_<snake>` helper, runs the
+    // upstream aggregator against the collected `&[Upstream]` slice,
+    // and encodes the `Option<R>` result back via the matching
+    // per-output-record `ret_to_witvalue_<snake>` encoder. For
+    // same-record aggregates `input.kebab_name == output.kebab_name`;
+    // for different-record cases (#612: e.g. `tgeompoint-st-extent`
+    // returns `option<stbox>`) the two snakes diverge.
     if matches!(&shape.accumulator_kind, AccKind::Record { .. }) {
-        s.push_str(&format!(
-            "{i}return Err(types::Duckerror::Invalidargument(\n\
-             {i}    format!(\"{sql_name}: AccKind::Record aggregate not yet wired for DuckDB target (Phase 2 follow-up)\")));\n",
-        ));
-        return s;
+        return emit_aggregate_arm_body_record(shape, sql_name, arm_indent);
     }
 
     // Accumulator iteration: walk `rows`, skip rows whose
@@ -763,7 +766,7 @@ pub fn emit_aggregate_arm_body(
                  {i}let refs: Vec<&{resource_ty}> = resources.iter().collect();\n",
             ));
         }
-        AccKind::Record { .. } => unreachable!("handled by Phase 2 stub above"),
+        AccKind::Record { .. } => unreachable!("handled by emit_aggregate_arm_body_record above"),
     }
 
     // Marshal extras (constant across rows) into Rust-typed
@@ -919,6 +922,90 @@ pub fn emit_aggregate_arm_body(
             ));
         }
     }
+    s
+}
+
+/// #607 Phase 2 + #612 (OQ1): DuckDB-target aggregate body for
+/// `AccKind::Record` — mobilitydb temporal-type aggregators.
+///
+/// DuckDB's `call_aggregate` ABI hands the guest the entire group
+/// as `rows: rowbatch` in a single invocation (no init/step/finalize
+/// round-trip; no accumulator state across calls). The body:
+///
+///   1. Walks `rows`, skipping NULL/empty entries. Each non-null
+///      row's column 0 carries a `Duckvalue::Complex { type_expr,
+///      json }` wit-value carrier; the existing per-input-record
+///      `arg_witvalue_<in_snake>` helper unwraps the carrier and
+///      `serde_json::from_str::<UPSTREAM>(&cmplx.json)` decodes the
+///      payload straight into the upstream record.
+///
+///   2. Calls the upstream aggregator with `&upstream_vec` — wit-
+///      bindgen lowers `list<R>` as `&[R]` so the slice coerces
+///      cleanly.
+///
+///   3. Encodes the `Option<R>` result back via the matching
+///      per-output-record `ret_to_witvalue_<out_snake>` helper.
+///      `None` returns `Duckvalue::Null` (PostgreSQL aggregate
+///      semantics over all-NULL groups).
+///
+/// Same-record aggregates have `input.kebab_name ==
+/// output.kebab_name` so the two snakes match; for the OQ1
+/// different-record case (e.g. `tgeompoint-st-extent` returns
+/// `option<stbox>` from `list<tgeompoint-sequence>`) the snakes
+/// diverge — `collect_referenced_records` must walk both kebabs so
+/// both codec sites are emitted.
+///
+/// Extras (constant args beyond the streaming list) are not
+/// supported on the AccKind::Record surface today — no known
+/// mobilitydb temporal-aggregate signature uses them. The body
+/// errors clearly if one materialises rather than emitting a half-
+/// wired body the compiler still accepts.
+fn emit_aggregate_arm_body_record(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::Record { input, output } = &shape.accumulator_kind else {
+        unreachable!("invariant: caller checks AccKind::Record");
+    };
+    let in_snake = input.kebab_name.replace('-', "_");
+    let out_snake = output.kebab_name.replace('-', "_");
+
+    let mut s = String::new();
+
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}return Err(types::Duckerror::Invalidargument(\n\
+             {i}    format!(\"{sql_name}: AccKind::Record aggregate with extra args not yet wired\")));\n",
+        ));
+        return s;
+    }
+
+    // Walk rows; skip NULL/empty entries; decode column 0 to
+    // UPSTREAM via the per-input-record helper.
+    s.push_str(&format!(
+        "{i}let mut upstream_vec = Vec::with_capacity(rows.len());\n\
+         {i}for row in &rows {{\n\
+         {i}    if row.is_empty() {{ continue; }}\n\
+         {i}    if matches!(row[0], types::Duckvalue::Null) {{ continue; }}\n\
+         {i}    upstream_vec.push(arg_witvalue_{in_snake}(row, 0, \"{sql_name}\")?);\n\
+         {i}}}\n",
+    ));
+
+    // Upstream call + encode. `&upstream_vec` coerces to `&[R]`
+    // which wit-bindgen lowers as `list<R>`. Option<R'> result
+    // encodes via the OUTPUT record's ret helper (may differ from
+    // input for OQ1 / #612 cases).
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}(&upstream_vec);\n\
+         {i}match __r {{\n\
+         {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
+         {i}    None => Ok(types::Duckvalue::Null),\n\
+         {i}}}",
+    ));
     s
 }
 

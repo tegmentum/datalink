@@ -387,7 +387,8 @@ use bindings::exports::duckdb::extension::guest;
 
     // Per-record wit-value helpers — only for records referenced
     // by a wired param or return.
-    let referenced_records = collect_referenced_records(&scalar_entries);
+    let referenced_records =
+        collect_referenced_records(&scalar_entries, &aggregate_entries);
     let helper_records: Vec<RecordType> = records
         .iter()
         .filter(|r| referenced_records.contains(&r.kebab_name))
@@ -954,6 +955,7 @@ fn topology_err_string(e: TopologyError) -> String {{
 /// emission filter.
 fn collect_referenced_records(
     scalar_entries: &[(interface_db::DispatchEntry, bool)],
+    aggregate_entries: &[interface_db::AggregateEntry],
 ) -> std::collections::BTreeSet<String> {
     let mut out: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
@@ -976,6 +978,20 @@ fn collect_referenced_records(
                 out.insert(kebab_name.clone());
             }
             _ => {}
+        }
+    }
+    // #607 Phase 2 + #612 (OQ1): AccKind::Record aggregates
+    // reference TWO per-record codec sites — `arg_witvalue_<in>`
+    // for the input record's decoder + `ret_to_witvalue_<out>`
+    // for the output record's encoder. Same-record aggregates have
+    // matching kebabs (so only one codec block is emitted via the
+    // BTreeSet dedupe); different-record (#612) cases need both.
+    for entry in aggregate_entries {
+        if let interface_db::AccKind::Record { input, output } =
+            &entry.shape.accumulator_kind
+        {
+            out.insert(input.kebab_name.clone());
+            out.insert(output.kebab_name.clone());
         }
     }
     out
