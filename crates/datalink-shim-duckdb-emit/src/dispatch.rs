@@ -68,7 +68,10 @@ pub fn emit_scalar_arm_body(
                 s.push_str(&format!(
                     "{i}let arg{idx} = dv_text(&args, {idx}, \"{sql_name}\")?;\n",
                 ));
-                call_args.push(format!("arg{idx}.as_str()"));
+                // `dv_text` returns `&str` already; pass directly.
+                // `.as_str()` on `&str` is an unstable nightly
+                // feature (`str_as_str`, rust-lang/rust#130366).
+                call_args.push(format!("arg{idx}"));
             }
             ParamShape::F64 => {
                 s.push_str(&format!(
@@ -118,10 +121,15 @@ pub fn emit_scalar_arm_body(
                 call_args.push("None".to_string());
             }
             // Step 4 scalar-first cut: shapes below need either a
-            // helper that hasn't been defined here yet, or
-            // ducklink-loader integration that isn't ready. Emit a
-            // stub return so the bridge still compiles; the
-            // function reports as unsupported at call time.
+            // helper that hasn't been defined here yet
+            // (Geom/Geog/Raster/Topology need `from_wkb` /
+            // `geog_from_wkb` / `from_raster_binary` /
+            // `from_topology_bytes` analogs of sqlite-emit's per-
+            // resource decoders), or ducklink-loader integration
+            // that isn't ready (WitValueRecord / ListGeom / Enum /
+            // ListPrim / ListRecord / ListTuple). Emit a stub
+            // return so the bridge still compiles; the function
+            // reports as unsupported at call time.
             other => {
                 let shape_dbg = format!("{:?}", other)
                     .replace('"', "\\\"")
@@ -137,9 +145,42 @@ pub fn emit_scalar_arm_body(
         }
     }
 
+    // Decide the return-wrap shape before emitting the call. Some
+    // RetShape variants emit a `return Err(...)` (deferred wit-
+    // value shapes etc.); for those we skip the upstream call
+    // entirely to avoid an unreachable-code lint.
+    let ret_expr_opt = render_ret_to_duckvalue(&shape.ret);
+    let Some(ret_expr) = ret_expr_opt else {
+        let shape_dbg = format!("{:?}", &shape.ret)
+            .replace('"', "\\\"")
+            .replace('{', "{{")
+            .replace('}', "}}");
+        return format!(
+            "{i}let _ = args; // suppress unused-warning\n\
+             {i}return Err(types::Duckerror::Unsupported(format!(\n\
+             {i}    \"{sql_name}: DuckDB return shape not yet wired in Step 4 cut ({shape_dbg})\"\n\
+             {i})));\n",
+        );
+    };
+
     let module = &shape.wit_module;
     let func = &shape.wit_func;
     let call_args_str = call_args.join(", ");
+    // MethodCall: this is a WIT resource method or constructor.
+    // Step 4 scalar-first cut defers method dispatch (it requires
+    // emitting the resource `use` line + per-resource decode
+    // helpers like sqlite-emit's `from_topology_bytes`); emit an
+    // Unsupported stub so the bridge still compiles.
+    if shape.method_call.is_some() {
+        let _ = (module, func, call_args_str, fallible, ret_expr);
+        return format!(
+            "{i}let _ = args; // suppress unused-warning\n\
+             {i}return Err(types::Duckerror::Unsupported(format!(\n\
+             {i}    \"{sql_name}: WIT resource method/constructor dispatch \
+not yet wired in Step 4 cut\"\n\
+             {i})));\n",
+        );
+    }
     let call_line = if fallible {
         format!(
             "{i}let __ret = {module}::{func}({call_args_str})\n\
@@ -154,7 +195,6 @@ pub fn emit_scalar_arm_body(
     s.push_str(&call_line);
 
     // Wrap the return value into a Duckvalue.
-    let ret_expr = render_ret_to_duckvalue(&shape.ret, sql_name);
     s.push_str(&format!("{i}Ok({ret_expr})\n"));
     s
 }
@@ -162,23 +202,24 @@ pub fn emit_scalar_arm_body(
 /// Render the Rust expression that wraps the upstream `__ret`
 /// value into a `Duckvalue`. The scalar-first cut handles the
 /// primitive returns + a Blob fallback. Shapes that need
-/// per-record wit-value marshaling fall through to a runtime
-/// `Unsupported` error.
-fn render_ret_to_duckvalue(ret: &RetShape, sql_name: &str) -> String {
+/// per-record wit-value marshaling return `None` and the caller
+/// emits an `Unsupported` Duckerror without making the upstream
+/// call (so wit-bindgen doesn't elide the upstream import).
+fn render_ret_to_duckvalue(ret: &RetShape) -> Option<String> {
     match ret {
         RetShape::Text => {
-            "types::Duckvalue::Text(__ret.into())".to_string()
+            Some("types::Duckvalue::Text(__ret.into())".to_string())
         }
-        RetShape::Real => "types::Duckvalue::Float64(__ret)".to_string(),
+        RetShape::Real => Some("types::Duckvalue::Float64(__ret)".to_string()),
         // The core IR collapses signed integer returns into a
         // single `Int` arm that the SQLite emit promotes to i64
         // (SqlValue::Integer is signed-i64-only). DuckDB has a
         // wider integer family but we don't know the original WIT
         // width here, so promote to Int64 for parity. Future
         // refinement: extend the core IR with an Int<width> arm.
-        RetShape::Int => "types::Duckvalue::Int64(__ret as i64)".to_string(),
-        RetShape::BoolInt => "types::Duckvalue::Boolean(__ret)".to_string(),
-        RetShape::Blob => "types::Duckvalue::Blob(__ret.into())".to_string(),
+        RetShape::Int => Some("types::Duckvalue::Int64(__ret as i64)".to_string()),
+        RetShape::BoolInt => Some("types::Duckvalue::Boolean(__ret)".to_string()),
+        RetShape::Blob => Some("types::Duckvalue::Blob(__ret.into())".to_string()),
         // Geometry / Raster / Topology returns currently round-trip
         // through `as_wkb()` / `as_binary()` / `to_bytes()` and emit
         // as Blob. The scalar-first cut treats them all as opaque
@@ -186,42 +227,36 @@ fn render_ret_to_duckvalue(ret: &RetShape, sql_name: &str) -> String {
         // Once a follow-up adds typed-value-binding support, these
         // become `Duckvalue::Complex(...)` entries.
         RetShape::GeomBlob => {
-            "types::Duckvalue::Blob(__ret.as_wkb().into())".to_string()
+            Some("types::Duckvalue::Blob(__ret.as_wkb().into())".to_string())
         }
         RetShape::RasterBlob => {
-            "types::Duckvalue::Blob(__ret.as_binary().into())".to_string()
+            Some("types::Duckvalue::Blob(__ret.as_binary().into())".to_string())
         }
         RetShape::TopologyBlob => {
-            "types::Duckvalue::Blob(__ret.to_bytes().into())".to_string()
+            Some("types::Duckvalue::Blob(__ret.to_bytes().into())".to_string())
         }
-        RetShape::OptionText => {
-            "match __ret { Some(v) => types::Duckvalue::Text(v.into()), None => types::Duckvalue::Null }".to_string()
-        }
-        RetShape::OptionReal => {
-            "match __ret { Some(v) => types::Duckvalue::Float64(v), None => types::Duckvalue::Null }".to_string()
-        }
-        RetShape::OptionInt => {
-            "match __ret { Some(v) => types::Duckvalue::Int64(v as i64), None => types::Duckvalue::Null }".to_string()
-        }
-        RetShape::OptionBoolInt => {
-            "match __ret { Some(v) => types::Duckvalue::Boolean(v), None => types::Duckvalue::Null }".to_string()
-        }
-        RetShape::OptionBlob => {
-            "match __ret { Some(v) => types::Duckvalue::Blob(v.into()), None => types::Duckvalue::Null }".to_string()
-        }
-        RetShape::OptionGeomBlob => {
-            "match __ret { Some(g) => types::Duckvalue::Blob(g.as_wkb().into()), None => types::Duckvalue::Null }".to_string()
-        }
-        other => {
-            let shape_dbg = format!("{:?}", other)
-                .replace('"', "\\\"")
-                .replace('{', "{{")
-                .replace('}', "}}");
-            format!(
-                "return Err(types::Duckerror::Unsupported(format!(\n\
-                 \x20   \"{sql_name}: DuckDB return shape not yet wired in Step 4 cut ({shape_dbg})\"\n\
-                 )))",
-            )
-        }
+        RetShape::OptionText => Some(
+            "match __ret { Some(v) => types::Duckvalue::Text(v.into()), None => types::Duckvalue::Null }".to_string(),
+        ),
+        RetShape::OptionReal => Some(
+            "match __ret { Some(v) => types::Duckvalue::Float64(v), None => types::Duckvalue::Null }".to_string(),
+        ),
+        RetShape::OptionInt => Some(
+            "match __ret { Some(v) => types::Duckvalue::Int64(v as i64), None => types::Duckvalue::Null }".to_string(),
+        ),
+        RetShape::OptionBoolInt => Some(
+            "match __ret { Some(v) => types::Duckvalue::Boolean(v), None => types::Duckvalue::Null }".to_string(),
+        ),
+        RetShape::OptionBlob => Some(
+            "match __ret { Some(v) => types::Duckvalue::Blob(v.into()), None => types::Duckvalue::Null }".to_string(),
+        ),
+        RetShape::OptionGeomBlob => Some(
+            "match __ret { Some(g) => types::Duckvalue::Blob(g.as_wkb().into()), None => types::Duckvalue::Null }".to_string(),
+        ),
+        // WitValueRecord / Enum / JsonText / TuplePick / etc. —
+        // deferred to a follow-up step. Returning None tells the
+        // caller to emit an Unsupported Duckerror instead of
+        // making the upstream call.
+        _ => None,
     }
 }
