@@ -39,7 +39,7 @@ use datalink_extcore::NeutralValue;
 
 pub mod parse;
 
-pub use parse::{parse_visualize, Outcome};
+pub use parse::{parse_visualize, Dialect, Outcome, DUCKDB, SQLITE};
 
 /// The reserved scalar name the sqlink host-shell parse-failure intercept
 /// looks for. Any loaded extension that declares a scalar with this name
@@ -60,7 +60,9 @@ datalink_extcore::declare! {
     // engine. NULL return == declined; an Err == a clean parse error.
     scalar __sqlink_parse(text) -> text [propagate, deterministic] = |args| {
         let q = args.arg_text(0, PARSE_FN)?;
-        match parse::parse_visualize(&q) {
+        // The sqlite host-shell intercept always runs against SQLite, so
+        // the entrypoint emits the SQLite dialect of the rewrite.
+        match parse::parse_visualize(&q, &parse::SQLITE) {
             parse::Outcome::Declined => Ok(NeutralValue::Null),
             parse::Outcome::Invalid(msg) => Err(msg),
             parse::Outcome::Rewrite(sql) => Ok(NeutralValue::Text(sql)),
