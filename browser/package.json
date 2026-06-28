@@ -4,6 +4,24 @@
   "type": "module",
   "description": "DB-agnostic browser runtime plumbing for datalink (DuckDB / SQLite wasm components): WASI polyfill configuration, jco component instantiation with JSPI, and the extension-host registration bridge.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tegmentum/datalink.git",
+    "directory": "browser"
+  },
+  "homepage": "https://github.com/tegmentum/datalink/tree/main/browser#readme",
+  "keywords": [
+    "wasm",
+    "webassembly",
+    "wasi",
+    "component-model",
+    "duckdb",
+    "sqlite",
+    "browser",
+    "jspi"
+  ],
+  "main": "./src/index.mjs",
+  "module": "./src/index.mjs",
   "exports": {
     ".": "./src/index.mjs",
     "./polyfill": "./src/polyfill.mjs",
@@ -12,7 +30,15 @@
     "./resolver": "./src/resolver.mjs",
     "./fetch-bytes": "./src/fetch-bytes.mjs"
   },
-  "peerDependencies": {
-    "@tegmentum/wasi-polyfill": "*"
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@tegmentum/wasi-polyfill": "^0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
