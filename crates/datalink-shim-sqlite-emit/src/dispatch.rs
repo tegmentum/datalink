@@ -765,11 +765,18 @@ pub fn emit_aggregate_step_body(
     arm_indent: &str,
 ) -> String {
     let i = arm_indent;
+    // #607 Phase 1: AccKind::Record uses a different per-row shape
+    // (WitValuePayload extracted from SqlValue::WitValue rather than
+    // a raw blob). Emit a dedicated body.
+    if let AccKind::Record { .. } = &shape.accumulator_kind {
+        return emit_aggregate_step_body_record(shape, sql_name, arm_indent);
+    }
     // #548 (W3.2): the push helper varies by accumulator kind.
     // Both per-kind state maps live in the bridge's lib.rs prelude.
-    let push = match shape.accumulator_kind {
+    let push = match &shape.accumulator_kind {
         AccKind::Geom => "push_geom_state",
         AccKind::Raster => "push_raster_state",
+        AccKind::Record { .. } => unreachable!("handled above"),
     };
     if shape.extra_args.is_empty() {
         // Simple shape: just push the resource blob.
@@ -793,6 +800,41 @@ pub fn emit_aggregate_step_body(
     }
 }
 
+/// #607 Phase 1: aggregate step body for `AccKind::Record` —
+/// mobilitydb temporal-type aggregators. The per-row arg is a
+/// `SqlValue::WitValue(payload)`; we extract the `WitValuePayload`
+/// and push it onto the per-context witvalue state.  Finalize
+/// decodes each via the per-record codec helper.
+///
+/// Extra args (constants beyond the streaming list) are latched
+/// using the same `set_or_validate_extras` shape as the
+/// Geom/Raster paths so per-target divergence stays contained.
+fn emit_aggregate_step_body_record(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let extract = format!(
+        "{i}let payload = match args.get(0) {{\n\
+         {i}    Some(SqlValue::WitValue(p)) => p.clone(),\n\
+         {i}    _ => return Err(format!(\"{sql_name}: arg 0 must be WIT-VALUE\")),\n\
+         {i}}};\n\
+         {i}push_witvalue_state(context_id, payload);\n",
+    );
+    if shape.extra_args.is_empty() {
+        format!("{extract}{i}Ok(())")
+    } else {
+        format!(
+            "{extract}\
+             {i}// Round 2: latch extra constant args (1..) on first step.\n\
+             {i}let extras: Vec<SqlValue> = args[1..].to_vec();\n\
+             {i}set_or_validate_extras(context_id, extras, \"{sql_name}\")?;\n\
+             {i}Ok(())"
+        )
+    }
+}
+
 /// Emit the body of an aggregate `finalize` call. Materialises
 /// the accumulated geometries, calls the WIT aggregate function,
 /// returns the WKB-encoded result.
@@ -807,11 +849,18 @@ pub fn emit_aggregate_finalize_body(
     let i = arm_indent;
     let module = &shape.wit_module;
     let func = &shape.wit_func;
+    // #607 Phase 1: AccKind::Record finalize is structurally
+    // different (lazy decode via per-record codec, no `refs` slice
+    // of borrows) so we route to a dedicated emitter and short-
+    // circuit before the Geom/Raster scaffolding.
+    if let AccKind::Record { .. } = &shape.accumulator_kind {
+        return emit_aggregate_finalize_body_record(shape, sql_name, arm_indent);
+    }
     let mut s = String::new();
     // #548 (W3.2): per-kind accumulator take + decode. Both paths
     // materialise `refs: Vec<&Resource>` so the downstream
     // call-args composition is uniform.
-    match shape.accumulator_kind {
+    match &shape.accumulator_kind {
         AccKind::Geom => {
             s.push_str(&format!(
                 "{i}let blobs = take_geom_state(context_id);\n\
@@ -831,6 +880,7 @@ pub fn emit_aggregate_finalize_body(
                  {i}let refs: Vec<&Raster> = rasters.iter().collect();\n",
             ));
         }
+        AccKind::Record { .. } => unreachable!("handled above"),
     }
 
     // Build the extras as Rust-typed bindings if any.
@@ -993,6 +1043,78 @@ pub fn emit_aggregate_finalize_body(
     }
     s
 }
+
+/// #607 Phase 1: aggregate finalize body for `AccKind::Record` —
+/// mobilitydb temporal-type aggregators.
+///
+/// Pattern (lazy decode per DD1):
+///   1. `take_witvalue_state` recovers the per-row payload list.
+///   2. For each payload, the existing `arg_witvalue_<snake>`
+///      decoder runs (slice trick: synthesise a one-element
+///      `[SqlValue::WitValue(p)]` so the helper's args/idx
+///      signature matches). This produces an UPSTREAM record.
+///   3. The upstream aggregator is called with the `&Vec<R>`
+///      (wit-bindgen lowers `list<R>` as `&[R]`).
+///   4. The Option<R> result is encoded back via the existing
+///      `ret_to_witvalue_<snake>` helper — the same encoder the
+///      `OptionWitValueRecord` scalar return shape uses.
+///
+/// Extras (constant args beyond the streaming list) are
+/// supported by the same `take_extras_state` flow as the
+/// Geom/Raster path. Phase 1 pilot has no temporal aggregate
+/// with extras; this branch errors clearly if one shows up.
+fn emit_aggregate_finalize_body_record(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::Record { kebab_name, .. } = &shape.accumulator_kind else {
+        unreachable!("invariant: caller checks AccKind::Record");
+    };
+    let snake = kebab_name.replace('-', "_");
+
+    let mut s = String::new();
+    // Drain the per-context witvalue accumulator, then decode each
+    // payload to UPSTREAM via the per-record helper.
+    s.push_str(&format!(
+        "{i}let payloads = take_witvalue_state(context_id);\n\
+         {i}let mut upstream_vec = Vec::with_capacity(payloads.len());\n\
+         {i}for pw in payloads {{\n\
+         {i}    // Slice trick: arg_witvalue_<snake> takes the standard\n\
+         {i}    // `&[SqlValue]` / idx signature. Synthesise a one-element\n\
+         {i}    // slice so we can reuse the helper from the aggregate\n\
+         {i}    // finalize site.\n\
+         {i}    let __args = [SqlValue::WitValue(pw)];\n\
+         {i}    upstream_vec.push(arg_witvalue_{snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}}}\n",
+    ));
+
+    // Phase 1 pilot doesn't support record-typed aggregates with
+    // extras (no known surface today). Bail with a clear error
+    // when one materialises — better than emitting a half-wired
+    // body the compiler still accepts.
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}return Err(format!(\"{sql_name}: AccKind::Record aggregate with extra args not yet wired\"));\n",
+        ));
+        return s;
+    }
+
+    // Upstream takes `list<R>` which wit-bindgen lowers to `&[R]`;
+    // `&upstream_vec` coerces to a slice cleanly.
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}(&upstream_vec);\n\
+         {i}match __r {{\n\
+         {i}    Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
+         {i}    None => Ok(SqlValue::Null),\n\
+         {i}}}",
+    ));
+    s
+}
+
 /// W3.3 (#543): kebab-case → PascalCase for enum-type and -case
 /// names. wit-bindgen's generator does the same conversion when
 /// emitting Rust enum idents, so the dispatch arm references

@@ -344,9 +344,17 @@ pub fn render_aggregates(
         // Arg 0 is the streaming accumulator column: Blob for both
         // Geom and Raster aggregates (the WKB / raster-binary the
         // bridge decodes inside the dispatch arm).
+        //
+        // #607 Phase 1: AccKind::Record aggregates are not yet
+        // wired on the DuckDB target — the dispatch arm short-
+        // circuits to a runtime stub. Skip the register entry so
+        // DuckDB doesn't advertise an unimplemented aggregate;
+        // Phase 2 (per the aggregate-substrate plan) replaces this
+        // skip with the real Logicaltype mapping.
         let mut args_block = String::new();
-        let acc_logical = match entry.shape.accumulator_kind {
+        let acc_logical = match &entry.shape.accumulator_kind {
             AccKind::Geom | AccKind::Raster => "types::Logicaltype::Blob",
+            AccKind::Record { .. } => continue,
         };
         args_block.push_str(&format!(
             "            runtime::Funcarg {{\n\

@@ -559,36 +559,43 @@ pub fn build_aggregate_registry(
     // Index aggregate-shaped WIT functions by snake_case name.
     // Primary index: `postgis-aggregates` (the canonical aggregate
     // interface) plus `postgis-raster-aggregates` (#548 W3.2; raster
-    // mosaic aggregates live here). Fallback index: any other
-    // interface whose function's first param is a borrowed-list of
-    // a supported resource type — covers `postgis-accessors::st-collect`
-    // and friends that are declared as scalars but semantically
-    // usable as aggregates.
+    // mosaic aggregates live here) plus `temporal-aggregate-ops`
+    // (#607 Phase 0; mobilitydb temporal-type aggregates).
+    // Fallback index: any other interface whose function's first
+    // param is a borrowed-list of a supported resource type, OR an
+    // owned-list of a record-typed kebab — covers
+    // `postgis-accessors::st-collect` and friends that are declared
+    // as scalars but semantically usable as aggregates.
+    fn is_primary_agg_interface(iface: &str) -> bool {
+        matches!(
+            iface,
+            "postgis-aggregates" | "postgis-raster-aggregates" | "temporal-aggregate-ops"
+        )
+    }
     let mut agg_index: HashMap<String, &WitFunction> = HashMap::new();
     for f in &wit_fns {
-        if f.interface == "postgis-aggregates"
-            || f.interface == "postgis-raster-aggregates"
-        {
+        if is_primary_agg_interface(&f.interface) {
             agg_index.insert(wit_parse::kebab_to_snake(&f.kebab_name), f);
         }
     }
     let mut agg_index_fallback: HashMap<String, &WitFunction> = HashMap::new();
     for f in &wit_fns {
-        if f.interface == "postgis-aggregates"
-            || f.interface == "postgis-raster-aggregates"
-        {
+        if is_primary_agg_interface(&f.interface) {
             continue;
         }
-        if f.params
+        let first_is_agg_list = f
+            .params
             .first()
-            .map(|p| {
-                matches!(
-                    p.ty,
-                    WitType::ListGeomBorrow | WitType::ListRasterBorrow,
-                )
+            .map(|p| match &p.ty {
+                WitType::ListGeomBorrow | WitType::ListRasterBorrow => true,
+                // #607 Phase 0: list<X> owned where X is unsupported
+                // (i.e. a kebab — record candidate). The classifier
+                // will validate the kebab against the record registry.
+                WitType::List(inner) => matches!(inner.as_ref(), WitType::Unsupported(_)),
+                _ => false,
             })
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if first_is_agg_list {
             agg_index_fallback
                 .entry(wit_parse::kebab_to_snake(&f.kebab_name))
                 .or_insert(f);
@@ -708,14 +715,48 @@ pub struct AggregateShape {
 }
 
 /// #548 (W3.2): resource type held by the per-context aggregate
-/// accumulator. Default is `Geom` (preserving the existing
-/// postgis-aggregates surface). `Raster` is used by
-/// `st-rast-union-aggregate` and any future
+/// accumulator. `Geom` is the original postgis-aggregates surface;
+/// `Raster` was added for `st-rast-union-aggregate` and any future
 /// `list<borrow<raster>>`-taking aggregate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// #607 Phase 0: `Record` is the wit-value variant — the accumulator
+/// state carries `Vec<WitValuePayload>` (per-row canonical-CBOR
+/// payloads) and finalize decodes via the bridge's per-record codec
+/// before calling the upstream aggregator. Mobilitydb temporal-type
+/// aggregates (`tfloat-temporal-min`, `tint-temporal-max`,
+/// `tbool-temporal-and`, etc.) take owned `list<X-sequence>` and
+/// return `option<X-sequence>` — the per-row marshaling needs the
+/// record codec rather than `from_wkb` / `from_raster_binary`.
+///
+/// Carries the upstream record kebab name plus the symbolic-name +
+/// type-id needed to produce the WitValue payload on the finalize
+/// side. The fields mirror the data carried by
+/// `RetShape::OptionWitValueRecord` so the existing
+/// `ret_to_witvalue_<snake>` encoder helper can be reused at the
+/// finalize site.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccKind {
     Geom,
     Raster,
+    /// #607 Phase 0: resource-record aggregator. Carries the kebab
+    /// name of the upstream WIT record + the fields needed to
+    /// reference its codec helper and produce a WitValue payload on
+    /// the finalize side. Set only when the aggregate's first param
+    /// is `list<X>` and `X` is in the bridge's record_registry.
+    ///
+    /// Phase 1 (sqlite-emit) only wires aggregates where the input
+    /// and output record kebab match (`tfloat-temporal-min`,
+    /// `tbool-temporal-and`, etc.). Different-record cases like
+    /// `tgeompoint-st-extent` (input `tgeompoint-sequence`, output
+    /// `stbox`) are deferred — see plan OQ1.
+    Record {
+        kebab_name: String,
+        wit_interface: String,
+        wit_package: String,
+        wit_package_version: String,
+        symbolic_name: String,
+        type_id_hex: String,
+    },
 }
 
 /// Same as `build_registry` for UDTFs (table_functions).
@@ -1080,9 +1121,13 @@ pub fn classify_aggregate_shape(
     let wit_func = wit_parse::kebab_to_snake(&f.kebab_name);
 
     // First param must be a borrowed-list of a supported resource
-    // type. #548 (W3.2): both `list<borrow<geometry>>` (Geom) and
-    // `list<borrow<raster>>` (Raster) are accepted; the kind picks
-    // the per-context accumulator helpers + the finalize decoder.
+    // type or an owned-list of a record type. #548 (W3.2): both
+    // `list<borrow<geometry>>` (Geom) and `list<borrow<raster>>`
+    // (Raster) are accepted; the kind picks the per-context
+    // accumulator helpers + the finalize decoder. #607 Phase 0:
+    // also accept `list<X>` where `X` is a record-typed kebab in
+    // the bridge's record_registry (mobilitydb temporal-type
+    // aggregates).
     if f.params.is_empty() {
         return Err("aggregate has zero params".into());
     }
@@ -1090,9 +1135,40 @@ pub fn classify_aggregate_shape(
     let accumulator_kind = match first {
         WitType::ListGeomBorrow => AccKind::Geom,
         WitType::ListRasterBorrow => AccKind::Raster,
+        // #607 Phase 0: `list<X>` owned where X is a record
+        // kebab — temporal-aggregate-ops shape. The classifier
+        // also enforces same-record-in-out (Phase 1 pilot scope);
+        // different input/output records (e.g. `tgeompoint-st-extent`
+        // returning `option<stbox>`) are deferred via OQ1.
+        WitType::List(inner) => {
+            if let WitType::Unsupported(name) = inner.as_ref() {
+                if let Some(rec) = records.iter().find(|r| &r.kebab_name == name) {
+                    let type_id_hex: String =
+                        rec.type_id.iter().map(|b| format!("{:02x}", b)).collect();
+                    AccKind::Record {
+                        kebab_name: rec.kebab_name.clone(),
+                        wit_interface: rec.interface.clone(),
+                        wit_package: rec.package.clone(),
+                        wit_package_version: rec.package_version.clone(),
+                        symbolic_name: rec.symbolic_name.clone(),
+                        type_id_hex,
+                    }
+                } else {
+                    return Err(format!(
+                        "first aggregate param `list<{}>` has no matching record in the bridge registry",
+                        name,
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "first aggregate param must be list<borrow<geometry>>, list<borrow<raster>>, or list<record>; got list<{:?}>",
+                    inner,
+                ));
+            }
+        }
         other => {
             return Err(format!(
-                "first aggregate param must be list<borrow<geometry>> or list<borrow<raster>>; got {:?}",
+                "first aggregate param must be list<borrow<geometry>>, list<borrow<raster>>, or list<record>; got {:?}",
                 other,
             ));
         }
@@ -1107,6 +1183,37 @@ pub fn classify_aggregate_shape(
     }
 
     let ret = classify_return(&f.ret, records, enums)?;
+
+    // #607 Phase 1 pilot: when `AccKind::Record` is set, enforce
+    // same-record-in-out — the accumulator's per-row payloads decode
+    // to the SAME upstream record the finalize call returns
+    // (wrapped in option<...>). Different input/output records
+    // (e.g. `tgeompoint-st-extent`: input `tgeompoint-sequence`,
+    // output `stbox`) are deferred to a follow-up batch — see OQ1.
+    if let AccKind::Record { kebab_name, .. } = &accumulator_kind {
+        let ret_kebab = match &ret {
+            RetShape::OptionWitValueRecord { kebab_name: rk, .. } => Some(rk.as_str()),
+            RetShape::WitValueRecord { kebab_name: rk, .. } => Some(rk.as_str()),
+            RetShape::FirstWitValueRecord { kebab_name: rk, .. } => Some(rk.as_str()),
+            _ => None,
+        };
+        match ret_kebab {
+            Some(rk) if rk == kebab_name.as_str() => {}
+            Some(rk) => {
+                return Err(format!(
+                    "AccKind::Record aggregate input/output records differ (input `{}`, output `{}`); deferred — see plan OQ1",
+                    kebab_name, rk,
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "AccKind::Record aggregate input `{}` but return shape is not a record (deferred — different output type)",
+                    kebab_name,
+                ));
+            }
+        }
+    }
+
     Ok(AggregateShape {
         wit_module: alias,
         wit_package: f.package.clone(),

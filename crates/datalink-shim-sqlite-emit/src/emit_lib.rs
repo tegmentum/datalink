@@ -459,6 +459,46 @@ use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
         &collect_tuple_list_sigs(&scalar_entries, &agg_entries, &udtf_entries),
     );
 
+    // #607 Phase 1: only emit the witvalue-typed aggregator state
+    // (thread-local Vec<WitValuePayload> + push/take helpers) when
+    // there's at least one `AccKind::Record` aggregate in the wired
+    // set. Postgis bridges (no record-typed aggregates today) skip
+    // this block entirely — byte-identical to the pre-#607 output.
+    let has_record_agg = agg_entries.iter().any(|e| {
+        matches!(e.shape.accumulator_kind, dispatch::AccKind::Record { .. })
+    });
+    let (witvalue_state_decl, witvalue_state_helpers) = if has_record_agg {
+        (
+            "\n    /// #607 Phase 1: parallel accumulator for record-typed\n\
+             \x20   /// aggregates (mobilitydb temporal-type aggregates).  Holds the\n\
+             \x20   /// per-row `WitValuePayload` (canon-CBOR bytes + symbolic +\n\
+             \x20   /// type-id); finalize iterates and decodes each via the per-\n\
+             \x20   /// record codec helper before invoking the upstream aggregator.\n\
+             \x20   static AGG_WITVALUE_STATE: RefCell<HashMap<u64, Vec<bindings::sqlite::extension::types::WitValuePayload>>> =\n\
+             \x20       RefCell::new(HashMap::new());"
+                .to_string(),
+            "\n/// #607 Phase 1: record-typed aggregate accumulator push.\n\
+             /// Mirrors `push_geom_state` / `push_raster_state` but stores\n\
+             /// the per-row `WitValuePayload` (CBOR bytes + type id) rather\n\
+             /// than a raw blob, since record-typed aggregates need the\n\
+             /// per-record codec at finalize time rather than `from_wkb` /\n\
+             /// `from_raster_binary`.\n\
+             fn push_witvalue_state(context_id: u64, payload: bindings::sqlite::extension::types::WitValuePayload) {\n\
+             \x20   AGG_WITVALUE_STATE.with(|m| {\n\
+             \x20       m.borrow_mut().entry(context_id).or_default().push(payload);\n\
+             \x20   });\n\
+             }\n\n\
+             fn take_witvalue_state(context_id: u64) -> Vec<bindings::sqlite::extension::types::WitValuePayload> {\n\
+             \x20   AGG_WITVALUE_STATE.with(|m| {\n\
+             \x20       m.borrow_mut().remove(&context_id).unwrap_or_default()\n\
+             \x20   })\n\
+             }\n"
+                .to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+
     // #557fix W4a composition fix: emit a force-link block that
     // references every upstream function in every primary-shim
     // imported interface as a `*const ()`. Without this,
@@ -636,7 +676,7 @@ thread_local! {{
     /// concurrent geom + raster aggregates on the same connection
     /// don't share state.
     static AGG_RASTER_STATE: RefCell<HashMap<u64, Vec<Vec<u8>>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::new());{WITVALUE_AGG_STATE_DECL}
     /// Round 2: per-context constant args for aggregates that
     /// take extra params beyond the streaming geometry
     /// (`st_clusterwithin(geom, distance)` and friends).
@@ -668,6 +708,7 @@ fn take_raster_state(context_id: u64) -> Vec<Vec<u8>> {{
         m.borrow_mut().remove(&context_id).unwrap_or_default()
     }})
 }}
+{WITVALUE_AGG_STATE_HELPERS}
 
 /// Round 2: store-or-validate the constant extras for an
 /// aggregate. On the first step we just record them; on
@@ -742,6 +783,8 @@ struct {bridge_struct};
         POSTGIS_HELPERS = helpers_block.as_str(),
         TUPLE_LIST_HELPERS = tuple_list_helpers.as_str(),
         FORCE_LINK_BLOCK = force_link_block.as_str(),
+        WITVALUE_AGG_STATE_DECL = witvalue_state_decl.as_str(),
+        WITVALUE_AGG_STATE_HELPERS = witvalue_state_helpers.as_str(),
     ));
 
     // MetadataGuest impl — reflect every scalar / aggregate / UDTF
@@ -1815,6 +1858,13 @@ fn collect_referenced_records(
         }
         if let Some(name) = record_name_in_ret(&entry.shape.ret) {
             out.insert(name.clone());
+        }
+        // #607 Phase 1: AccKind::Record aggregates reference the
+        // upstream record's `arg_witvalue_<snake>` decoder helper
+        // at the aggregate's finalize site. Pull the kebab into the
+        // helper-emission set so the codec helpers get generated.
+        if let dispatch::AccKind::Record { kebab_name, .. } = &entry.shape.accumulator_kind {
+            out.insert(kebab_name.clone());
         }
     }
     for entry in udtf_entries {
