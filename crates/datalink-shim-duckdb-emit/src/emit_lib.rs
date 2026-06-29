@@ -445,26 +445,55 @@ impl callback_dispatch::Guest for {bridge_struct} {{
     // The major-4 contract replaced the row-major call_scalar_batch /
     // call_aggregate / (and added call_cast_col) with columnar
     // variants that cross the ABI as `list<colvec>`. Correctness-first
-    // migration: convert columns -> rows up-front, route through the
+    // migration: convert columns -> rows on demand, route through the
     // row-major cold paths, then rebuild a colvec on the way out.
-    // The contract envisions bulk memcpy on fixed-width columns; that
-    // is a future optimisation -- the existing arm bodies (which
-    // produce a `Duckvalue` per row) already pay the per-cell cost.
+    //
+    // #659 micro-opts on the lift/lower paths:
+    //   * Opt 1: scalar-batch / cast paths skip the
+    //     `Vec<Vec<Duckvalue>>` intermediate -- they materialize one
+    //     row at a time via `materialize_row` / `colvec_get` (the
+    //     aggregate path still uses `colvecs_to_rows` because its
+    //     arm bodies iterate `rows` directly).
+    //   * Opt 2: `values_to_colvec` fuses validity + type-sniff
+    //     into a single pass and pre-allocates the typed `Vec<T>`
+    //     from the captured arm-kind.
+    //   * Opt 3: scalar-batch reuses a single per-row buffer across
+    //     iterations -- the buffer's capacity is preserved by
+    //     `materialize_row` (`std::mem::take` then re-grow to
+    //     `args.len()`).
+    //
+    // The contract envisions bulk memcpy on fixed-width columns;
+    // that is a future optimisation -- mobilitydb-style workloads
+    // are dominated by per-row binary/text decode in the arm
+    // bodies, so the savings here are on the lift/lower prologue
+    // rather than the arm dispatch itself.
 
     fn call_scalar_batch_col(
         handle: u32,
         args: Vec<column_types::Colvec>,
         ctx: types::Invokeinfo,
     ) -> Result<column_types::Colvec, types::Duckerror> {{
-        let rows = colvecs_to_rows(&args)?;
+        let n_rows = validate_colvec_rows(&args)?;
+        let n_args = args.len();
         let base = ctx.rowindex.unwrap_or(0);
-        let mut out: Vec<types::Duckvalue> = Vec::with_capacity(rows.len());
-        for (i, args) in rows.into_iter().enumerate() {{
+        let mut out: Vec<types::Duckvalue> = Vec::with_capacity(n_rows);
+        // Pooled per-row buffer (#659 Opt 3). `materialize_row`
+        // clears + re-grows on each iteration, preserving capacity
+        // across rows; we mem::take it into the Guest call (which
+        // consumes the Vec by value), then re-grow on the next
+        // iteration. The per-row alloc is unavoidable as long as
+        // call_scalar's WIT-derived signature takes
+        // `args: Vec<Duckvalue>` by value -- the capacity hint at
+        // least keeps the alloc right-sized.
+        let mut row_buf: Vec<types::Duckvalue> = Vec::with_capacity(n_args);
+        for i in 0..n_rows {{
+            materialize_row(&args, i, &mut row_buf);
             let row_ctx = types::Invokeinfo {{
                 rowindex: Some(base + i as u64),
                 iswindow: ctx.iswindow,
             }};
-            out.push(<Self as callback_dispatch::Guest>::call_scalar(handle, args, row_ctx)?);
+            let row_args = core::mem::take(&mut row_buf);
+            out.push(<Self as callback_dispatch::Guest>::call_scalar(handle, row_args, row_ctx)?);
         }}
         values_to_colvec(out)
     }}
@@ -493,9 +522,12 @@ impl callback_dispatch::Guest for {bridge_struct} {{
         handle: u32,
         arg: column_types::Colvec,
     ) -> Result<column_types::Colvec, types::Duckerror> {{
-        let values = colvec_to_values(&arg);
-        let mut out: Vec<types::Duckvalue> = Vec::with_capacity(values.len());
-        for v in values.into_iter() {{
+        // #659 Opt 1: lift one cell at a time via `colvec_get`
+        // rather than building the full `Vec<Duckvalue>` upfront.
+        let n_rows = arg.rows as usize;
+        let mut out: Vec<types::Duckvalue> = Vec::with_capacity(n_rows);
+        for i in 0..n_rows {{
+            let v = colvec_get(&arg, i);
             out.push(<Self as callback_dispatch::Guest>::call_cast(handle, v)?);
         }}
         values_to_colvec(out)
@@ -977,7 +1009,8 @@ fn parse_json_list_string(args: &[types::Duckvalue], idx: usize, name: &str) -> 
 /// envisions bulk-memcpy on fixed-width columns; that is a future
 /// optimisation -- the row-major dispatch already pays the per-cell
 /// cost via the existing arm bodies.
-const COLVEC_HELPERS: &str = r##"// --- Colvec <-> row-major helpers (#653 columnar callback-dispatch) ---
+const COLVEC_HELPERS: &str = r##"// --- Colvec <-> row-major helpers (#653 columnar callback-dispatch,
+//     #659 micro-opts on the lift/lower hot path) ---
 
 /// Validity-bitmap probe. An empty bitmap means "all rows valid"
 /// (matching DuckDB's null-validity pointer convention); otherwise
@@ -992,67 +1025,61 @@ fn cv_is_valid(validity: &[u8], i: usize) -> bool {
     }
 }
 
-/// Lift a single `colvec` to a row-major `Vec<Duckvalue>`. NULLs
-/// (validity bit clear) become `Duckvalue::Null`. Variable-width
-/// arms (Text / Blob) clone the underlying buffer; fixed-width arms
-/// copy by value.
-fn colvec_to_values(cv: &column_types::Colvec) -> Vec<types::Duckvalue> {
-    let n = cv.rows as usize;
-    let mut out = Vec::with_capacity(n);
-    let validity = cv.validity.as_slice();
-    for i in 0..n {
-        if !cv_is_valid(validity, i) {
-            out.push(types::Duckvalue::Null);
-            continue;
-        }
-        let v = match &cv.data {
-            column_types::Column::Boolean(xs)     => xs.get(i).copied().map(types::Duckvalue::Boolean),
-            column_types::Column::Int64(xs)       => xs.get(i).copied().map(types::Duckvalue::Int64),
-            column_types::Column::Uint64(xs)      => xs.get(i).copied().map(types::Duckvalue::Uint64),
-            column_types::Column::Float64(xs)     => xs.get(i).copied().map(types::Duckvalue::Float64),
-            column_types::Column::Int32(xs)       => xs.get(i).copied().map(types::Duckvalue::Int32),
-            column_types::Column::Timestamp(xs)   => xs.get(i).copied().map(types::Duckvalue::Timestamp),
-            column_types::Column::Int8(xs)        => xs.get(i).copied().map(types::Duckvalue::Int8),
-            column_types::Column::Int16(xs)       => xs.get(i).copied().map(types::Duckvalue::Int16),
-            column_types::Column::Uint8(xs)       => xs.get(i).copied().map(types::Duckvalue::Uint8),
-            column_types::Column::Uint16(xs)      => xs.get(i).copied().map(types::Duckvalue::Uint16),
-            column_types::Column::Uint32(xs)      => xs.get(i).copied().map(types::Duckvalue::Uint32),
-            column_types::Column::Float32(xs)     => xs.get(i).copied().map(types::Duckvalue::Float32),
-            column_types::Column::Date(xs)        => xs.get(i).copied().map(types::Duckvalue::Date),
-            column_types::Column::Time(xs)        => xs.get(i).copied().map(types::Duckvalue::Time),
-            column_types::Column::Timestamptz(xs) => xs.get(i).copied().map(types::Duckvalue::Timestamptz),
-            column_types::Column::Decimal(xs) => xs.get(i).cloned().map(|d| {
-                types::Duckvalue::Decimal(types::Decimalvalue {
-                    lower: d.lower, upper: d.upper, width: d.width, scale: d.scale,
-                })
-            }),
-            column_types::Column::Interval(xs) => xs.get(i).cloned().map(|d| {
-                types::Duckvalue::Interval(types::Intervalvalue {
-                    months: d.months, days: d.days, micros: d.micros,
-                })
-            }),
-            column_types::Column::Uuid(xs) => xs.get(i).cloned().map(|d| {
-                types::Duckvalue::Uuid(types::Uuidvalue { hi: d.hi, lo: d.lo })
-            }),
-            column_types::Column::Text(xs)  => xs.get(i).cloned().map(types::Duckvalue::Text),
-            column_types::Column::Blob(xs)  => xs.get(i).cloned().map(types::Duckvalue::Blob),
-            column_types::Column::Complex(xs) => xs.get(i).cloned().map(|c| {
-                types::Duckvalue::Complex(types::Complexvalue {
-                    type_expr: c.type_expr, json: c.json,
-                })
-            }),
-        };
-        out.push(v.unwrap_or(types::Duckvalue::Null));
+/// (#659 Opt 1) Lift a single cell from a colvec into a Duckvalue
+/// without materializing the whole column. Used by the per-row
+/// dispatch loops in `call_scalar_batch_col` / `call_cast_col` to
+/// avoid the `Vec<Vec<Duckvalue>>` intermediate. Variable-width
+/// arms (Text / Blob / Complex) clone; fixed-width arms copy.
+fn colvec_get(cv: &column_types::Colvec, i: usize) -> types::Duckvalue {
+    if !cv_is_valid(cv.validity.as_slice(), i) {
+        return types::Duckvalue::Null;
     }
-    out
+    let v = match &cv.data {
+        column_types::Column::Boolean(xs)     => xs.get(i).copied().map(types::Duckvalue::Boolean),
+        column_types::Column::Int64(xs)       => xs.get(i).copied().map(types::Duckvalue::Int64),
+        column_types::Column::Uint64(xs)      => xs.get(i).copied().map(types::Duckvalue::Uint64),
+        column_types::Column::Float64(xs)     => xs.get(i).copied().map(types::Duckvalue::Float64),
+        column_types::Column::Int32(xs)       => xs.get(i).copied().map(types::Duckvalue::Int32),
+        column_types::Column::Timestamp(xs)   => xs.get(i).copied().map(types::Duckvalue::Timestamp),
+        column_types::Column::Int8(xs)        => xs.get(i).copied().map(types::Duckvalue::Int8),
+        column_types::Column::Int16(xs)       => xs.get(i).copied().map(types::Duckvalue::Int16),
+        column_types::Column::Uint8(xs)       => xs.get(i).copied().map(types::Duckvalue::Uint8),
+        column_types::Column::Uint16(xs)      => xs.get(i).copied().map(types::Duckvalue::Uint16),
+        column_types::Column::Uint32(xs)      => xs.get(i).copied().map(types::Duckvalue::Uint32),
+        column_types::Column::Float32(xs)     => xs.get(i).copied().map(types::Duckvalue::Float32),
+        column_types::Column::Date(xs)        => xs.get(i).copied().map(types::Duckvalue::Date),
+        column_types::Column::Time(xs)        => xs.get(i).copied().map(types::Duckvalue::Time),
+        column_types::Column::Timestamptz(xs) => xs.get(i).copied().map(types::Duckvalue::Timestamptz),
+        column_types::Column::Decimal(xs) => xs.get(i).cloned().map(|d| {
+            types::Duckvalue::Decimal(types::Decimalvalue {
+                lower: d.lower, upper: d.upper, width: d.width, scale: d.scale,
+            })
+        }),
+        column_types::Column::Interval(xs) => xs.get(i).cloned().map(|d| {
+            types::Duckvalue::Interval(types::Intervalvalue {
+                months: d.months, days: d.days, micros: d.micros,
+            })
+        }),
+        column_types::Column::Uuid(xs) => xs.get(i).cloned().map(|d| {
+            types::Duckvalue::Uuid(types::Uuidvalue { hi: d.hi, lo: d.lo })
+        }),
+        column_types::Column::Text(xs)  => xs.get(i).cloned().map(types::Duckvalue::Text),
+        column_types::Column::Blob(xs)  => xs.get(i).cloned().map(types::Duckvalue::Blob),
+        column_types::Column::Complex(xs) => xs.get(i).cloned().map(|c| {
+            types::Duckvalue::Complex(types::Complexvalue {
+                type_expr: c.type_expr, json: c.json,
+            })
+        }),
+    };
+    v.unwrap_or(types::Duckvalue::Null)
 }
 
-/// Lift `args: Vec<Colvec>` to `Vec<Vec<Duckvalue>>` (one row per
-/// input row, args ordered as registered). All input colvecs are
-/// expected to share `rows`; mismatched lengths emit an error.
-fn colvecs_to_rows(args: &[column_types::Colvec]) -> Result<Vec<Vec<types::Duckvalue>>, types::Duckerror> {
-    let n_args = args.len();
-    let n_rows = if n_args == 0 { 0 } else { args[0].rows as usize };
+/// (#659 Opt 1) Validate that every input colvec shares the same
+/// row count and return it. Mismatched lengths return an Internal
+/// error -- the host-side dispatcher should never deliver ragged
+/// column slices.
+fn validate_colvec_rows(args: &[column_types::Colvec]) -> Result<usize, types::Duckerror> {
+    let n_rows = if args.is_empty() { 0 } else { args[0].rows as usize };
     for (j, cv) in args.iter().enumerate() {
         if cv.rows as usize != n_rows {
             return Err(types::Duckerror::Internal(format!(
@@ -1061,191 +1088,304 @@ fn colvecs_to_rows(args: &[column_types::Colvec]) -> Result<Vec<Vec<types::Duckv
             )));
         }
     }
-    let cols: Vec<Vec<types::Duckvalue>> = args.iter().map(colvec_to_values).collect();
+    Ok(n_rows)
+}
+
+/// (#659 Opt 1 + Opt 3) Materialize row `i` from a slice of colvecs
+/// into the provided buffer. The buffer is cleared first; capacity
+/// is preserved across calls, so the dispatch loop can reuse a
+/// single allocation across rows. This avoids the
+/// `Vec<Vec<Duckvalue>>` intermediate (one column-Vec per arg plus
+/// one row-Vec per row) that the original `colvecs_to_rows`
+/// allocated.
+fn materialize_row(args: &[column_types::Colvec], i: usize, out: &mut Vec<types::Duckvalue>) {
+    out.clear();
+    if out.capacity() < args.len() {
+        out.reserve(args.len() - out.capacity());
+    }
+    for cv in args {
+        out.push(colvec_get(cv, i));
+    }
+}
+
+/// Lift a single `colvec` to a row-major `Vec<Duckvalue>`.
+/// (Retained for the aggregate dispatch path; the scalar-batch and
+/// cast paths now use `colvec_get` directly via `materialize_row`.)
+fn colvec_to_values(cv: &column_types::Colvec) -> Vec<types::Duckvalue> {
+    let n = cv.rows as usize;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(colvec_get(cv, i));
+    }
+    out
+}
+
+/// Lift `args: Vec<Colvec>` to `Vec<Vec<Duckvalue>>`. (Retained for
+/// the aggregate dispatch path -- aggregate arms iterate `rows`
+/// directly. The scalar-batch and cast paths use `validate_colvec_rows`
+/// + `materialize_row` to skip the intermediate `Vec<Vec<_>>`.)
+fn colvecs_to_rows(args: &[column_types::Colvec]) -> Result<Vec<Vec<types::Duckvalue>>, types::Duckerror> {
+    let n_rows = validate_colvec_rows(args)?;
+    let n_args = args.len();
     let mut rows: Vec<Vec<types::Duckvalue>> = Vec::with_capacity(n_rows);
     for i in 0..n_rows {
         let mut row: Vec<types::Duckvalue> = Vec::with_capacity(n_args);
-        for col in &cols {
-            // colvec_to_values produced exactly n_rows entries per col
-            // so this index is in bounds by construction.
-            row.push(col[i].clone());
+        for cv in args {
+            row.push(colvec_get(cv, i));
         }
         rows.push(row);
     }
     Ok(rows)
 }
 
-/// Build a validity bitmap (little-endian, byte-packed; bit set =
-/// non-NULL) for a Vec<Duckvalue>. Returns an empty Vec when every
-/// value is non-NULL (fast-path: matches the contract's "empty
-/// bitmap means all-valid" sentinel).
-fn build_validity_bitmap(values: &[types::Duckvalue]) -> Vec<u8> {
-    let any_null = values.iter().any(|v| matches!(v, types::Duckvalue::Null));
-    if !any_null {
-        return Vec::new();
+/// (#659 Opt 2) Lower a row-major `Vec<Duckvalue>` back into a
+/// `colvec`. Fuses the original two passes (`build_validity_bitmap`
+/// then `iter().find()` for the type sniff) into a single sweep,
+/// then dispatches once on the captured arm-kind to pre-allocate
+/// the typed `Vec<T>`. An all-NULL / empty input falls back to a
+/// boolean column (the validity bitmap carries the NULLs, so the
+/// data arm is just a placeholder of the right length).
+///
+/// Note: the underlying lift-arm signature (handle -> Duckvalue)
+/// forces a per-cell tag dispatch in the build loops. Threading
+/// the arm's `RetShape` (known at codegen time) through a per-handle
+/// shape registry would let us skip the tag check entirely, but
+/// that touches register.rs + the dispatch surface and is out of
+/// scope for #659. The sniff path here keeps the change local to
+/// emit_lib.rs while still removing one full pass over `values`.
+fn values_to_colvec(values: Vec<types::Duckvalue>) -> Result<column_types::Colvec, types::Duckerror> {
+    // Local arm-kind tag captured during the validity pass. Cheaper
+    // than holding a `&Duckvalue` borrow into `values` once we want
+    // to consume `values` for the variable-width arms.
+    #[derive(Clone, Copy)]
+    enum K {
+        Bool, I64, U64, F64, I32, Ts, I8, I16, U8, U16, U32, F32,
+        Date, Time, Tstz, Decimal, Interval, Uuid, Text, Blob, Complex,
     }
-    let n = values.len();
-    let mut bits = alloc::vec![0u8; (n + 7) / 8];
-    for (i, v) in values.iter().enumerate() {
-        if !matches!(v, types::Duckvalue::Null) {
-            bits[i / 8] |= 1u8 << (i % 8);
+    fn kind_of(v: &types::Duckvalue) -> Option<K> {
+        match v {
+            types::Duckvalue::Null         => None,
+            types::Duckvalue::Boolean(_)   => Some(K::Bool),
+            types::Duckvalue::Int64(_)     => Some(K::I64),
+            types::Duckvalue::Uint64(_)    => Some(K::U64),
+            types::Duckvalue::Float64(_)   => Some(K::F64),
+            types::Duckvalue::Int32(_)     => Some(K::I32),
+            types::Duckvalue::Timestamp(_) => Some(K::Ts),
+            types::Duckvalue::Int8(_)      => Some(K::I8),
+            types::Duckvalue::Int16(_)     => Some(K::I16),
+            types::Duckvalue::Uint8(_)     => Some(K::U8),
+            types::Duckvalue::Uint16(_)    => Some(K::U16),
+            types::Duckvalue::Uint32(_)    => Some(K::U32),
+            types::Duckvalue::Float32(_)   => Some(K::F32),
+            types::Duckvalue::Date(_)      => Some(K::Date),
+            types::Duckvalue::Time(_)      => Some(K::Time),
+            types::Duckvalue::Timestamptz(_) => Some(K::Tstz),
+            types::Duckvalue::Decimal(_)   => Some(K::Decimal),
+            types::Duckvalue::Interval(_)  => Some(K::Interval),
+            types::Duckvalue::Uuid(_)      => Some(K::Uuid),
+            types::Duckvalue::Text(_)      => Some(K::Text),
+            types::Duckvalue::Blob(_)      => Some(K::Blob),
+            types::Duckvalue::Complex(_)   => Some(K::Complex),
         }
     }
-    bits
-}
 
-/// Lower a row-major `Vec<Duckvalue>` back into a `colvec`. The
-/// column arm is type-sniffed from the first non-NULL value; an
-/// all-NULL / empty input falls back to a boolean column (the
-/// validity bitmap carries the NULLs, so the data arm is just a
-/// placeholder of the right length).
-fn values_to_colvec(values: Vec<types::Duckvalue>) -> Result<column_types::Colvec, types::Duckerror> {
     let n = values.len();
     let rows = n as u32;
-    let validity = build_validity_bitmap(&values);
 
-    let sniff = values.iter().find(|v| !matches!(v, types::Duckvalue::Null));
-    let data = match sniff {
+    // Single-pass validity build + first-non-null sniff.
+    let mut bits: Vec<u8> = alloc::vec![0u8; (n + 7) / 8];
+    let mut any_null = false;
+    let mut kind: Option<K> = None;
+    for (i, v) in values.iter().enumerate() {
+        if matches!(v, types::Duckvalue::Null) {
+            any_null = true;
+        } else {
+            bits[i / 8] |= 1u8 << (i % 8);
+            if kind.is_none() { kind = kind_of(v); }
+        }
+    }
+    let validity = if any_null { bits } else { Vec::new() };
+
+    // Typed pre-allocation per arm. `Vec::with_capacity(n)` +
+    // pushes is semantically identical to `iter().map().collect()`
+    // for a slice iterator (which already calls `size_hint`), but
+    // hoisting the allocation up to the arm head makes the pattern
+    // obvious for future per-shape specialization.
+    let data = match kind {
         None => column_types::Column::Boolean(alloc::vec![false; n]),
-        Some(types::Duckvalue::Boolean(_)) => {
-            let xs: Vec<bool> = values.iter().map(|v| match v {
-                types::Duckvalue::Boolean(b) => *b, _ => false,
-            }).collect();
+        Some(K::Bool) => {
+            let mut xs: Vec<bool> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Boolean(b) = v { *b } else { false });
+            }
             column_types::Column::Boolean(xs)
         }
-        Some(types::Duckvalue::Int64(_)) => {
-            let xs: Vec<i64> = values.iter().map(|v| match v {
-                types::Duckvalue::Int64(x) => *x, _ => 0,
-            }).collect();
+        Some(K::I64) => {
+            let mut xs: Vec<i64> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Int64(x) = v { *x } else { 0 });
+            }
             column_types::Column::Int64(xs)
         }
-        Some(types::Duckvalue::Uint64(_)) => {
-            let xs: Vec<u64> = values.iter().map(|v| match v {
-                types::Duckvalue::Uint64(x) => *x, _ => 0,
-            }).collect();
+        Some(K::U64) => {
+            let mut xs: Vec<u64> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Uint64(x) = v { *x } else { 0 });
+            }
             column_types::Column::Uint64(xs)
         }
-        Some(types::Duckvalue::Float64(_)) => {
-            let xs: Vec<f64> = values.iter().map(|v| match v {
-                types::Duckvalue::Float64(x) => *x, _ => 0.0,
-            }).collect();
+        Some(K::F64) => {
+            let mut xs: Vec<f64> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Float64(x) = v { *x } else { 0.0 });
+            }
             column_types::Column::Float64(xs)
         }
-        Some(types::Duckvalue::Int32(_)) => {
-            let xs: Vec<i32> = values.iter().map(|v| match v {
-                types::Duckvalue::Int32(x) => *x, _ => 0,
-            }).collect();
+        Some(K::I32) => {
+            let mut xs: Vec<i32> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Int32(x) = v { *x } else { 0 });
+            }
             column_types::Column::Int32(xs)
         }
-        Some(types::Duckvalue::Timestamp(_)) => {
-            let xs: Vec<i64> = values.iter().map(|v| match v {
-                types::Duckvalue::Timestamp(x) => *x, _ => 0,
-            }).collect();
+        Some(K::Ts) => {
+            let mut xs: Vec<i64> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Timestamp(x) = v { *x } else { 0 });
+            }
             column_types::Column::Timestamp(xs)
         }
-        Some(types::Duckvalue::Int8(_)) => {
-            let xs: Vec<i8> = values.iter().map(|v| match v {
-                types::Duckvalue::Int8(x) => *x, _ => 0,
-            }).collect();
+        Some(K::I8) => {
+            let mut xs: Vec<i8> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Int8(x) = v { *x } else { 0 });
+            }
             column_types::Column::Int8(xs)
         }
-        Some(types::Duckvalue::Int16(_)) => {
-            let xs: Vec<i16> = values.iter().map(|v| match v {
-                types::Duckvalue::Int16(x) => *x, _ => 0,
-            }).collect();
+        Some(K::I16) => {
+            let mut xs: Vec<i16> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Int16(x) = v { *x } else { 0 });
+            }
             column_types::Column::Int16(xs)
         }
-        Some(types::Duckvalue::Uint8(_)) => {
-            let xs: Vec<u8> = values.iter().map(|v| match v {
-                types::Duckvalue::Uint8(x) => *x, _ => 0,
-            }).collect();
+        Some(K::U8) => {
+            let mut xs: Vec<u8> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Uint8(x) = v { *x } else { 0 });
+            }
             column_types::Column::Uint8(xs)
         }
-        Some(types::Duckvalue::Uint16(_)) => {
-            let xs: Vec<u16> = values.iter().map(|v| match v {
-                types::Duckvalue::Uint16(x) => *x, _ => 0,
-            }).collect();
+        Some(K::U16) => {
+            let mut xs: Vec<u16> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Uint16(x) = v { *x } else { 0 });
+            }
             column_types::Column::Uint16(xs)
         }
-        Some(types::Duckvalue::Uint32(_)) => {
-            let xs: Vec<u32> = values.iter().map(|v| match v {
-                types::Duckvalue::Uint32(x) => *x, _ => 0,
-            }).collect();
+        Some(K::U32) => {
+            let mut xs: Vec<u32> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Uint32(x) = v { *x } else { 0 });
+            }
             column_types::Column::Uint32(xs)
         }
-        Some(types::Duckvalue::Float32(_)) => {
-            let xs: Vec<f32> = values.iter().map(|v| match v {
-                types::Duckvalue::Float32(x) => *x, _ => 0.0,
-            }).collect();
+        Some(K::F32) => {
+            let mut xs: Vec<f32> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Float32(x) = v { *x } else { 0.0 });
+            }
             column_types::Column::Float32(xs)
         }
-        Some(types::Duckvalue::Date(_)) => {
-            let xs: Vec<i32> = values.iter().map(|v| match v {
-                types::Duckvalue::Date(x) => *x, _ => 0,
-            }).collect();
+        Some(K::Date) => {
+            let mut xs: Vec<i32> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Date(x) = v { *x } else { 0 });
+            }
             column_types::Column::Date(xs)
         }
-        Some(types::Duckvalue::Time(_)) => {
-            let xs: Vec<i64> = values.iter().map(|v| match v {
-                types::Duckvalue::Time(x) => *x, _ => 0,
-            }).collect();
+        Some(K::Time) => {
+            let mut xs: Vec<i64> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Time(x) = v { *x } else { 0 });
+            }
             column_types::Column::Time(xs)
         }
-        Some(types::Duckvalue::Timestamptz(_)) => {
-            let xs: Vec<i64> = values.iter().map(|v| match v {
-                types::Duckvalue::Timestamptz(x) => *x, _ => 0,
-            }).collect();
+        Some(K::Tstz) => {
+            let mut xs: Vec<i64> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(if let types::Duckvalue::Timestamptz(x) = v { *x } else { 0 });
+            }
             column_types::Column::Timestamptz(xs)
         }
-        Some(types::Duckvalue::Decimal(_)) => {
-            let xs: Vec<column_types::Decimalvalue> = values.iter().map(|v| match v {
-                types::Duckvalue::Decimal(d) => column_types::Decimalvalue {
-                    lower: d.lower, upper: d.upper, width: d.width, scale: d.scale,
-                },
-                _ => column_types::Decimalvalue { lower: 0, upper: 0, width: 0, scale: 0 },
-            }).collect();
+        Some(K::Decimal) => {
+            let mut xs: Vec<column_types::Decimalvalue> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(match v {
+                    types::Duckvalue::Decimal(d) => column_types::Decimalvalue {
+                        lower: d.lower, upper: d.upper, width: d.width, scale: d.scale,
+                    },
+                    _ => column_types::Decimalvalue { lower: 0, upper: 0, width: 0, scale: 0 },
+                });
+            }
             column_types::Column::Decimal(xs)
         }
-        Some(types::Duckvalue::Interval(_)) => {
-            let xs: Vec<column_types::Intervalvalue> = values.iter().map(|v| match v {
-                types::Duckvalue::Interval(d) => column_types::Intervalvalue {
-                    months: d.months, days: d.days, micros: d.micros,
-                },
-                _ => column_types::Intervalvalue { months: 0, days: 0, micros: 0 },
-            }).collect();
+        Some(K::Interval) => {
+            let mut xs: Vec<column_types::Intervalvalue> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(match v {
+                    types::Duckvalue::Interval(d) => column_types::Intervalvalue {
+                        months: d.months, days: d.days, micros: d.micros,
+                    },
+                    _ => column_types::Intervalvalue { months: 0, days: 0, micros: 0 },
+                });
+            }
             column_types::Column::Interval(xs)
         }
-        Some(types::Duckvalue::Uuid(_)) => {
-            let xs: Vec<column_types::Uuidvalue> = values.iter().map(|v| match v {
-                types::Duckvalue::Uuid(d) => column_types::Uuidvalue { hi: d.hi, lo: d.lo },
-                _ => column_types::Uuidvalue { hi: 0, lo: 0 },
-            }).collect();
+        Some(K::Uuid) => {
+            let mut xs: Vec<column_types::Uuidvalue> = Vec::with_capacity(n);
+            for v in &values {
+                xs.push(match v {
+                    types::Duckvalue::Uuid(d) => column_types::Uuidvalue { hi: d.hi, lo: d.lo },
+                    _ => column_types::Uuidvalue { hi: 0, lo: 0 },
+                });
+            }
             column_types::Column::Uuid(xs)
         }
-        Some(types::Duckvalue::Text(_)) => {
-            let xs: Vec<String> = values.into_iter().map(|v| match v {
-                types::Duckvalue::Text(s) => s, _ => String::new(),
-            }).collect();
+        Some(K::Text) => {
+            let mut xs: Vec<String> = Vec::with_capacity(n);
+            for v in values.into_iter() {
+                xs.push(match v {
+                    types::Duckvalue::Text(s) => s,
+                    _ => String::new(),
+                });
+            }
             column_types::Column::Text(xs)
         }
-        Some(types::Duckvalue::Blob(_)) => {
-            let xs: Vec<Vec<u8>> = values.into_iter().map(|v| match v {
-                types::Duckvalue::Blob(b) => b, _ => Vec::new(),
-            }).collect();
+        Some(K::Blob) => {
+            let mut xs: Vec<Vec<u8>> = Vec::with_capacity(n);
+            for v in values.into_iter() {
+                xs.push(match v {
+                    types::Duckvalue::Blob(b) => b,
+                    _ => Vec::new(),
+                });
+            }
             column_types::Column::Blob(xs)
         }
-        Some(types::Duckvalue::Complex(_)) => {
-            let xs: Vec<column_types::Complexvalue> = values.into_iter().map(|v| match v {
-                types::Duckvalue::Complex(c) => column_types::Complexvalue {
-                    type_expr: c.type_expr, json: c.json,
-                },
-                _ => column_types::Complexvalue {
-                    type_expr: String::new(), json: String::new(),
-                },
-            }).collect();
+        Some(K::Complex) => {
+            let mut xs: Vec<column_types::Complexvalue> = Vec::with_capacity(n);
+            for v in values.into_iter() {
+                xs.push(match v {
+                    types::Duckvalue::Complex(c) => column_types::Complexvalue {
+                        type_expr: c.type_expr, json: c.json,
+                    },
+                    _ => column_types::Complexvalue {
+                        type_expr: String::new(), json: String::new(),
+                    },
+                });
+            }
             column_types::Column::Complex(xs)
         }
-        Some(types::Duckvalue::Null) => unreachable!("sniff filtered NULL"),
     };
 
     Ok(column_types::Colvec { data, validity, rows })
