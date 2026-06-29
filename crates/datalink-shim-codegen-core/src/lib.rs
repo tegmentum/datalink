@@ -14,6 +14,7 @@
 pub mod compose_emit;
 pub mod force_link;
 pub mod interface_db;
+pub mod kebab_fix;
 pub mod name_match;
 pub mod override_tables;
 pub mod record_registry;

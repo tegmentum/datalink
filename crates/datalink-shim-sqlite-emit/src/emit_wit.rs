@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 
 use shim_bridge_codegen_core::BridgePlan;
+use datalink_shim_codegen_core::kebab_fix::kebab_fix_wit;
 use datalink_shim_codegen_core::record_registry::RecordType;
 use datalink_shim_codegen_core::wit_parse::{self, WitPackage};
 
@@ -628,8 +629,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
                 copy_tree(&resolved, &to)?;
             } else if resolved.is_file() {
                 if same_file(&resolved, &to) { continue; }
-                fs::copy(&resolved, &to)
-                    .with_context(|| format!("copy {} -> {}", resolved.display(), to.display()))?;
+                copy_file_with_kebab_fix(&resolved, &to)?;
             }
         } else if file_type.is_file() {
             // Phase F (#522): when --out resolves to the SAME path
@@ -641,10 +641,29 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             if same_file(&from, &to) {
                 continue;
             }
-            fs::copy(&from, &to)
-                .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
+            copy_file_with_kebab_fix(&from, &to)?;
         }
         // skip symlinks / other — not expected in WIT trees
+    }
+    Ok(())
+}
+
+/// Copy `from` to `to`, applying the WIT kebab-fix
+/// (`-2d` / `-3d` trailing-segment rewrite, #655) when the source is
+/// a `.wit` file. Non-WIT files pass through `fs::copy` unchanged so
+/// binary artifacts in a WIT tree (rare, but the codegen treats deps
+/// trees opaquely) aren't corrupted by a text-mode round-trip.
+fn copy_file_with_kebab_fix(from: &Path, to: &Path) -> Result<()> {
+    let is_wit = from.extension().and_then(|s| s.to_str()) == Some("wit");
+    if is_wit {
+        let text = fs::read_to_string(from)
+            .with_context(|| format!("read {}", from.display()))?;
+        let fixed = kebab_fix_wit(&text);
+        fs::write(to, fixed)
+            .with_context(|| format!("write kebab-fixed {}", to.display()))?;
+    } else {
+        fs::copy(from, to)
+            .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
     }
     Ok(())
 }
