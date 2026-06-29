@@ -1,0 +1,14 @@
+[package]
+name = "rot47-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `rot47` extension (ROT47 cipher over the 94 printable ASCII chars): the algorithm + the capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "rot47_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }

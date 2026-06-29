@@ -1,0 +1,15 @@
+[package]
+name = "stopwords-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `stopwords` extension (stop-word detection + removal via the `stop-words` crate): the logic + the capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "stopwords_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+stop-words = "*"

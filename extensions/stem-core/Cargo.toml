@@ -1,0 +1,15 @@
+[package]
+name = "stem-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `stem` extension (Snowball word stemming via `rust-stemmers`): the logic + the capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "stem_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+rust-stemmers = "1"
