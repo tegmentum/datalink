@@ -1,0 +1,16 @@
+[package]
+name = "cron-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `cron` extension (deterministic UTC cron evaluation via croner + chrono): the logic + the capability declaration, written ONCE. The per-DB shims are generated from this declaration by datalink-extcore."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "cron_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+croner = "3"
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }

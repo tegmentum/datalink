@@ -1,0 +1,15 @@
+[package]
+name = "emoji-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `emoji` extension (emoji name/shortcode lookups via emojis): the logic + the capability declaration, written ONCE. The per-DB shims are generated from this declaration by datalink-extcore."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "emoji_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+emojis = "0.8"
