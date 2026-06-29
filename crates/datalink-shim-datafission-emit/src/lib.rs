@@ -40,9 +40,13 @@
 //!     `FunctionError::UnknownFunction`.
 //!   * `type-plugin/custom-type` + `multi-custom-type` — empty
 //!     `list-types`; per-type ops return `TypeError::Internal`.
-//!   * `spatial-index-plugin/spatial-index` — stub `name` + empty
-//!     capabilities; `build` returns
-//!     `SpatialError::UnsupportedOperation`.
+//!   * `spatial-index-plugin/spatial-index` — when the shim
+//!     advertises `postgis:wasm/postgis-spatial-index`, wired as a
+//!     pass-through to `pg_strtree::*` (GEOS STRtree:
+//!     name=`"strtree"`, aliases `spatial`/`gist`/`rtree`, full
+//!     envelope+KNN+within-distance capabilities). Bridges without
+//!     that interface fall back to the original stub (advertises
+//!     nothing; `build` returns `SpatialError::UnsupportedOperation`).
 //!   * `system-catalog-plugin/system-catalog` — `catalog-name`
 //!     returns the primary; `list-tables` returns empty.
 //!   * `index-plugin/index` — stub `name` + empty types /

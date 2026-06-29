@@ -25,10 +25,14 @@
 //!   8. Stub impl for multi-custom-type — empty advertisements +
 //!      `Internal` errors. (The single-type `custom-type`
 //!      interface is intentionally NOT exported.)
-//!   9. Stub impls for spatial-index / system-catalog / index-plugin
-//!      — empty advertisements + `Internal` / `UnsupportedOperation`
+//!   9. `impl spatial_index::Guest for Component` — #619: wired as
+//!      a pass-through to `pg_strtree::*` (GEOS STRtree) when the
+//!      shim package surfaces `postgis-spatial-index`; otherwise
+//!      falls back to the empty-advertisement stub.
+//!  10. Stub impls for system-catalog / index-plugin — empty
+//!      advertisements + `Internal` / `UnsupportedOperation`
 //!      errors.
-//!  10. `export!(Component);` at file scope.
+//!  11. `export!(Component);` at file scope.
 //!
 //! Unlike the SQLite and DuckDB targets, datafission's contract
 //! has NO `register_*` call: the host snapshots each registry's
@@ -530,6 +534,31 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         .map(|p| p.variants.iter().any(|v| v.kebab_name == "topology-error"))
         .unwrap_or(false);
 
+    // #619: detect whether any vendored shim package surfaces the
+    // postgis-wasm STRtree interface. When present, the
+    // datafission `spatial-index-plugin::Guest` impl is wired as a
+    // pass-through to `pg_strtree::*` (create/insert/build/query/
+    // destroy); when absent, the original "not wired" stub stands.
+    // The check spans every shim package — postgis is the only
+    // surface that supplies this interface today, but a future
+    // engine could expose its own STRtree under the same package
+    // name without further codegen changes.
+    let shim_has_postgis_spatial_index = shim_packages
+        .iter()
+        .any(|p| {
+            p.ns_name == "postgis:wasm"
+                && p.interfaces.iter().any(|i| i == "postgis-spatial-index")
+        });
+    if shim_has_postgis_spatial_index {
+        // Force-register the postgis-spatial-index alias so the
+        // `use bindings::postgis::wasm::postgis_spatial_index as pg_strtree;`
+        // line is rendered by the loop below — the wired
+        // `spatial_index::Guest` impl references `pg_strtree::*`.
+        used_aliases
+            .entry("pg_strtree".to_string())
+            .or_insert_with(|| "postgis:wasm".to_string());
+    }
+
     // wit-bindgen `additional_derives_ignore` list. Datafission
     // contract packages and helper-shim packages don't ship serde
     // impls (their variants/flags use macros that don't auto-derive),
@@ -594,10 +623,13 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
 //! Scalar-first cut: scalars are wired against the canonical
 //! datafission per-capability contract (version pins
 //! auto-detected from the vendored WIT at codegen time);
-//! aggregates, window functions, table functions,
-//! multi-custom-type, spatial indexes, system catalog, and 1D
-//! index plugin export stubs that advertise nothing and return
-//! `Unknown*` / `Internal` errors on per-call paths. The
+//! aggregates, window functions, table functions and
+//! multi-custom-type are wired where their surface is
+//! non-empty. Spatial indexes are wired pass-through to
+//! `postgis:wasm/postgis-spatial-index` (#619) when the shim
+//! exposes it; system catalog and 1D index plugin export stubs
+//! that advertise nothing and return `Unknown*` / `Internal`
+//! errors on per-call paths. The
 //! single-type `type-plugin/custom-type` interface is
 //! intentionally NOT exported — components register types
 //! through `multi-custom-type` instead. See AGENTS.md (in
@@ -870,9 +902,134 @@ use bindings::datafission::function_plugin::types as types;
     // canonical-CBOR round-trip on the multi-type path lands.
     s.push_str(&build_multi_custom_type_impl(&records));
 
-    // ---- spatial-index: stub ----
-    s.push_str(&format!(
-        r##"impl spatial_index::Guest for Component {{
+    // ---- spatial-index ----
+    // #619 Phase 2A: when the vendored shim package exposes
+    // `postgis:wasm/postgis-spatial-index`, dispatch the
+    // datafission `spatial-index-plugin::Guest` surface through
+    // `pg_strtree::*` (GEOS STRtree). The semantics map cleanly:
+    //
+    //   datafission                postgis-wasm
+    //   ──────────                 ────────────
+    //   build(items)            →  create_index + insert_wkb* + build
+    //   query_envelope          →  query_envelope (envelope unpacked)
+    //   query_knn(wkb, k)       →  query_knn
+    //   query_within_distance   →  envelope-expand + query_envelope
+    //                              (envelope-only fallback path)
+    //   query_within_distance_wkb → query_within_distance (WKB-source)
+    //   destroy                 →  destroy_index
+    //
+    // The upstream STRtree doesn't surface an entry-count
+    // primitive, so `entry_count` returns 0 (the planner treats
+    // this as a "stat unavailable" hint). `update_after_build` is
+    // false because the upstream tree is one-shot.
+    //
+    // Bridges that don't import postgis-spatial-index (e.g. a
+    // future non-spatial datafission extension) keep the original
+    // "not wired" stub so they still build.
+    if shim_has_postgis_spatial_index {
+        s.push_str(
+            r##"impl spatial_index::Guest for Component {
+    fn name() -> String { "strtree".into() }
+    fn aliases() -> Vec<String> {
+        // PostGIS surfaces its STRtree under `USING gist` and
+        // `USING spatial` historically; accept `rtree` too because
+        // dialects vary. Anything not in this set falls through to
+        // a future engine-specific implementation.
+        alloc::vec![
+            "spatial".into(),
+            "gist".into(),
+            "rtree".into(),
+        ]
+    }
+    fn capabilities() -> sitypes::IndexCapabilities {
+        sitypes::IndexCapabilities {
+            knn: true,
+            within_distance: true,
+            within_distance_wkb: true,
+            update_after_build: false,
+        }
+    }
+    fn build(items: Vec<sitypes::BuildItem>) -> Result<u64, sitypes::SpatialError> {
+        // GEOS's default node-capacity is 10 — match the postgis-wasm
+        // wrapper's documented default so behaviour stays stable
+        // whether callers go through this bridge or the sqlink path.
+        let handle = pg_strtree::create_index(10);
+        for item in &items {
+            if !pg_strtree::insert_wkb(handle, &item.wkb, item.item_id) {
+                pg_strtree::destroy_index(handle);
+                return Err(sitypes::SpatialError::InvalidGeometry(
+                    format!("invalid WKB for item-id {}", item.item_id),
+                ));
+            }
+        }
+        if !pg_strtree::build(handle) {
+            pg_strtree::destroy_index(handle);
+            return Err(sitypes::SpatialError::BuildFailed(
+                "STRtree finalise failed".into(),
+            ));
+        }
+        Ok(handle)
+    }
+    fn entry_count(_handle: u64) -> u64 {
+        // postgis-wasm's STRtree interface doesn't surface a count
+        // primitive; reporting 0 lets the planner skip cardinality
+        // weighting rather than misreport.
+        0
+    }
+    fn query_envelope(
+        handle: u64,
+        env: sitypes::Envelope,
+    ) -> Result<Vec<u64>, sitypes::SpatialError> {
+        Ok(pg_strtree::query_envelope(
+            handle,
+            env.min_x,
+            env.min_y,
+            env.max_x,
+            env.max_y,
+        ))
+    }
+    fn query_knn(
+        handle: u64,
+        query_bytes: Vec<u8>,
+        k: u32,
+    ) -> Result<Vec<u64>, sitypes::SpatialError> {
+        Ok(pg_strtree::query_knn(handle, &query_bytes, k))
+    }
+    fn query_within_distance(
+        handle: u64,
+        query_env: sitypes::Envelope,
+        distance: f64,
+    ) -> Result<Vec<u64>, sitypes::SpatialError> {
+        // Envelope-source within-distance: postgis-wasm's predicate
+        // is WKB-driven (GEOS distance over a real geometry), so
+        // synthesise the envelope-expand path the WIT contract
+        // describes as the planner fallback — the host can re-filter
+        // candidates against the true predicate post-pass.
+        Ok(pg_strtree::query_envelope(
+            handle,
+            query_env.min_x - distance,
+            query_env.min_y - distance,
+            query_env.max_x + distance,
+            query_env.max_y + distance,
+        ))
+    }
+    fn query_within_distance_wkb(
+        handle: u64,
+        query_wkb: Vec<u8>,
+        distance: f64,
+    ) -> Result<Vec<u64>, sitypes::SpatialError> {
+        Ok(pg_strtree::query_within_distance(handle, &query_wkb, distance))
+    }
+    fn destroy(handle: u64) {
+        pg_strtree::destroy_index(handle);
+    }
+}
+
+"##,
+        );
+    } else {
+        s.push_str(&format!(
+            r##"impl spatial_index::Guest for Component {{
     fn name() -> String {{ "{primary}-stub-spatial".into() }}
     fn aliases() -> Vec<String> {{ Vec::new() }}
     fn capabilities() -> sitypes::IndexCapabilities {{
@@ -913,8 +1070,9 @@ use bindings::datafission::function_plugin::types as types;
 }}
 
 "##,
-        primary = primary,
-    ));
+            primary = primary,
+        ));
+    }
 
     // ---- system-catalog: stub ----
     s.push_str(&format!(
