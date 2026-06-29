@@ -1,0 +1,11 @@
+package sys:compose@1.0.0;
+
+/// Core compositor world providing plan validation, composition, and execution
+world compositor {
+  import plan;
+  import emit;
+  import exec;
+  import blobs;
+  import trust;
+  import events;
+}

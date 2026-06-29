@@ -1,0 +1,62 @@
+/// Plan interface - declarative composition graph
+interface plan {
+  use types.{error, digest, component-id, secret-token, policy, linkage-mode};
+
+  /// Component specification in the plan
+  record component-spec {
+    /// Component identifier
+    id: component-id,
+    /// Content digest of the component
+    digest: digest,
+    /// Source location (git:// or oci://)
+    source: option<string>,
+  }
+
+  /// Import binding specification
+  record import-binding {
+    /// Import name in the component
+    import-name: string,
+    /// Provider component ID
+    provider-id: component-id,
+    /// Export name from provider
+    export-name: string,
+  }
+
+  /// Secret binding specification
+  record secret-binding {
+    /// Secret identifier in the plan
+    secret-id: string,
+    /// Backend URI (pkcs11://, vault://, etc.)
+    backend-uri: string,
+  }
+
+  /// Composition plan (version 1)
+  record plan-v1 {
+    /// Plan version (must be "1")
+    version: string,
+    /// Root component to execute
+    root: component-id,
+    /// All components in the graph
+    components: list<component-spec>,
+    /// Import/export bindings
+    bindings: list<import-binding>,
+    /// Secret bindings
+    secrets: list<secret-binding>,
+    /// Execution policy
+    policy: policy,
+    /// Linking strategy (static composition vs runtime linking).
+    linkage: linkage-mode,
+  }
+
+  /// Serialize a plan to canonical CBOR bytes
+  serialize: func(plan: plan-v1) -> result<list<u8>, error>;
+
+  /// Deserialize a plan from canonical CBOR bytes
+  deserialize: func(bytes: list<u8>) -> result<plan-v1, error>;
+
+  /// Validate a plan structure and graph
+  validate: func(plan: plan-v1) -> result<_, error>;
+
+  /// Compute the canonical digest of a plan
+  compute-digest: func(plan: plan-v1) -> result<digest, error>;
+}

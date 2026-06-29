@@ -1,0 +1,34 @@
+[package]
+name = "redis-endpoint"
+version = "0.1.0"
+edition = "2021"
+description = """
+DB-agnostic Redis client provider for the compose:dynlink/endpoint contract.
+Speaks the Redis RESP2 wire protocol over wasi:sockets (std TcpStream) — the
+same socket-client path proven by the postgres_scanner / mysql_scanner wasm
+components and the sibling http-endpoint / s3-endpoint providers. This is the
+pilot for the "network client as a pure wasm component" track: a Redis
+extension does NOT need a native host bridge, only a TCP wire client, which
+wasm32-wasip2 supports today. Methods are dispatched via the uniform message
+endpoint with a CBOR request/response envelope.
+"""
+license = "MIT"
+publish = false
+
+# Detached from any parent workspace — built standalone via
+# `cargo build --release --target wasm32-wasip2` in this dir.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.33"
+# CBOR request/response envelope (same as the http-endpoint sibling).
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+
+[profile.release]
+opt-level = "s"
+lto = true
