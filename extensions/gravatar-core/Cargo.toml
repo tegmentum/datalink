@@ -1,0 +1,15 @@
+[package]
+name = "gravatar-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `gravatar` extension (gravatar_hash / gravatar_url over the md5 of a normalized email), written ONCE. The per-DB shims (ducklink duckdb:extension, sqlink sqlite:extension, embed) are generated from this declaration by datalink-extcore."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "gravatar_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+md5 = "0.7"
