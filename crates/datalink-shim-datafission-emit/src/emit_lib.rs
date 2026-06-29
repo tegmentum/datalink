@@ -46,6 +46,185 @@ use datalink_shim_codegen_core::record_registry::{self, RecordType};
 use crate::dispatch;
 use crate::emit_wit;
 
+/// Escape a string literal for direct emission inside a Rust
+/// double-quoted string. Replaces `\` and `"` only — the inputs
+/// here come from the interface DB (SQL identifiers, op tokens,
+/// type names) where embedded newlines and other control chars
+/// are not expected.
+fn rust_str_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Map a BridgePlan `CastRewrite::source_kind` string (as stored in
+/// the interface DB) to the matching `setypes::CastSourceKind`
+/// enum variant. The DB stores values in `castsourcekind::<variant>`
+/// form (the lowercased `Debug` print); newer shims may also send
+/// the bare variant name. Unknown values fall back to `Any` so a
+/// freshly-extracted DB with an unexpected discriminant still
+/// compiles instead of refusing to regen.
+fn cast_source_kind_variant(raw: &str) -> &'static str {
+    let stripped = raw
+        .rsplit("::")
+        .next()
+        .unwrap_or(raw)
+        .to_ascii_lowercase();
+    match stripped.as_str() {
+        "stringliteral" | "string-literal" | "string_literal" => "StringLiteral",
+        "geographycolumn" | "geography-column" | "geography_column" => "GeographyColumn",
+        _ => "Any",
+    }
+}
+
+/// Build the body of `metadata::Guest::list_cast_rewrites()` —
+/// emits `Ok(vec![ setypes::CastRewrite { ... }, ... ])` from
+/// `plan.extensions[*].cast_rewrites`. Empty plan yields the
+/// original `Ok(Vec::new())` so byte-output for extensions with
+/// no cast rewrites stays identical to the prior stub.
+fn build_cast_rewrites_body(plan: &BridgePlan) -> String {
+    let total: usize = plan.extensions.iter().map(|e| e.cast_rewrites.len()).sum();
+    if total == 0 {
+        return "        Ok(Vec::new())\n".to_string();
+    }
+    let mut s = String::new();
+    s.push_str("        Ok(alloc::vec![\n");
+    for ext in &plan.extensions {
+        for c in &ext.cast_rewrites {
+            let variant = cast_source_kind_variant(&c.source_kind);
+            s.push_str(&format!(
+                "            setypes::CastRewrite {{\n\
+                 \x20               target_type: \"{tt}\".to_string(),\n\
+                 \x20               function_name: \"{fn_}\".to_string(),\n\
+                 \x20               source_fn_hint: \"{hint}\".to_string(),\n\
+                 \x20               source_kind: setypes::CastSourceKind::{variant},\n\
+                 \x20           }},\n",
+                tt = rust_str_escape(&c.target_type),
+                fn_ = rust_str_escape(&c.function_name),
+                hint = rust_str_escape(&c.source_fn_hint),
+                variant = variant,
+            ));
+        }
+    }
+    s.push_str("        ])\n");
+    s
+}
+
+/// Build the body of `metadata::Guest::list_operator_rewrites()`.
+fn build_operator_rewrites_body(plan: &BridgePlan) -> String {
+    let total: usize = plan.extensions.iter().map(|e| e.operators.len()).sum();
+    if total == 0 {
+        return "        Ok(Vec::new())\n".to_string();
+    }
+    let mut s = String::new();
+    s.push_str("        Ok(alloc::vec![\n");
+    for ext in &plan.extensions {
+        for op in &ext.operators {
+            let lhs = match op.lhs_type_id {
+                Some(id) => format!("Some({id}u32)"),
+                None => "None".to_string(),
+            };
+            let rhs = match op.rhs_type_id {
+                Some(id) => format!("Some({id}u32)"),
+                None => "None".to_string(),
+            };
+            s.push_str(&format!(
+                "            setypes::OperatorRewrite {{\n\
+                 \x20               symbol: \"{sym}\".to_string(),\n\
+                 \x20               lhs_type_id: {lhs},\n\
+                 \x20               rhs_type_id: {rhs},\n\
+                 \x20               function_name: \"{fn_}\".to_string(),\n\
+                 \x20           }},\n",
+                sym = rust_str_escape(&op.symbol),
+                lhs = lhs,
+                rhs = rhs,
+                fn_ = rust_str_escape(&op.function_name),
+            ));
+        }
+    }
+    s.push_str("        ])\n");
+    s
+}
+
+/// Build the body of `metadata::Guest::list_preprocessor_patterns()`.
+fn build_preprocessor_patterns_body(plan: &BridgePlan) -> String {
+    let total: usize = plan
+        .extensions
+        .iter()
+        .map(|e| e.preprocessor_patterns.len())
+        .sum();
+    if total == 0 {
+        return "        Ok(Vec::new())\n".to_string();
+    }
+    let mut s = String::new();
+    s.push_str("        Ok(alloc::vec![\n");
+    for ext in &plan.extensions {
+        for p in &ext.preprocessor_patterns {
+            s.push_str(&format!(
+                "            setypes::PreprocessorPattern {{\n\
+                 \x20               op_token: \"{tok}\".to_string(),\n\
+                 \x20               function_name: \"{fn_}\".to_string(),\n\
+                 \x20           }},\n",
+                tok = rust_str_escape(&p.op_token),
+                fn_ = rust_str_escape(&p.function_name),
+            ));
+        }
+    }
+    s.push_str("        ])\n");
+    s
+}
+
+/// Build an `aliases:` field literal for the meta record. When the
+/// aliases slice is empty, emits the original `Vec::new()` literal
+/// so byte-output for extensions with no aliases (postgis today)
+/// stays identical to the pre-patch stub. When non-empty, emits a
+/// `vec!["a".to_string(), ...]` populated list.
+fn aliases_literal(aliases: &[String]) -> String {
+    if aliases.is_empty() {
+        return "Vec::new()".to_string();
+    }
+    let mut s = String::new();
+    s.push_str("alloc::vec![");
+    for a in aliases {
+        s.push_str(&format!("\"{}\".to_string(), ", rust_str_escape(a)));
+    }
+    s.push(']');
+    s
+}
+
+/// Build a sql-name → canonical-name + aliases lookup over a
+/// homogeneous slice of BridgePlan function records (each element
+/// must expose its canonical name and alias list via the closures
+/// — keeps this generic over ScalarFn/AggregateFn/WindowFn/TableFn
+/// without dragging a trait through `shim-bridge-codegen-core`).
+///
+/// Returns:
+///   - `alias_set`: every name that is an ALIAS (not a canonical) —
+///     so the per-family registry impl can detect and skip the
+///     redundant meta emission.
+///   - `canonical_aliases`: for each canonical name, the full
+///     aliases vec verbatim from BridgePlan.
+struct NameIndex {
+    alias_set: std::collections::HashSet<String>,
+    canonical_aliases: std::collections::HashMap<String, Vec<String>>,
+}
+
+fn build_name_index<'a, I>(it: I) -> NameIndex
+where
+    I: IntoIterator<Item = (&'a str, &'a [String])>,
+{
+    let mut alias_set = std::collections::HashSet::new();
+    let mut canonical_aliases = std::collections::HashMap::new();
+    for (canonical, aliases) in it {
+        canonical_aliases.insert(canonical.to_string(), aliases.to_vec());
+        for a in aliases {
+            alias_set.insert(a.clone());
+        }
+    }
+    NameIndex {
+        alias_set,
+        canonical_aliases,
+    }
+}
+
 /// Snake → PascalCase converter mirroring wit-bindgen's ident
 /// conversion. Used for resource-type idents (Geometry, Raster,
 /// Topology) and for per-record Rust type names.
@@ -591,26 +770,38 @@ use bindings::datafission::function_plugin::types as types;
         api_version = api_version,
     ));
 
-    // ---- sql-extension-plugin/metadata: empty lists ----
+    // ---- sql-extension-plugin/metadata: WIRED (#650 Path C) ----
+    // Each `list-*` body materialises the static metadata that the
+    // host snapshots at `CREATE EXTENSION` time. Source: the
+    // BridgePlan's `cast_rewrites` / `operators` /
+    // `preprocessor_patterns` (loaded verbatim from the interface
+    // DB). When a plan has zero entries in a given family the body
+    // collapses back to `Ok(Vec::new())` so postgis bridges (which
+    // currently surface postgis casts/ops/preprocs via the same
+    // shape) and any other zero-row extension stay byte-identical
+    // to the pre-patch stub.
+    let cast_body = build_cast_rewrites_body(plan);
+    let op_body = build_operator_rewrites_body(plan);
+    let prep_body = build_preprocessor_patterns_body(plan);
     s.push_str(&format!(
         r##"impl metadata::Guest for Component {{
     fn name() -> String {{ "{primary}".into() }}
     fn version() -> String {{ "{version}".into() }}
 
     fn list_cast_rewrites() -> Result<Vec<setypes::CastRewrite>, setypes::SqlExtError> {{
-        Ok(Vec::new())
-    }}
+{cast_body}    }}
     fn list_operator_rewrites() -> Result<Vec<setypes::OperatorRewrite>, setypes::SqlExtError> {{
-        Ok(Vec::new())
-    }}
+{op_body}    }}
     fn list_preprocessor_patterns() -> Result<Vec<setypes::PreprocessorPattern>, setypes::SqlExtError> {{
-        Ok(Vec::new())
-    }}
+{prep_body}    }}
 }}
 
 "##,
         primary = primary,
         version = version,
+        cast_body = cast_body,
+        op_body = op_body,
+        prep_body = prep_body,
     ));
 
     // ---- scalar-function-registry: WIRED ----
@@ -650,7 +841,7 @@ use bindings::datafission::function_plugin::types as types;
     if window_entries.is_empty() {
         s.push_str(WINDOW_STUB);
     } else {
-        s.push_str(&build_window_registry_impl(&window_entries, primary));
+        s.push_str(&build_window_registry_impl(&window_entries, primary, plan));
     }
 
     // ---- table-function-registry: WIRED ----
@@ -662,7 +853,7 @@ use bindings::datafission::function_plugin::types as types;
         s.push_str(TABLE_STUB);
     } else {
         s.push_str(UDTF_STATE_BLOCK);
-        s.push_str(&build_table_registry_impl(&udtf_entries));
+        s.push_str(&build_table_registry_impl(&udtf_entries, plan));
     }
 
     // ---- multi-custom-type: WIRED ----
@@ -877,6 +1068,16 @@ fn build_scalar_registry_impl(
         }
     }
 
+    // #650 Path C: alias index — when a sql_name is a BridgePlan
+    // alias of some canonical, skip its meta emission (the canonical
+    // will list it in its `aliases` field) but still emit return /
+    // execute arms so an alias-keyed dispatch still works.
+    let name_idx = build_name_index(plan.extensions.iter().flat_map(|e| {
+        e.scalars
+            .iter()
+            .map(|s| (s.canonical_name.as_str(), s.aliases.as_slice()))
+    }));
+
     // First pass: build deduped sql_name list (mirrors the per-arm
     // walk pattern from duckdb-emit's build_scalar_arms — a SQL
     // name might surface multiple times if the entry classifier
@@ -894,6 +1095,11 @@ fn build_scalar_registry_impl(
             det.get(&entry.sql_name).copied().unwrap_or((true, true));
 
         // ---- metadata entry ----
+        // Skip alias entries: their canonical advertises them via
+        // the canonical's `aliases` field. We still emit the per-name
+        // arms below so a host that dispatches by alias name keeps
+        // working without depending on host-side pre-resolution.
+        let is_alias = name_idx.alias_set.contains(&entry.sql_name);
         let mut sig_block = String::new();
         sig_block.push_str("vec![");
         for p in &entry.shape.params {
@@ -903,19 +1109,29 @@ fn build_scalar_registry_impl(
         }
         sig_block.push(']');
         let escaped = entry.sql_name.replace('"', "\\\"");
-        metas_block.push_str(&format!(
-            "        ftypes::ScalarFunctionMeta {{\n\
-             \x20           name: \"{escaped}\".to_string(),\n\
-             \x20           aliases: Vec::new(),\n\
-             \x20           param_types: vec![{sig_block}],\n\
-             \x20           is_deterministic: {deterministic},\n\
-             \x20           propagates_null: {propagates_null},\n\
-             \x20       }},\n",
-            escaped = escaped,
-            sig_block = sig_block,
-            deterministic = deterministic,
-            propagates_null = propagates_null,
-        ));
+        if !is_alias {
+            let aliases_lit = aliases_literal(
+                name_idx
+                    .canonical_aliases
+                    .get(&entry.sql_name)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+            );
+            metas_block.push_str(&format!(
+                "        ftypes::ScalarFunctionMeta {{\n\
+                 \x20           name: \"{escaped}\".to_string(),\n\
+                 \x20           aliases: {aliases_lit},\n\
+                 \x20           param_types: vec![{sig_block}],\n\
+                 \x20           is_deterministic: {deterministic},\n\
+                 \x20           propagates_null: {propagates_null},\n\
+                 \x20       }},\n",
+                escaped = escaped,
+                aliases_lit = aliases_lit,
+                sig_block = sig_block,
+                deterministic = deterministic,
+                propagates_null = propagates_null,
+            ));
+        }
 
         // ---- return_type arm ----
         let ret_logical = dispatch::retshape_to_logicaltype(&entry.shape.ret);
@@ -997,8 +1213,22 @@ fn build_scalar_registry_impl(
 /// `AGGREGATE_STATE_BLOCK` prelude emitted alongside this impl.
 fn build_aggregate_registry_impl(
     agg_entries: &[interface_db::AggregateEntry],
-    _plan: &BridgePlan,
+    plan: &BridgePlan,
 ) -> String {
+    // #650 Path C: alias index — see scalar registry for rationale.
+    // For aggregates, the per-alias `AggregateEntry` rows currently
+    // come from `interface_db::build_aggregate_registry` (which
+    // pushes one entry per canonical + one per alias). We skip the
+    // alias entries here so the canonical meta is the sole carrier
+    // of `aliases`; create/finalize arms still get emitted for
+    // alias sql_names so an alias-keyed dispatch keeps working
+    // without depending on host-side pre-resolution.
+    let name_idx = build_name_index(plan.extensions.iter().flat_map(|e| {
+        e.aggregates
+            .iter()
+            .map(|a| (a.canonical_name.as_str(), a.aliases.as_slice()))
+    }));
+
     // Walk aggregates with first-writer-wins dedupe over sql_name.
     // The host calls all of {create_accumulator, accumulate, ...,
     // finalize} by NAME — but our finalize body needs to know
@@ -1009,11 +1239,30 @@ fn build_aggregate_registry_impl(
         std::collections::HashMap::new();
     let mut next_arm: usize = 0;
     for entry in agg_entries {
-        arm_for.entry(entry.sql_name.clone()).or_insert_with(|| {
+        // Aliases reuse the canonical's arm_idx so the finalize body
+        // is emitted once and shared.
+        let key = if name_idx.alias_set.contains(&entry.sql_name) {
+            // Find the canonical for this alias.
+            plan.extensions
+                .iter()
+                .flat_map(|e| e.aggregates.iter())
+                .find(|a| a.aliases.iter().any(|al| al == &entry.sql_name))
+                .map(|a| a.canonical_name.clone())
+                .unwrap_or_else(|| entry.sql_name.clone())
+        } else {
+            entry.sql_name.clone()
+        };
+        arm_for.entry(key.clone()).or_insert_with(|| {
             let i = next_arm;
             next_arm += 1;
             i
         });
+        // Also bind the entry's own sql_name to the same arm so
+        // create_accumulator can dispatch alias-keyed callers.
+        let canonical_arm = *arm_for.get(&key).unwrap();
+        arm_for
+            .entry(entry.sql_name.clone())
+            .or_insert(canonical_arm);
     }
 
     let mut metas_block = String::new();
@@ -1024,12 +1273,15 @@ fn build_aggregate_registry_impl(
         std::collections::HashSet::new();
     let mut seen_meta: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut seen_create: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for entry in agg_entries {
         let escaped = entry.sql_name.replace('"', "\\\"");
         let arm_idx = *arm_for.get(&entry.sql_name).unwrap();
+        let is_alias = name_idx.alias_set.contains(&entry.sql_name);
 
-        if seen_meta.insert(entry.sql_name.clone()) {
+        if seen_meta.insert(entry.sql_name.clone()) && !is_alias {
             // ---- metadata entry ----
             let mut sig_block = String::new();
             sig_block.push_str("vec![vec![");
@@ -1050,10 +1302,17 @@ fn build_aggregate_registry_impl(
                 cfg_indices.push_str(&format!("{i1}u32, "));
             }
             let accepts_config = !entry.shape.extra_args.is_empty();
+            let aliases_lit = aliases_literal(
+                name_idx
+                    .canonical_aliases
+                    .get(&entry.sql_name)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+            );
             metas_block.push_str(&format!(
                 "        ftypes::AggregateFunctionMeta {{\n\
                  \x20           name: \"{escaped}\".to_string(),\n\
-                 \x20           aliases: Vec::new(),\n\
+                 \x20           aliases: {aliases_lit},\n\
                  \x20           param_types: {sig_block},\n\
                  \x20           supports_grouped: true,\n\
                  \x20           supports_partial: true,\n\
@@ -1068,10 +1327,22 @@ fn build_aggregate_registry_impl(
             return_arms.push_str(&format!(
                 "            \"{escaped}\" => Ok({ret_logical}),\n",
             ));
+        }
 
+        if seen_create.insert(entry.sql_name.clone()) {
             create_arms.push_str(&format!(
                 "            \"{escaped}\" => {arm_idx}usize,\n",
             ));
+            // For aliases, also emit the return_type arm (it was
+            // skipped above because the meta block was skipped) so
+            // alias-keyed return-type lookups still resolve.
+            if is_alias {
+                let ret_logical =
+                    dispatch::aggregate_ret_logicaltype(&entry.shape);
+                return_arms.push_str(&format!(
+                    "            \"{escaped}\" => Ok({ret_logical}),\n",
+                ));
+            }
         }
 
         if emitted_finalize.insert(arm_idx) {
@@ -1307,7 +1578,15 @@ fn alloc_accumulator(arm_idx: usize, extras: Vec<String>) -> u64 {
 fn build_window_registry_impl(
     window_entries: &[interface_db::WindowEntry],
     primary: &str,
+    plan: &BridgePlan,
 ) -> String {
+    // #650 Path C: alias index (see scalar registry for rationale).
+    let name_idx = build_name_index(plan.extensions.iter().flat_map(|e| {
+        e.window_functions
+            .iter()
+            .map(|w| (w.canonical_name.as_str(), w.aliases.as_slice()))
+    }));
+
     let mut metas_block = String::new();
     let mut return_arms = String::new();
     let mut compute_arms = String::new();
@@ -1318,33 +1597,44 @@ fn build_window_registry_impl(
 
     for entry in window_entries {
         let escaped = entry.sql_name.replace('"', "\\\"");
+        let is_alias = name_idx.alias_set.contains(&entry.sql_name);
 
         if seen_meta.insert(entry.sql_name.clone()) {
-            // ---- metadata entry ----
-            let mut sig_block = String::new();
-            sig_block.push_str("vec![vec![");
-            // Streaming partition arg: Binary (WKB).
-            sig_block.push_str("ftypes::LogicalType::Binary, ");
-            for p in &entry.shape.extra_args {
-                let lt = dispatch::paramshape_to_logicaltype(p);
-                sig_block.push_str(&lt);
-                sig_block.push_str(", ");
-            }
-            sig_block.push_str("]]");
-            metas_block.push_str(&format!(
-                "        ftypes::WindowFunctionMeta {{\n\
-                 \x20           name: \"{escaped}\".to_string(),\n\
-                 \x20           aliases: Vec::new(),\n\
-                 \x20           param_types: {sig_block},\n\
-                 \x20       }},\n",
-            ));
-
-            // ---- return_type arm ----
             let ret_logical = match &entry.shape.returns {
                 interface_db::WindowReturn::OptionU32
                 | interface_db::WindowReturn::U32 => "types::LogicalType::Int64",
                 interface_db::WindowReturn::GeomBlob => "types::LogicalType::Binary",
             };
+            // ---- metadata entry (skipped for alias sql_names) ----
+            if !is_alias {
+                let mut sig_block = String::new();
+                sig_block.push_str("vec![vec![");
+                // Streaming partition arg: Binary (WKB).
+                sig_block.push_str("ftypes::LogicalType::Binary, ");
+                for p in &entry.shape.extra_args {
+                    let lt = dispatch::paramshape_to_logicaltype(p);
+                    sig_block.push_str(&lt);
+                    sig_block.push_str(", ");
+                }
+                sig_block.push_str("]]");
+                let aliases_lit = aliases_literal(
+                    name_idx
+                        .canonical_aliases
+                        .get(&entry.sql_name)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]),
+                );
+                metas_block.push_str(&format!(
+                    "        ftypes::WindowFunctionMeta {{\n\
+                     \x20           name: \"{escaped}\".to_string(),\n\
+                     \x20           aliases: {aliases_lit},\n\
+                     \x20           param_types: {sig_block},\n\
+                     \x20       }},\n",
+                ));
+            }
+
+            // ---- return_type arm (emitted for canonical AND alias
+            // sql_names so alias-keyed dispatch still resolves) ----
             return_arms.push_str(&format!(
                 "            \"{escaped}\" => Ok({ret_logical}),\n",
             ));
@@ -1533,7 +1823,15 @@ fn emit_window_compute_arm_body(
 /// rows), plus next_row + end against the UDTF_STATE handle table.
 fn build_table_registry_impl(
     udtf_entries: &[interface_db::UdtfEntry],
+    plan: &BridgePlan,
 ) -> String {
+    // #650 Path C: alias index (see scalar registry for rationale).
+    let name_idx = build_name_index(plan.extensions.iter().flat_map(|e| {
+        e.table_functions
+            .iter()
+            .map(|t| (t.canonical_name.as_str(), t.aliases.as_slice()))
+    }));
+
     let mut metas_block = String::new();
     let mut output_schema_arms = String::new();
     let mut begin_arms = String::new();
@@ -1545,23 +1843,33 @@ fn build_table_registry_impl(
             continue;
         }
         let escaped = entry.sql_name.replace('"', "\\\"");
+        let is_alias = name_idx.alias_set.contains(&entry.sql_name);
 
-        // ---- metadata entry ----
-        let mut sig_block = String::new();
-        sig_block.push_str("vec![vec![");
-        for p in &entry.shape.params {
-            let lt = dispatch::paramshape_to_logicaltype(p);
-            sig_block.push_str(&lt);
-            sig_block.push_str(", ");
+        // ---- metadata entry (skipped for alias sql_names) ----
+        if !is_alias {
+            let mut sig_block = String::new();
+            sig_block.push_str("vec![vec![");
+            for p in &entry.shape.params {
+                let lt = dispatch::paramshape_to_logicaltype(p);
+                sig_block.push_str(&lt);
+                sig_block.push_str(", ");
+            }
+            sig_block.push_str("]]");
+            let aliases_lit = aliases_literal(
+                name_idx
+                    .canonical_aliases
+                    .get(&entry.sql_name)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+            );
+            metas_block.push_str(&format!(
+                "        ftypes::TableFunctionMeta {{\n\
+                 \x20           name: \"{escaped}\".to_string(),\n\
+                 \x20           aliases: {aliases_lit},\n\
+                 \x20           param_types: {sig_block},\n\
+                 \x20       }},\n",
+            ));
         }
-        sig_block.push_str("]]");
-        metas_block.push_str(&format!(
-            "        ftypes::TableFunctionMeta {{\n\
-             \x20           name: \"{escaped}\".to_string(),\n\
-             \x20           aliases: Vec::new(),\n\
-             \x20           param_types: {sig_block},\n\
-             \x20       }},\n",
-        ));
 
         // ---- output_schema arm ----
         let cols = dispatch::emit_udtf_column_info(&entry.shape);
