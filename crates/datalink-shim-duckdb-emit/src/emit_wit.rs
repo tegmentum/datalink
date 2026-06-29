@@ -318,6 +318,17 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         return Err(anyhow!("source {} is not a directory", src.display()));
     }
+    // #656: if `dst` is itself a symlink pointing back at a source WIT
+    // tree, the umbrella-prune below would `unlink` files at the source
+    // location (path traversal follows the dst symlink). Replace any dst
+    // symlink with a real directory before continuing.
+    if let Ok(meta) = fs::symlink_metadata(dst) {
+        if meta.file_type().is_symlink() {
+            fs::remove_file(dst).with_context(|| {
+                format!("removing dst symlink {}", dst.display())
+            })?;
+        }
+    }
     fs::create_dir_all(dst)?;
     // #642: when the upstream shim splits an umbrella `world.wit` into
     // per-interface .wit files, a stale `dst/world.wit` left over from
@@ -325,8 +336,9 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     // triggering a "duplicate item" parse error. Drop the stale file
     // before copying — if the source still owns a `world.wit`, the
     // loop below copies it right back; if not, it stays gone.
+    // Use `symlink_metadata` so we don't follow a `world.wit` symlink.
     let stale_world = dst.join("world.wit");
-    if stale_world.exists() {
+    if fs::symlink_metadata(&stale_world).is_ok() {
         fs::remove_file(&stale_world)
             .with_context(|| format!("removing stale {}", stale_world.display()))?;
     }

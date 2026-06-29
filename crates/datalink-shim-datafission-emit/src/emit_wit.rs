@@ -466,6 +466,21 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         return Err(anyhow!("source {} is not a directory", src.display()));
     }
+    // #656: if `dst` is itself a symlink (datafission extensions ship
+    // `wit/deps/<pkg> -> ../../../../wit/<pkg>` symlinks pointing back at
+    // the source-of-truth WIT tree), every subsequent path operation that
+    // joins onto `dst` traverses the symlink. The umbrella-prune below
+    // (#642) would then `unlink` files at the SOURCE location, silently
+    // deleting `$DATAFISSION_WIT/<pkg>/world.wit` on each regen.
+    // Replace any dst symlink with a real directory before continuing —
+    // the copy loop below will repopulate it from `src`.
+    if let Ok(meta) = fs::symlink_metadata(dst) {
+        if meta.file_type().is_symlink() {
+            fs::remove_file(dst).with_context(|| {
+                format!("removing dst symlink {}", dst.display())
+            })?;
+        }
+    }
     fs::create_dir_all(dst)?;
     // #642: when the upstream shim splits an umbrella `world.wit` into
     // per-interface .wit files, a stale `dst/world.wit` left over from
@@ -473,10 +488,18 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     // triggering a "duplicate item" parse error. Drop the stale file
     // before copying — if the source still owns a `world.wit`, the
     // loop below copies it right back; if not, it stays gone.
+    // Use `symlink_metadata` (not `exists`) so we don't follow a
+    // `world.wit` symlink and `unlink` the file at its target.
     let stale_world = dst.join("world.wit");
-    if stale_world.exists() {
-        fs::remove_file(&stale_world)
-            .with_context(|| format!("removing stale {}", stale_world.display()))?;
+    match fs::symlink_metadata(&stale_world) {
+        Ok(_) => {
+            // Regular file or symlink — either way, `remove_file` only
+            // unlinks the directory entry at this path (does not follow
+            // a final-component symlink), which is what we want.
+            fs::remove_file(&stale_world)
+                .with_context(|| format!("removing stale {}", stale_world.display()))?;
+        }
+        Err(_) => {}
     }
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -514,5 +537,82 @@ fn same_file(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// #656: when `dst` is a symlink pointing back at the source WIT
+    /// tree, `copy_tree` must not delete source files through the
+    /// symlink. The pre-fix code path called `fs::remove_file` on
+    /// `dst.join("world.wit")`, whose path traversal followed the dst
+    /// symlink and unlinked the file at the source location.
+    #[test]
+    fn copy_tree_does_not_delete_through_dst_symlink() {
+        let tmp = std::env::temp_dir().join(format!(
+            "datafission-656-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let src = tmp.join("src/wit/extension");
+        let out_deps = tmp.join("out/wit/deps");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&out_deps).unwrap();
+        let source_world = src.join("world.wit");
+        fs::write(&source_world, "source content").unwrap();
+
+        let dst = out_deps.join("extension");
+        symlink(&src, &dst).unwrap();
+
+        // src has a single regular file (world.wit) which copy_tree
+        // will iterate over.
+        copy_tree(&src, &dst).unwrap();
+
+        // Source file must still exist with original content.
+        assert!(
+            source_world.is_file(),
+            "source world.wit was deleted by copy_tree"
+        );
+        let after = fs::read_to_string(&source_world).unwrap();
+        assert_eq!(after, "source content");
+
+        // dst is now a real directory (the symlink got replaced).
+        let meta = fs::symlink_metadata(&dst).unwrap();
+        assert!(meta.file_type().is_dir(), "dst should be real dir");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// #642 must keep working: a stale REAL `world.wit` file in dst
+    /// (not a symlink) is still pruned before the copy loop runs.
+    #[test]
+    fn copy_tree_still_prunes_real_stale_world() {
+        let tmp = std::env::temp_dir().join(format!(
+            "datafission-642-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let src = tmp.join("src/wit/extension");
+        let dst = tmp.join("out/wit/deps/extension");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        // Source has no world.wit (umbrella was split into pieces).
+        fs::write(src.join("piece.wit"), "interface piece {}").unwrap();
+        // dst has a stale REAL world.wit from a previous regen.
+        fs::write(dst.join("world.wit"), "stale umbrella").unwrap();
+
+        copy_tree(&src, &dst).unwrap();
+
+        assert!(
+            !dst.join("world.wit").exists(),
+            "#642 regression: stale real world.wit was not pruned"
+        );
+        assert!(dst.join("piece.wit").is_file());
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
