@@ -1,0 +1,15 @@
+[package]
+name = "hashids-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `hashids` extension (Hashids integer-id obfuscation: hashids_encode / hashids_decode via `harsh`), written ONCE. The per-DB shims are generated from this declaration by datalink-extcore. NULL / undecodable -> NULL; a NULL salt coerces to the empty salt."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "hashids_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+harsh = "0.2"
