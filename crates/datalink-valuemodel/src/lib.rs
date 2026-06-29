@@ -115,6 +115,138 @@ impl NeutralValue {
     }
 }
 
+/// A typed, contiguous neutral COLUMN — the columnar counterpart of a
+/// per-cell [`NeutralValue`] list. This is the neutral spelling of the
+/// proposed major-4 `duckdb:extension` columnar ABI (`column` variant):
+/// one buffer per physical type, so the WIT canonical-ABI crossing is a
+/// bulk `memcpy` for fixed-width arms instead of a per-cell tagged-variant
+/// serialization. Variable-width arms (`Text`/`Blob`) stay element-wise
+/// (unavoidable), and anything outside the closed set rides
+/// [`NeutralColumn::Complex`] exactly as [`NeutralValue::Complex`] does.
+///
+/// Measured win of the columnar boundary over the row-major
+/// `list<list<duckvalue>>` boundary: ~82-110x on a 1M-row i64 scalar (the
+/// canonical-ABI marshalling drops from ~73 ns/row to ~0.9 ns/row); see
+/// the `columnar-abi-prototype` bench. NULLs are carried out-of-band in a
+/// packed validity bitmap so the data buffer stays a flat typed array.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NeutralColumn {
+    /// Logical boolean column.
+    Boolean(Vec<bool>),
+    /// 64-bit signed integer column (also carries the physical-int aliases
+    /// the host widens — date/time/timestamp ride the host `column` arms).
+    Int64(Vec<i64>),
+    /// IEEE-754 double column.
+    Float64(Vec<f64>),
+    /// UTF-8 text column (element-wise; var-width).
+    Text(Vec<String>),
+    /// Binary blob column (element-wise; var-width).
+    Blob(Vec<Vec<u8>>),
+    /// Escape-hatch column: one `(type-expr, json)` per row. `type_expr`
+    /// is shared across the column; `json` is per-row.
+    Complex {
+        /// The shared DuckDB type-expression for every element.
+        type_expr: String,
+        /// The per-row JSON-rendered values.
+        json: Vec<String>,
+    },
+}
+
+impl NeutralColumn {
+    /// Number of rows in the column.
+    pub fn len(&self) -> usize {
+        match self {
+            NeutralColumn::Boolean(v) => v.len(),
+            NeutralColumn::Int64(v) => v.len(),
+            NeutralColumn::Float64(v) => v.len(),
+            NeutralColumn::Text(v) => v.len(),
+            NeutralColumn::Blob(v) => v.len(),
+            NeutralColumn::Complex { json, .. } => json.len(),
+        }
+    }
+
+    /// True if the column has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The [`NeutralType`] every element of this column carries.
+    pub fn neutral_type(&self) -> NeutralType {
+        match self {
+            NeutralColumn::Boolean(_) => NeutralType::Boolean,
+            NeutralColumn::Int64(_) => NeutralType::Int64,
+            NeutralColumn::Float64(_) => NeutralType::Float64,
+            NeutralColumn::Text(_) => NeutralType::Text,
+            NeutralColumn::Blob(_) => NeutralType::Blob,
+            NeutralColumn::Complex { type_expr, .. } => {
+                NeutralType::Complex(type_expr.clone())
+            }
+        }
+    }
+
+    /// Read row `i` as a [`NeutralValue`] (the bridge to per-row core logic
+    /// for cores that have not yet been ported to a columnar kernel).
+    /// `valid` is this row's validity bit (false ⇒ [`NeutralValue::Null`]).
+    pub fn value_at(&self, i: usize, valid: bool) -> NeutralValue {
+        if !valid {
+            return NeutralValue::Null;
+        }
+        match self {
+            NeutralColumn::Boolean(v) => NeutralValue::Boolean(v[i]),
+            NeutralColumn::Int64(v) => NeutralValue::Int64(v[i]),
+            NeutralColumn::Float64(v) => NeutralValue::Float64(v[i]),
+            NeutralColumn::Text(v) => NeutralValue::Text(v[i].clone()),
+            NeutralColumn::Blob(v) => NeutralValue::Blob(v[i].clone()),
+            NeutralColumn::Complex { type_expr, json } => NeutralValue::Complex {
+                type_expr: type_expr.clone(),
+                json: json[i].clone(),
+            },
+        }
+    }
+}
+
+/// A neutral column plus its packed validity bitmap and row count — the
+/// neutral counterpart of the proposed major-4 `colvec` record. `validity`
+/// is a packed little-endian bitmap (bit `i` set ⇒ row `i` valid); an
+/// EMPTY bitmap means "all rows valid", mirroring DuckDB's null validity
+/// pointer (the common, fast case allocates nothing).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NeutralColVec {
+    /// The typed data buffer.
+    pub data: NeutralColumn,
+    /// Packed validity bits; empty ⇒ all valid.
+    pub validity: Vec<u8>,
+    /// The logical row count.
+    pub rows: usize,
+}
+
+impl NeutralColVec {
+    /// Construct an all-valid column (empty validity bitmap).
+    pub fn all_valid(data: NeutralColumn) -> Self {
+        let rows = data.len();
+        NeutralColVec {
+            data,
+            validity: Vec::new(),
+            rows,
+        }
+    }
+
+    /// True if row `i` is valid (non-NULL). An empty bitmap ⇒ all valid.
+    #[inline]
+    pub fn is_valid(&self, i: usize) -> bool {
+        if self.validity.is_empty() {
+            return true;
+        }
+        let byte = i >> 3;
+        byte >= self.validity.len() || (self.validity[byte] >> (i & 7)) & 1 != 0
+    }
+
+    /// Read row `i` as a [`NeutralValue`], honoring validity.
+    pub fn value_at(&self, i: usize) -> NeutralValue {
+        self.data.value_at(i, self.is_valid(i))
+    }
+}
+
 /// How a scalar handles a NULL argument. This is part of the capability
 /// declaration so the generated shim encodes the contract uniformly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -41,7 +41,8 @@
 extern crate alloc;
 
 pub use datalink_valuemodel::{
-    CapabilityKind, FnDecl, NeutralType, NeutralValue, NullHandling,
+    CapabilityKind, FnDecl, NeutralColVec, NeutralColumn, NeutralType, NeutralValue,
+    NullHandling,
 };
 
 use alloc::string::String;
@@ -94,6 +95,159 @@ pub fn scalar_batch<V, E>(
         out.push(from_neutral(res));
     }
     Ok(out)
+}
+
+/// Columnar scalar dispatch — the guest side of the proposed major-4
+/// `call-scalar-batch-col` ABI. The host hands one [`NeutralColVec`] per
+/// argument (each a contiguous typed buffer + a packed validity bitmap),
+/// the generated columnar shim having lifted them via a bulk `memcpy`
+/// across the canonical ABI instead of the row-major
+/// `list<list<duckvalue>>` per-cell tagged-variant serialization. This is
+/// where the ~82-110x boundary win is realized (see the
+/// `columnar-abi-prototype` bench).
+///
+/// The kernel here still bridges to the per-row `dispatch` so EVERY
+/// existing core works under the columnar ABI with zero per-core changes:
+/// only the boundary representation changed, not the core's neutral logic.
+/// A core that later ships a true vectorized kernel can supersede this
+/// bridge, but it is never required. Semantics are identical to
+/// [`scalar_batch`]: row `i` ⇒ `out[i]`, and a [`NullHandling::Propagate`]
+/// function yields NULL (validity bit cleared) for any row with a NULL
+/// argument without invoking the core.
+///
+/// `ret` is the declared return [`NeutralType`]; the output column is a
+/// matching typed buffer. The reused `scratch` neutral row buffer means a
+/// chunk allocates only the output column + (lazily) one validity byte
+/// vector, not 2048 inner vectors.
+pub fn scalar_batch_col(
+    idx: usize,
+    propagate: bool,
+    ret: &NeutralType,
+    args: &[NeutralColVec],
+    dispatch: impl Fn(usize, &[NeutralValue]) -> Result<NeutralValue, String>,
+) -> Result<NeutralColVec, String> {
+    let rows = args.first().map(|c| c.rows).unwrap_or(0);
+    let mut out = OutColumn::with_capacity(ret, rows);
+    let mut scratch: Vec<NeutralValue> = Vec::with_capacity(args.len());
+    let mut validity = ValidityBuilder::new(rows);
+    for r in 0..rows {
+        scratch.clear();
+        let mut any_null = false;
+        for col in args {
+            let v = col.value_at(r);
+            any_null |= v.is_null();
+            scratch.push(v);
+        }
+        if propagate && any_null {
+            out.push(NeutralValue::Null);
+            validity.set_null(r);
+            continue;
+        }
+        let res = dispatch(idx, &scratch)?;
+        if res.is_null() {
+            validity.set_null(r);
+        }
+        out.push(res);
+    }
+    Ok(NeutralColVec {
+        data: out.finish(),
+        validity: validity.finish(),
+        rows,
+    })
+}
+
+/// Accumulates a typed output column for [`scalar_batch_col`], pushing one
+/// [`NeutralValue`] per row into the buffer matching the declared return
+/// type. A value whose type does not match the declared return is coerced
+/// to the column's NULL slot (the validity bitmap records the NULL); this
+/// mirrors the row-major path, where a type mismatch is the core's bug, not
+/// a panic.
+enum OutColumn {
+    Boolean(Vec<bool>),
+    Int64(Vec<i64>),
+    Float64(Vec<f64>),
+    Text(Vec<String>),
+    Blob(Vec<Vec<u8>>),
+    Complex { type_expr: String, json: Vec<String> },
+}
+
+impl OutColumn {
+    fn with_capacity(ret: &NeutralType, rows: usize) -> Self {
+        match ret {
+            NeutralType::Boolean => OutColumn::Boolean(Vec::with_capacity(rows)),
+            NeutralType::Int64 => OutColumn::Int64(Vec::with_capacity(rows)),
+            NeutralType::Float64 => OutColumn::Float64(Vec::with_capacity(rows)),
+            NeutralType::Text => OutColumn::Text(Vec::with_capacity(rows)),
+            NeutralType::Blob => OutColumn::Blob(Vec::with_capacity(rows)),
+            NeutralType::Complex(te) => OutColumn::Complex {
+                type_expr: te.clone(),
+                json: Vec::with_capacity(rows),
+            },
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, v: NeutralValue) {
+        match (self, v) {
+            (OutColumn::Boolean(b), NeutralValue::Boolean(x)) => b.push(x),
+            (OutColumn::Boolean(b), _) => b.push(false),
+            (OutColumn::Int64(b), NeutralValue::Int64(x)) => b.push(x),
+            (OutColumn::Int64(b), _) => b.push(0),
+            (OutColumn::Float64(b), NeutralValue::Float64(x)) => b.push(x),
+            (OutColumn::Float64(b), _) => b.push(0.0),
+            (OutColumn::Text(b), NeutralValue::Text(x)) => b.push(x),
+            (OutColumn::Text(b), _) => b.push(String::new()),
+            (OutColumn::Blob(b), NeutralValue::Blob(x)) => b.push(x),
+            (OutColumn::Blob(b), _) => b.push(Vec::new()),
+            (OutColumn::Complex { json, .. }, NeutralValue::Complex { json: j, .. }) => {
+                json.push(j)
+            }
+            (OutColumn::Complex { json, .. }, _) => json.push(String::new()),
+        }
+    }
+
+    fn finish(self) -> NeutralColumn {
+        match self {
+            OutColumn::Boolean(b) => NeutralColumn::Boolean(b),
+            OutColumn::Int64(b) => NeutralColumn::Int64(b),
+            OutColumn::Float64(b) => NeutralColumn::Float64(b),
+            OutColumn::Text(b) => NeutralColumn::Text(b),
+            OutColumn::Blob(b) => NeutralColumn::Blob(b),
+            OutColumn::Complex { type_expr, json } => {
+                NeutralColumn::Complex { type_expr, json }
+            }
+        }
+    }
+}
+
+/// Lazily-allocated packed validity bitmap. Stays empty (zero allocation)
+/// until the first NULL is recorded, matching the all-valid fast path of
+/// DuckDB's null validity pointer and [`NeutralColVec::all_valid`].
+struct ValidityBuilder {
+    rows: usize,
+    bits: Vec<u8>,
+}
+
+impl ValidityBuilder {
+    fn new(rows: usize) -> Self {
+        ValidityBuilder { rows, bits: Vec::new() }
+    }
+
+    #[inline]
+    fn set_null(&mut self, row: usize) {
+        if self.bits.is_empty() {
+            // Allocate all-valid (all bits set), then clear this row.
+            self.bits = alloc::vec![0xFF; (self.rows + 7) / 8];
+        }
+        let byte = row >> 3;
+        if byte < self.bits.len() {
+            self.bits[byte] &= !(1u8 << (row & 7));
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bits
+    }
 }
 
 /// The contract an extension core implements. `declare!` generates this
@@ -205,3 +359,69 @@ mod shim_duckdb_agg;
 mod shim_embed;
 mod shim_sqlite;
 mod shim_sqlite_agg;
+
+#[cfg(test)]
+mod columnar_tests {
+    use super::*;
+    use alloc::vec;
+
+    // +1 i64 scalar; CALLED null-handling (inspects the NULL itself).
+    fn plus_one(_idx: usize, args: &[NeutralValue]) -> Result<NeutralValue, String> {
+        match args.first() {
+            Some(NeutralValue::Int64(n)) => Ok(NeutralValue::Int64(n + 1)),
+            _ => Ok(NeutralValue::Null),
+        }
+    }
+
+    #[test]
+    fn columnar_matches_rowmajor_all_valid() {
+        let n = 2048usize;
+        let data: Vec<i64> = (0..n as i64).collect();
+        let col = NeutralColVec::all_valid(NeutralColumn::Int64(data.clone()));
+        let out = scalar_batch_col(0, false, &NeutralType::Int64, &[col], plus_one).unwrap();
+        assert_eq!(out.rows, n);
+        assert!(out.validity.is_empty(), "all-valid stays zero-alloc");
+        match out.data {
+            NeutralColumn::Int64(v) => {
+                for (i, x) in v.iter().enumerate() {
+                    assert_eq!(*x, i as i64 + 1);
+                }
+            }
+            _ => panic!("wrong out type"),
+        }
+    }
+
+    #[test]
+    fn columnar_propagate_sets_validity_for_null_rows() {
+        // rows 3 and 7 NULL; propagate => result NULL at those rows.
+        let n = 10usize;
+        let data: Vec<i64> = (0..n as i64).collect();
+        let mut validity = vec![0xFFu8; (n + 7) / 8];
+        for &null_row in &[3usize, 7] {
+            validity[null_row >> 3] &= !(1u8 << (null_row & 7));
+        }
+        let col = NeutralColVec {
+            data: NeutralColumn::Int64(data),
+            validity,
+            rows: n,
+        };
+        let out = scalar_batch_col(0, true, &NeutralType::Int64, &[col], plus_one).unwrap();
+        for r in 0..n {
+            let valid = out.is_valid(r);
+            if r == 3 || r == 7 {
+                assert!(!valid, "row {r} should be NULL");
+            } else {
+                assert!(valid, "row {r} should be valid");
+                assert_eq!(out.value_at(r), NeutralValue::Int64(r as i64 + 1));
+            }
+        }
+    }
+
+    #[test]
+    fn columnar_empty_chunk() {
+        let col = NeutralColVec::all_valid(NeutralColumn::Int64(Vec::new()));
+        let out = scalar_batch_col(0, false, &NeutralType::Int64, &[col], plus_one).unwrap();
+        assert_eq!(out.rows, 0);
+        assert_eq!(out.data, NeutralColumn::Int64(Vec::new()));
+    }
+}
