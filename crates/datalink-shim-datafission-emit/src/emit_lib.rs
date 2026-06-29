@@ -1074,54 +1074,29 @@ use bindings::datafission::function_plugin::types as types;
         ));
     }
 
-    // ---- system-catalog: stub ----
-    s.push_str(&format!(
-        r##"impl system_catalog::Guest for Component {{
-    fn catalog_name() -> String {{ "{primary}".into() }}
-    fn list_tables() -> Result<Vec<sctypes::SystemTable>, sctypes::CatalogError> {{
-        Ok(Vec::new())
-    }}
-    fn read_table(table_name: String) -> Result<
-        Vec<Vec<sctypes::ScalarValue>>, sctypes::CatalogError,
-    > {{
-        Err(sctypes::CatalogError::UnknownTable(table_name))
-    }}
-    fn notify_extension_column_added(
-        _session_id: u64,
-        _catalog: String,
-        _schema: String,
-        _table_name: String,
-        _column_name: String,
-        _type_id: u32,
-        _srid: Option<i32>,
-        _coord_dim: Option<i32>,
-    ) {{}}
-    fn notify_extension_column_removed(
-        _session_id: u64,
-        _catalog: String,
-        _schema: String,
-        _table_name: String,
-        _column_name: String,
-    ) {{}}
-    fn read_table_for_session(
-        _session_id: u64,
-        table_name: String,
-    ) -> Result<Vec<Vec<sctypes::ScalarValue>>, sctypes::CatalogError> {{
-        Err(sctypes::CatalogError::UnknownTable(table_name))
-    }}
-    fn notify_extension_column_raster_metadata(
-        _session_id: u64,
-        _catalog: String,
-        _schema: String,
-        _table_name: String,
-        _column_name: String,
-        _metadata: sctypes::RasterColumnMetadata,
-    ) {{}}
-}}
-
-"##,
-        primary = primary,
-    ));
+    // ---- system-catalog-plugin (#620): honest stub ----
+    //
+    // The `datafission:system-catalog-plugin/system-catalog` interface
+    // advertises read-only virtual catalog tables — PostGIS's
+    // `spatial_ref_sys` / `geometry_columns` / `raster_columns`,
+    // analogous extensions for vector, jsonb, etc. The BridgePlan
+    // substrate has no `catalog_entries` field today; none of the
+    // upstream wasm shims (postgis, mobilitydb) register concrete
+    // catalog tables — both ship `list_tables` returning the empty
+    // vector. The Guest impl is therefore wired as an honest stub:
+    // `catalog_name` reports the primary shim name (so a host that
+    // probes the export sees a real name rather than a placeholder),
+    // `list_tables` returns an empty vector (honest discovery: "this
+    // bridge advertises no catalog tables"), and the per-op `read_*`
+    // methods return a diagnostic `CatalogError::Internal` that
+    // names both the SQL surface and the WIT method. The notify-*
+    // entrypoints stay no-ops — hosts fire those on CREATE TABLE /
+    // ALTER TABLE regardless, and a plugin without a catalog has no
+    // state to update. When a shim source first registers concrete
+    // catalog tables, extend BridgePlan with a `catalog_entries`
+    // field and populate the `list_tables` / `read_table` arms from
+    // it here.
+    s.push_str(&build_system_catalog_impl(primary));
 
     // ---- index-plugin (#621 Phase 2C): honest no-op ----
     //
@@ -2318,6 +2293,93 @@ fn build_multi_custom_type_impl(records: &[RecordType]) -> String {
             "no per-call codec wired for custom type id {{type_id}} (advertisement-only cut)"
         )))
     }}
+}}
+
+"##,
+    )
+}
+
+/// #620: honest stub `system-catalog::Guest` impl.
+///
+/// Render the per-bridge `impl system_catalog::Guest for Component`
+/// block. The BridgePlan substrate carries no `catalog_entries`
+/// field today, and none of the upstream wasm shims (postgis,
+/// mobilitydb) register concrete catalog tables — both ship
+/// `list_tables` returning an empty vector. The trait surface is
+/// therefore wired structurally and every per-op read method
+/// returns a clearly labelled `CatalogError::Internal`. Each error
+/// string carries both the primary shim name and the WIT method
+/// name so a host that probes the export gets a diagnostic naming
+/// exactly where the call landed:
+///
+/// ```text
+/// postgis system-catalog-plugin: read_table not implemented
+///   (no catalog entries advertised by this bridge)
+/// ```
+///
+/// `catalog_name()` reports the primary shim name so a host that
+/// enumerates catalogs sees a real provider; `list_tables()`
+/// returns the empty vector (honest discovery: this bridge
+/// advertises nothing). The `notify_extension_column_*` methods
+/// stay no-ops — hosts fire those on CREATE TABLE / ALTER TABLE
+/// regardless, and a plugin without a catalog has no state to
+/// update. The whole block is built from a single `primary`
+/// parameter so emission is deterministic across regens.
+///
+/// When a shim source first registers concrete catalog tables,
+/// extend BridgePlan with a `catalog_entries` field (mirroring how
+/// `spatial_indexes` flows through Extension) and replace
+/// `list_tables` / `read_table` here with arms populated from it.
+fn build_system_catalog_impl(primary: &str) -> String {
+    format!(
+        r##"impl system_catalog::Guest for Component {{
+    fn catalog_name() -> String {{ "{primary}".into() }}
+    fn list_tables() -> Result<Vec<sctypes::SystemTable>, sctypes::CatalogError> {{
+        Ok(Vec::new())
+    }}
+    fn read_table(
+        _table_name: String,
+    ) -> Result<Vec<Vec<sctypes::ScalarValue>>, sctypes::CatalogError> {{
+        Err(unimpl_catalog_err("read_table"))
+    }}
+    fn read_table_for_session(
+        _session_id: u64,
+        _table_name: String,
+    ) -> Result<Vec<Vec<sctypes::ScalarValue>>, sctypes::CatalogError> {{
+        Err(unimpl_catalog_err("read_table_for_session"))
+    }}
+    fn notify_extension_column_added(
+        _session_id: u64,
+        _catalog: String,
+        _schema: String,
+        _table_name: String,
+        _column_name: String,
+        _type_id: u32,
+        _srid: Option<i32>,
+        _coord_dim: Option<i32>,
+    ) {{}}
+    fn notify_extension_column_removed(
+        _session_id: u64,
+        _catalog: String,
+        _schema: String,
+        _table_name: String,
+        _column_name: String,
+    ) {{}}
+    fn notify_extension_column_raster_metadata(
+        _session_id: u64,
+        _catalog: String,
+        _schema: String,
+        _table_name: String,
+        _column_name: String,
+        _metadata: sctypes::RasterColumnMetadata,
+    ) {{}}
+}}
+
+fn unimpl_catalog_err(op: &str) -> sctypes::CatalogError {{
+    sctypes::CatalogError::Internal(format!(
+        "{primary} system-catalog-plugin: {{op}} not implemented \
+         (no catalog entries advertised by this bridge)"
+    ))
 }}
 
 "##,
