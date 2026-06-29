@@ -1,0 +1,15 @@
+[package]
+name = "base45-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the base45 extension (RFC 9285 Base45 codec)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "base45_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+base45 = "3"

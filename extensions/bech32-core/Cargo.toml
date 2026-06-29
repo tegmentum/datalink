@@ -1,0 +1,15 @@
+[package]
+name = "bech32-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the bech32 extension (BIP-173 bech32 encode/decode)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "bech32_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+bech32 = "*"
