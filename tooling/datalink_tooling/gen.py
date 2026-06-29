@@ -92,6 +92,27 @@ def stamp(cfg, check: bool = False, extra_outputs=None) -> int:
                 e["content_digest"] = cd
                 changed += 1
             stamped_content += 1
+        # Provider-level identity: an entry may carry a `providers` list where
+        # each wasm provider pins its OWN content_digest (this is what the R2
+        # publish plan reads). Stamp those from the provider's artifact too, so
+        # they never drift from the top-level digest on a rebuild.
+        for p in e.get("providers", []):
+            if not isinstance(p, dict):
+                continue
+            if "wit_contract" in p and p["wit_contract"] != digest:
+                p["wit_contract"] = digest
+                changed += 1
+            if "wit_contract_version" in p and p["wit_contract_version"] != version:
+                p["wit_contract_version"] = version
+                changed += 1
+            if "content_digest" not in p:
+                continue
+            p_art = cfg.path(p["artifact"]) if p.get("artifact") else art
+            if p_art.exists():
+                p_cd = identity.content_digest(p_art)
+                if p["content_digest"] != p_cd:
+                    p["content_digest"] = p_cd
+                    changed += 1
 
     if check:
         if changed:
