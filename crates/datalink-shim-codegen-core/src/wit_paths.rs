@@ -106,15 +106,23 @@ pub fn source_shim_deps_dir(primary: &str) -> Result<PathBuf> {
 ///     upstream `wit/deps/` are imported via wac plug at compose time
 ///     and aren't part of the bridge's `wit/deps/`.
 ///   - `postgis`: `~/git/postgis-wasm/wit/*.wit` holds the primary
-///     `postgis:wasm` package as a multi-file dir; the helper
-///     `sfcgal:component` lives at `~/git/postgis-wasm/wit/deps/sfcgal-wasm/`.
+///     `postgis:wasm` package as a multi-file dir; helper packages
+///     `sfcgal:component`, `proj:wasm`, `mvt:vectortile`,
+///     `flatgeobuf:format`, `kml:parser`, `geos:geometry`,
+///     `geobuf:wasm`, `marc21:wasm`, `gml:parser`, `ttf:parser`,
+///     `rustybuzz:shaper`, `geographiclib:geodesic`, `gdal:core`
+///     are vendored at `~/git/postgis-wasm/wit/deps/<dir>/` (where
+///     `<dir>` is the upstream repo's chosen name, not always
+///     `<ns>-<name>`). #657 wires every helper into the synthesized
+///     tree so the regenerated bridge's `wit/deps/` resolves all of
+///     postgis-wasm's transitive imports.
 ///
 /// The synthesized tree is rooted at
 /// `$TMPDIR/sqlink-codegen-upstream-<primary>/` and is repopulated
 /// from scratch on every call so the bridge always picks up
 /// the latest upstream WIT.
 pub fn try_synthesize_upstream_deps(primary: &str) -> Result<Option<PathBuf>> {
-    let sources = upstream_pkg_sources(primary);
+    let sources = upstream_pkg_sources(primary)?;
     if sources.is_empty() {
         return Ok(None);
     }
@@ -136,10 +144,45 @@ pub fn try_synthesize_upstream_deps(primary: &str) -> Result<Option<PathBuf>> {
     Ok(Some(dest))
 }
 
+/// Postgis helper packages vendored under `~/git/postgis-wasm/wit/deps/`.
+/// Each entry is `(deps_subdir_in_synthesized_tree, upstream_subdir_under_postgis_wit_deps)`.
+///
+/// The upstream subdir name often doesn't match the package's
+/// `<ns>-<name>` form (e.g. `proj-wasm/` holds `proj:wasm`,
+/// `mvt-wasm/` holds `mvt:vectortile`). The synthesized tree uses
+/// the canonical `<ns>-<name>` naming to align with the bridge's
+/// own `wit/deps/` convention.
+const POSTGIS_HELPER_PKGS: &[(&str, &str)] = &[
+    ("sfcgal-component", "sfcgal-wasm"),
+    ("proj-wasm", "proj-wasm"),
+    ("mvt-vectortile", "mvt-wasm"),
+    ("flatgeobuf-format", "flatgeobuf-wasm"),
+    ("kml-parser", "kml-wasm"),
+    ("geos-geometry", "geos-wasm"),
+    ("geobuf-wasm", "geobuf-wasm"),
+    ("marc21-wasm", "marc21-wasm"),
+    ("gml-parser", "gml-wasm"),
+    ("ttf-parser", "ttf-parser-wasm"),
+    ("rustybuzz-shaper", "rustybuzz-wasm"),
+    ("geographiclib-geodesic", "geographiclib-wasm"),
+    ("gdal-core", "gdal-wasm"),
+    // Transitively required by `flatgeobuf-format/world.wit` (it
+    // imports `geozero:convert/geozero-api`). Not imported by
+    // postgis-wasm's top-level world directly, but the vendored
+    // flatgeobuf world.wit pulls it in during WIT-deps parsing.
+    ("geozero-convert", "geozero"),
+];
+
 /// Upstream-shim package sources. Each entry is
 /// `(deps_subdir_name, source_dir_with_*.wit_files)`. Empty when the
 /// upstream repo isn't checked out.
-pub fn upstream_pkg_sources(primary: &str) -> Vec<(&'static str, PathBuf)> {
+///
+/// Returns an error (Option A from #657) when the primary upstream
+/// repo IS checked out but a known-required helper package is
+/// missing from its vendored `wit/deps/` — silent skipping would
+/// surface later as a confusing "package <pkg> not found" during
+/// `cargo build --target wasm32-wasip2` of the regenerated bridge.
+pub fn upstream_pkg_sources(primary: &str) -> Result<Vec<(&'static str, PathBuf)>> {
     let mut out = Vec::<(&'static str, PathBuf)>::new();
     match primary {
         "mobilitydb" => {
@@ -152,18 +195,38 @@ pub fn upstream_pkg_sources(primary: &str) -> Vec<(&'static str, PathBuf)> {
         "postgis" => {
             if let Some(p) = home_path("git/postgis-wasm/wit") {
                 if p.is_dir() {
-                    out.push(("postgis-wasm", p));
-                    if let Some(s) = home_path("git/postgis-wasm/wit/deps/sfcgal-wasm") {
-                        if s.is_dir() {
-                            out.push(("sfcgal-component", s));
+                    out.push(("postgis-wasm", p.clone()));
+                    let deps_root = p.join("deps");
+                    let mut missing = Vec::<String>::new();
+                    for (dest_sub, src_sub) in POSTGIS_HELPER_PKGS {
+                        let src = deps_root.join(src_sub);
+                        if src.is_dir() {
+                            out.push((dest_sub, src));
+                        } else {
+                            missing.push(format!(
+                                "{} (expected at {})",
+                                dest_sub,
+                                src.display()
+                            ));
                         }
+                    }
+                    if !missing.is_empty() {
+                        return Err(anyhow!(
+                            "postgis-wasm checkout at {} is missing vendored \
+                             WIT helper package(s) required by postgis:wasm's \
+                             imports: {}. Update the postgis-wasm checkout or \
+                             extend POSTGIS_HELPER_PKGS in \
+                             datalink-shim-codegen-core::wit_paths.",
+                            p.display(),
+                            missing.join(", ")
+                        ));
                     }
                 }
             }
         }
         _ => {}
     }
-    out
+    Ok(out)
 }
 
 /// Copy only top-level `*.wit` files from `src` to `dst`, ignoring
