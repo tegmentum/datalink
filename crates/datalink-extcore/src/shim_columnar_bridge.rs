@@ -26,10 +26,16 @@
 //!
 //! NULL is carried out-of-band in `colvec.validity` (packed LE bitmap; empty =
 //! all-valid), byte-for-byte DuckDB's mask. The output column type is inferred
-//! from the first non-null result (a scalar's return type is fixed); an
-//! all-null result column falls back to `text` (only reachable when every input
-//! row is NULL, which DuckDB's default null-handling already skips for
-//! non-special scalars).
+//! from the first non-null result (a scalar's return type is fixed). The
+//! hand-written `call-scalar-batch-col` ABI does NOT carry the declared return
+//! type, so an all-null result column (no value to infer from) falls back to a
+//! `text` placeholder; this is harmless because the @4.0.0 core writes an
+//! all-null result column using the function's DECLARED return type and ignores
+//! the placeholder's variant (see `write_colvec_to_vector` / `colvec_all_null`
+//! in duckdb-wasm core). So a declared-`blob` (or any var-width) function whose
+//! result is all-null returns correct typed NULLs regardless of this fallback.
+//! (The codegen `duckdb_shim!` path has the declared `ret` in hand and builds
+//! the correctly-typed all-null column directly via `scalar_batch_col`.)
 
 /// Generate the full `impl callback_dispatch::Guest` for a hand-written
 /// component with scalar (and optionally cast) functions.
@@ -439,6 +445,11 @@ macro_rules! __columnar_bridge_conv {
                         })
                         .collect(),
                 ),
+                // All-null (or empty) result: no value to infer a type from.
+                // Emit a `text` placeholder column with an all-invalid validity
+                // mask; the @4.0.0 core ignores this variant and writes the
+                // all-null result using the DECLARED return type (see the module
+                // doc + `colvec_all_null` in the duckdb-wasm core).
                 Some(V::Null) | None => $col::Column::Text(
                     vals.iter()
                         .map(|_| ::std::string::String::new().into())
