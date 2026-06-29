@@ -40,6 +40,29 @@
 //!     internally, so plain `wac plug` against that wasm
 //!     satisfies the bridge cleanly. The postgis bridge fits
 //!     this case today.
+//!
+//! Bridge-import filtering (#648):
+//!
+//! `world.wit` enumerates every interface the shim packages export —
+//! a maximalist surface. wit-bindgen + wit-component DCE every
+//! interface the bridge's Rust code does not actually CALL into, so
+//! the BUILT bridge wasm imports only a subset. Listing the full
+//! `world.wit` set inside `compose.wac` causes `wac compose` to fail
+//! with "unknown import" on every DCE'd interface (mobilitydb today:
+//! arrow-ops, other-indexes-ops, pattern-ops, stbox3d-ops,
+//! tgeometry-ops — referenced only as record types in
+//! `multi-custom-type/list_types()` metadata, no function call).
+//!
+//! To stay in sync with the actual bridge wasm without parsing it,
+//! the emitter scans the codegen's OWN output —
+//! `<out_dir>/src/lib.rs` — for the `<snake_module>::` path-qualifier
+//! pattern. A `use bindings::<a>::<b>::<m>;` line never matches
+//! `<m>::` (it terminates with `;`); only a dispatcher arm that
+//! actually invokes `<m>::<func>(...)` or a brace-import
+//! `use ...::<m>::{Type, ...};` form does. The bridge import list
+//! is filtered to exactly the interfaces that pattern hits; stub-plug
+//! interfaces stay wired through `stub` so the W4a additions remain
+//! available to the bridge.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -116,7 +139,26 @@ pub fn write_compose_wac(
     if !should_emit_compose_wac(stub.is_some(), shim_packages) {
         return Ok(false);
     }
-    let bridge_imports = collect_bridge_imports(shim_packages);
+    // #648: filter the world.wit import list down to the interfaces
+    // the bridge's emitted `src/lib.rs` actually CALLS INTO. wit-bindgen
+    // + wit-component will DCE any interface whose host-callable
+    // functions aren't invoked from the Rust code; listing them in
+    // `compose.wac` causes wac compose to fail with "unknown import"
+    // on the DCE'd entries. When the lib.rs file isn't present yet
+    // (e.g. unit tests that exercise render_compose in isolation),
+    // fall back to the unfiltered world.wit list.
+    let used = read_used_interfaces_from_lib_rs(
+        &out_dir.join("src/lib.rs"),
+        shim_packages,
+    )?;
+    let all_bridge_imports = collect_bridge_imports(shim_packages);
+    let bridge_imports: Vec<ImportRef> = match used.as_ref() {
+        Some(used) => all_bridge_imports
+            .into_iter()
+            .filter(|imp| used.contains(&(imp.pkg.clone(), imp.iface.clone())))
+            .collect(),
+        None => all_bridge_imports,
+    };
     let body = render_compose(primary, bridge_pkg_name, stub.as_ref(), &bridge_imports);
     let dest = out_dir.join("compose.wac");
     fs::write(&dest, body)
@@ -228,6 +270,108 @@ fn strip_comment(line: &str) -> &str {
     } else {
         line
     }
+}
+
+/// #648: identify which shim interfaces the emitted `src/lib.rs`
+/// ACTUALLY references — the set wit-bindgen + wit-component will
+/// keep as imports on the bridge wasm after DCE.
+///
+/// The codegen emits a `use bindings::<pkg_ns>::<pkg_name>::<module>;`
+/// line for every interface the dispatch tables claim to reach. But
+/// the `use` alone isn't enough: emit_lib also emits a use line when
+/// a shim interface contributes only RECORD types to e.g.
+/// `multi-custom-type`'s `list_types()` (records get referenced as
+/// string literals like `"mobilitydb:temporal@0.1.0/other-indexes-ops/<rec>"`
+/// — the module is never actually called). wit-component DCE's the
+/// import for such record-only interfaces because no host-callable
+/// function from them survives lowering.
+///
+/// To match wit-component's DCE rule exactly without parsing the
+/// wasm (chicken-and-egg with codegen), this function looks for the
+/// `<module>::` path-qualifier pattern. A use line by itself never
+/// matches it (use lines end in `;` or `::{...}`); only an actual
+/// dispatcher arm that calls `<module>::<func>(...)` or a type
+/// method `<module>::<Resource>::<method>(...)` produces the `::`
+/// suffix. A use line of the form `use ...::<module>::{Type};`
+/// (postgis Geometry/Raster/Topology resource helpers) DOES match
+/// the `::` pattern, but those interfaces always also produce
+/// resource-method host calls (`Geometry::from_wkb`, etc.) so the
+/// match is correct.
+///
+/// Returns `Ok(None)` when the lib.rs file is missing — callers
+/// fall back to the unfiltered import list so this function is safe
+/// to invoke before the codegen has finished its lib.rs write
+/// (or from unit tests that only exercise render_compose in
+/// isolation).
+fn read_used_interfaces_from_lib_rs(
+    lib_rs_path: &Path,
+    shim_packages: &[WitPackage],
+) -> Result<Option<BTreeSet<(String, String)>>> {
+    if !lib_rs_path.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(lib_rs_path)
+        .with_context(|| format!("reading {}", lib_rs_path.display()))?;
+    let mut used: BTreeSet<(String, String)> = BTreeSet::new();
+    for pkg in shim_packages {
+        for iface in &pkg.interfaces {
+            let snake = sanitize_module(iface);
+            // Pattern: `<snake>::` somewhere in the body. emit_lib's
+            // arm bodies use either `<module>::<fn>(...)` (free
+            // function) or `<Resource>::<method>(...)` (resource
+            // method, where Resource is imported via
+            // `use ...::<module>::{Resource}`) — both leave a
+            // `<snake>::` occurrence in source.
+            //
+            // The use-line form `use bindings::<a>::<b>::<snake>;`
+            // does NOT match because the segment terminates with `;`
+            // rather than `::`. The brace-import form
+            // `use ...::<snake>::{Type, ...};` DOES match, which is
+            // intentional — those forms are emit_lib's postgis
+            // resource helper lines and always pair with resource-
+            // method calls that also reference the interface.
+            if contains_module_qualifier(&text, &snake) {
+                used.insert((pkg.ns_name.clone(), iface.clone()));
+            }
+        }
+    }
+    Ok(Some(used))
+}
+
+/// Substring scan: does `haystack` contain `<module>::` as a literal
+/// substring, where `<module>` is the snake_case interface ident? A
+/// raw `str::contains(&format!("{module}::"))` would false-match
+/// `<prefix><module>::` (`tint_ops::` inside `extra_tint_ops::`), so
+/// this checks the boundary char before the match — only an
+/// identifier-class character before the match means it's a longer
+/// identifier; anything else (whitespace, `:`, `(`, etc.) is a
+/// genuine module reference.
+fn contains_module_qualifier(haystack: &str, module: &str) -> bool {
+    let needle = format!("{module}::");
+    let bytes = haystack.as_bytes();
+    let n_bytes = needle.as_bytes();
+    let mut start = 0;
+    while start + n_bytes.len() <= bytes.len() {
+        let Some(rel) = haystack[start..].find(&needle) else {
+            return false;
+        };
+        let pos = start + rel;
+        if pos == 0 {
+            return true;
+        }
+        let prev = bytes[pos - 1] as char;
+        if !(prev.is_ascii_alphanumeric() || prev == '_') {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+/// emit_lib's `sanitize_module` — kept verbatim so the reverse-map
+/// in `read_used_interfaces_from_lib_rs` matches exactly.
+fn sanitize_module(s: &str) -> String {
+    s.replace('-', "_")
 }
 
 fn render_compose(
@@ -590,5 +734,207 @@ world w {
         assert!(!super::should_emit_compose_wac(false, &pkgs));
         // Stub-plug override forces emit even with multi-namespace.
         assert!(super::should_emit_compose_wac(true, &pkgs));
+    }
+
+    fn mdb_pkg(ifaces: &[&str]) -> WitPackage {
+        WitPackage {
+            ns_name: "mobilitydb:temporal".to_string(),
+            version: "0.1.0".to_string(),
+            interfaces: ifaces.iter().map(|s| s.to_string()).collect(),
+            records: vec![],
+            resources: vec![],
+            variants: vec![],
+            enums: vec![],
+            flags: vec![],
+            type_aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn module_qualifier_basic_matches() {
+        assert!(super::contains_module_qualifier(
+            "let x = tint_ops::tint_add(args);",
+            "tint_ops",
+        ));
+        assert!(super::contains_module_qualifier(
+            "Geometry::from_wkb(bytes)",
+            "Geometry",
+        ));
+        // Boundary check: `extra_tint_ops::foo` is a different ident.
+        assert!(!super::contains_module_qualifier(
+            "extra_tint_ops::foo(x)",
+            "tint_ops",
+        ));
+        // use line alone (terminated by `;`) does NOT match `<m>::`.
+        assert!(!super::contains_module_qualifier(
+            "use bindings::a::b::tint_ops;",
+            "tint_ops",
+        ));
+        // brace-import form DOES match.
+        assert!(super::contains_module_qualifier(
+            "use bindings::a::b::postgis_types::{Geometry};",
+            "postgis_types",
+        ));
+    }
+
+    #[test]
+    fn used_interfaces_filters_to_called_set() {
+        let pkgs = vec![mdb_pkg(&[
+            "tint-ops",
+            "tfloat-ops",
+            "tbool-ops",
+            // World.wit lists this but no dispatcher arm calls it —
+            // wit-component will DCE its import. compose.wac must NOT
+            // list it. Mirrors the `other-indexes-ops` real case.
+            "other-indexes-ops",
+            // Pure stale: not even a `use` line in lib.rs.
+            "arrow-ops",
+        ])];
+        let dir = tempdir_unique("compose-used-filter");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        // Mimic emit_lib's emitted form: bare `use` line (no `::` at
+        // end), plus arm bodies that DO call into the module. The
+        // `other_indexes_ops` interface gets a use line but no body
+        // reference — matches the real codegen output for record-
+        // only interfaces.
+        let lib = "\
+use bindings::mobilitydb::temporal::tint_ops;\n\
+use bindings::mobilitydb::temporal::tfloat_ops;\n\
+use bindings::mobilitydb::temporal::tbool_ops;\n\
+use bindings::mobilitydb::temporal::other_indexes_ops;\n\
+fn body() {\n\
+    let _a = tint_ops::tint_add(1);\n\
+    let _b = tfloat_ops::tfloat_avg(2.0);\n\
+    let _c = tbool_ops::tbool_and(true);\n\
+}\n\
+";
+        std::fs::write(dir.join("src/lib.rs"), lib).unwrap();
+        let used = super::read_used_interfaces_from_lib_rs(
+            &dir.join("src/lib.rs"),
+            &pkgs,
+        )
+        .unwrap()
+        .expect("Some(used)");
+        let key = |s: &str| ("mobilitydb:temporal".to_string(), s.to_string());
+        assert!(used.contains(&key("tint-ops")));
+        assert!(used.contains(&key("tfloat-ops")));
+        assert!(used.contains(&key("tbool-ops")));
+        assert!(!used.contains(&key("other-indexes-ops")));
+        assert!(!used.contains(&key("arrow-ops")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn used_interfaces_missing_file_returns_none() {
+        let pkgs = vec![mdb_pkg(&["tint-ops"])];
+        let dir = tempdir_unique("compose-used-missing");
+        let res = super::read_used_interfaces_from_lib_rs(
+            &dir.join("src/lib.rs"),
+            &pkgs,
+        )
+        .unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn write_compose_wac_filters_stale_imports() {
+        let dir = tempdir_unique("compose-write-filter");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        // world.wit lists 4 interfaces; lib.rs only calls into 2.
+        let pkgs = vec![mdb_pkg(&[
+            "tint-ops",
+            "tfloat-ops",
+            "arrow-ops",
+            "stbox3d-ops",
+        ])];
+        let lib = "\
+use bindings::mobilitydb::temporal::tint_ops;\n\
+use bindings::mobilitydb::temporal::tfloat_ops;\n\
+fn b() { tint_ops::add(1); tfloat_ops::avg(2.0); }\n\
+";
+        std::fs::write(dir.join("src/lib.rs"), lib).unwrap();
+        let emitted = super::write_compose_wac(
+            &dir,
+            "mobilitydb",
+            "datafission-bridge:mobilitydb",
+            &pkgs,
+        )
+        .unwrap();
+        assert!(emitted);
+        let body = std::fs::read_to_string(dir.join("compose.wac")).unwrap();
+        // Used interfaces survive.
+        assert!(body.contains("mobilitydb:temporal/tint-ops@0.1.0"));
+        assert!(body.contains("mobilitydb:temporal/tfloat-ops@0.1.0"));
+        // DCE'd entries from world.wit must NOT appear.
+        assert!(!body.contains("arrow-ops"));
+        assert!(!body.contains("stbox3d-ops"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_compose_wac_routes_w4a_through_stub() {
+        let dir = tempdir_unique("compose-write-w4a");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("stub-plug/wit")).unwrap();
+        let pkgs = vec![mdb_pkg(&[
+            "tint-ops",
+            "typed-join-ops",
+            "nearest-join-ops",
+            "types",
+        ])];
+        let lib = "\
+use bindings::mobilitydb::temporal::tint_ops;\n\
+use bindings::mobilitydb::temporal::typed_join_ops;\n\
+use bindings::mobilitydb::temporal::nearest_join_ops;\n\
+use bindings::mobilitydb::temporal::types;\n\
+fn body() {\n\
+    let _ = tint_ops::add(1);\n\
+    let _ = typed_join_ops::run();\n\
+    let _ = nearest_join_ops::run();\n\
+    let _ = types::version();\n\
+}\n\
+";
+        std::fs::write(dir.join("src/lib.rs"), lib).unwrap();
+        let world = r#"
+package datafission-bridge:mobilitydb-w4a-stub@0.1.0;
+
+world w4a-stub {
+    import mobilitydb:temporal/types@0.1.0;
+    export mobilitydb:temporal/typed-join-ops@0.1.0;
+    export mobilitydb:temporal/nearest-join-ops@0.1.0;
+}
+"#;
+        std::fs::write(dir.join("stub-plug/wit/world.wit"), world).unwrap();
+        let emitted = super::write_compose_wac(
+            &dir,
+            "mobilitydb",
+            "datafission-bridge:mobilitydb",
+            &pkgs,
+        )
+        .unwrap();
+        assert!(emitted);
+        let body = std::fs::read_to_string(dir.join("compose.wac")).unwrap();
+        // W4a additions go through stub, not mdb.
+        assert!(body.contains(
+            "\"mobilitydb:temporal/typed-join-ops@0.1.0\": stub[\"mobilitydb:temporal/typed-join-ops@0.1.0\"]"
+        ));
+        assert!(body.contains(
+            "\"mobilitydb:temporal/nearest-join-ops@0.1.0\": stub[\"mobilitydb:temporal/nearest-join-ops@0.1.0\"]"
+        ));
+        // Non-W4a still goes through mdb.
+        assert!(body.contains(
+            "\"mobilitydb:temporal/tint-ops@0.1.0\": mdb[\"mobilitydb:temporal/tint-ops@0.1.0\"]"
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn tempdir_unique(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{label}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
