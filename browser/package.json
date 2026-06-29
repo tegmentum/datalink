@@ -1,6 +1,6 @@
 {
   "name": "@tegmentum/datalink-browser",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "DB-agnostic browser runtime plumbing for datalink (DuckDB / SQLite wasm components): WASI polyfill configuration, jco component instantiation (JSPI fast-path + non-JSPI Web Worker fallback over postMessage RPC), and the extension-host registration bridge.",
   "license": "MIT",

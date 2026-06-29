@@ -187,15 +187,18 @@ export function createExtensionHost(opts) {
     // Imports the CORE component needs (pass via its additionalImports). Routes
     // each callback to the extension that owns the handle (the multi-ext router).
     //
-    // @param {object} [coreOpts]
-    // @param {boolean} [coreOpts.syncScalarBatch]  build a SYNCHRONOUS
-    //   call-scalar-batch (a plain loop, no Promise). Required for the non-JSPI
-    //   worker fallback, where the core is transpiled in sync mode and a
-    //   Promise-returning import would break. Safe because the per-row scalar
-    //   dispatch is itself synchronous when the extension is sync-transpiled
-    //   (the catalog's scalar extensions; socket-using scalars need JSPI).
-    coreImports(coreOpts = {}) {
-      const { syncScalarBatch = false } = coreOpts
+    // major-4 (duckdb:extension@4.0.0) COLUMNAR dispatch: the hot path crosses
+    // the boundary one DataChunk at a time as typed `colvec`s (call-scalar-batch-
+    // col / call-aggregate-col / call-cast-col), replacing major-3's row-major
+    // `list<list<duckvalue>>` per-row batch. Because the whole chunk is a SINGLE
+    // crossing, the host just forwards it to the owning extension's columnar
+    // export — no per-row loop here. The extension does the in-vector work and
+    // returns the result column. This forwarding is identical for the JSPI path
+    // (the extension's export may suspend on socket I/O; the core's import is
+    // declared async, so jco awaits the returned Promise) and the non-JSPI worker
+    // path (the extension is sync-transpiled, so the call returns synchronously) —
+    // a single `dispatch` covers both, so the old syncScalarBatch knob is gone.
+    coreImports() {
       // Resolve a core dispatch handle (global) to { instance, original }: the
       // owning extension + the handle IT expects (its original local handle).
       const route = (handle) => {
@@ -206,34 +209,6 @@ export function createExtensionHost(opts) {
       const dispatch = (method) => (handle, ...rest) => {
         const { instance, original } = route(handle)
         return instance.callbackDispatch[method](original, ...rest)
-      }
-
-      // One per-row scalar call (shared by the async + sync batch paths).
-      const callScalarRow = (instance, original, row, base, i, ctx) =>
-        instance.callbackDispatch.callScalar(original, row, {
-          rowindex: base + BigInt(i),
-          iswindow: ctx.iswindow,
-        })
-
-      // SYNC batch: a plain loop, no await. The extension's per-row callScalar is
-      // synchronous (sync-transpiled), so the whole batch returns synchronously —
-      // the core (sync-transpiled in the worker) gets a plain array.
-      const callScalarBatchSync = (handle, rows, ctx) => {
-        const { instance, original } = route(handle)
-        const base = ctx.rowindex ?? 0n
-        const out = new Array(rows.length)
-        for (let i = 0; i < rows.length; i++) out[i] = callScalarRow(instance, original, rows[i], base, i, ctx)
-        return out
-      }
-
-      // ASYNC batch (JSPI): each per-row call may suspend on async socket I/O, so
-      // await sequentially to preserve row + connection-state ordering.
-      const callScalarBatchAsync = async (handle, rows, ctx) => {
-        const { instance, original } = route(handle)
-        const base = ctx.rowindex ?? 0n
-        const out = []
-        for (let i = 0; i < rows.length; i++) out.push(await callScalarRow(instance, original, rows[i], base, i, ctx))
-        return out
       }
 
       return {
@@ -255,14 +230,14 @@ export function createExtensionHost(opts) {
           },
         },
         'duckdb:extension/callback-dispatch': {
+          // HOT PATH (columnar, one call per DataChunk): forward the whole chunk
+          // of typed `colvec`s to the owning extension's columnar export.
+          callScalarBatchCol: dispatch('callScalarBatchCol'),
+          callAggregateCol: dispatch('callAggregateCol'),
+          callCastCol: dispatch('callCastCol'),
+          // COLD singleton paths (kept row-major in @4.0.0): off the hot path.
           callScalar: dispatch('callScalar'),
-          // The core->host crossing is batched (one call per chunk); the
-          // extension is invoked per row. Row i's index is base + i. The sync
-          // variant (worker fallback) returns a plain array; the async variant
-          // (JSPI) awaits each row so socket-using scalars can suspend.
-          callScalarBatch: syncScalarBatch ? callScalarBatchSync : callScalarBatchAsync,
           callTable: dispatch('callTable'),
-          callAggregate: dispatch('callAggregate'),
           callPragma: dispatch('callPragma'),
           callCast: dispatch('callCast'),
         },
