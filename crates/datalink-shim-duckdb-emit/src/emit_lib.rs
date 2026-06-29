@@ -729,36 +729,47 @@ fn build_aggregate_arms(
     out: &mut String,
     agg_entries: &[interface_db::AggregateEntry],
 ) -> usize {
-    let mut arm_for: std::collections::HashMap<&str, usize> =
+    // Phase 1A: AggregateEntry carries a canonical sql_name plus an
+    // inline `aliases` Vec. The pre-Phase-1A iteration produced one
+    // (canonical or alias) entry per dispatch row; we now expand the
+    // alias list inline at the use site to keep the arm/handle
+    // index identical to `register::render_aggregates`.
+    let mut arm_for: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut next: usize = 0;
     for entry in agg_entries {
-        let key: &str = entry.sql_name.as_str();
-        arm_for.entry(key).or_insert_with(|| {
-            let i = next;
-            next += 1;
-            i
-        });
+        for name in std::iter::once(entry.sql_name.clone())
+            .chain(entry.aliases.iter().cloned())
+        {
+            arm_for.entry(name).or_insert_with(|| {
+                let i = next;
+                next += 1;
+                i
+            });
+        }
     }
     let mut emitted: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     for entry in agg_entries {
-        let key: &str = entry.sql_name.as_str();
-        let arm_idx = match arm_for.get(key) {
-            Some(&i) => i,
-            None => continue,
-        };
-        if !emitted.insert(arm_idx) {
-            continue;
+        for name in std::iter::once(entry.sql_name.as_str())
+            .chain(entry.aliases.iter().map(|s| s.as_str()))
+        {
+            let arm_idx = match arm_for.get(name) {
+                Some(&i) => i,
+                None => continue,
+            };
+            if !emitted.insert(arm_idx) {
+                continue;
+            }
+            let body = dispatch::emit_aggregate_arm_body(
+                &entry.shape,
+                name,
+                "                ",
+            );
+            out.push_str(&format!(
+                "            {arm_idx}usize => {{\n{body}\n            }}\n",
+            ));
         }
-        let body = dispatch::emit_aggregate_arm_body(
-            &entry.shape,
-            &entry.sql_name,
-            "                ",
-        );
-        out.push_str(&format!(
-            "            {arm_idx}usize => {{\n{body}\n            }}\n",
-        ));
     }
     next
 }

@@ -687,16 +687,22 @@ pub fn build_aggregate_registry(
             };
             match classify_aggregate_shape(f, records, &enums) {
                 Ok(shape) => {
+                    // Phase 1A: emit one canonical AggregateEntry with
+                    // its alias list folded into the `aliases` field.
+                    // Previously we pushed one entry per canonical PLUS
+                    // one per alias — the duplicate-entry shape forced
+                    // every downstream emitter to dedupe by sql_name
+                    // (and the datafission target additionally needed
+                    // an alias-vs-canonical name index, #650 Path C).
+                    // The new shape carries the alias list inline; emit
+                    // sites expand aliases at the use site so SQLite /
+                    // DuckDB per-alias dispatch arms and datafission
+                    // metadata stay byte-identical.
                     entries.push(AggregateEntry {
                         sql_name: ag.canonical_name.clone(),
-                        shape: shape.clone(),
+                        shape,
+                        aliases: ag.aliases.clone(),
                     });
-                    for alias in &ag.aliases {
-                        entries.push(AggregateEntry {
-                            sql_name: alias.clone(),
-                            shape: shape.clone(),
-                        });
-                    }
                 }
                 Err(reason) => unwired.push(UnwiredScalar {
                     sql_name: ag.canonical_name.clone(),
@@ -708,10 +714,17 @@ pub fn build_aggregate_registry(
     Ok((entries, unwired))
 }
 
-/// One aggregate dispatch arm.
+/// One aggregate dispatch arm. `sql_name` is the canonical SQL
+/// name; `aliases` lists any extra names the SQL surface exposes
+/// for the same upstream WIT function. Phase 1A (formerly each
+/// alias was its own `AggregateEntry`): downstream emitters expand
+/// aliases inline at the use site so a single classifier pass
+/// drives both the canonical and per-alias dispatch surfaces
+/// without forcing the emit layer to dedupe duplicate entries.
 pub struct AggregateEntry {
     pub sql_name: String,
     pub shape: AggregateShape,
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -1213,56 +1213,35 @@ fn build_scalar_registry_impl(
 /// `AGGREGATE_STATE_BLOCK` prelude emitted alongside this impl.
 fn build_aggregate_registry_impl(
     agg_entries: &[interface_db::AggregateEntry],
-    plan: &BridgePlan,
+    _plan: &BridgePlan,
 ) -> String {
-    // #650 Path C: alias index — see scalar registry for rationale.
-    // For aggregates, the per-alias `AggregateEntry` rows currently
-    // come from `interface_db::build_aggregate_registry` (which
-    // pushes one entry per canonical + one per alias). We skip the
-    // alias entries here so the canonical meta is the sole carrier
-    // of `aliases`; create/finalize arms still get emitted for
-    // alias sql_names so an alias-keyed dispatch keeps working
-    // without depending on host-side pre-resolution.
-    let name_idx = build_name_index(plan.extensions.iter().flat_map(|e| {
-        e.aggregates
-            .iter()
-            .map(|a| (a.canonical_name.as_str(), a.aliases.as_slice()))
-    }));
+    // Phase 1A: AggregateEntry now carries one canonical sql_name +
+    // an inline `aliases: Vec<String>`. The pre-Phase-1A shape (one
+    // entry per canonical, one per alias) needed a `NameIndex`
+    // (#650 Path C) to dedupe alias rows out of the meta block
+    // while still emitting their create/finalize arms; the inline
+    // alias list makes that workaround unnecessary — the metadata
+    // pass iterates `entry.aliases` directly for the `aliases:`
+    // literal, and the create_arms pass iterates canonical + each
+    // alias for the per-name handle dispatch.
 
-    // Walk aggregates with first-writer-wins dedupe over sql_name.
-    // The host calls all of {create_accumulator, accumulate, ...,
-    // finalize} by NAME — but our finalize body needs to know
-    // which decode/upstream-call recipe to run, so we assign each
-    // unique name an arm_idx and store it on the AccState. Aliases
-    // resolve to the same arm_idx as their canonical.
+    // Assign each canonical entry one arm_idx; aliases reuse the
+    // canonical's arm_idx so the finalize body is emitted once.
     let mut arm_for: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut next_arm: usize = 0;
     for entry in agg_entries {
-        // Aliases reuse the canonical's arm_idx so the finalize body
-        // is emitted once and shared.
-        let key = if name_idx.alias_set.contains(&entry.sql_name) {
-            // Find the canonical for this alias.
-            plan.extensions
-                .iter()
-                .flat_map(|e| e.aggregates.iter())
-                .find(|a| a.aliases.iter().any(|al| al == &entry.sql_name))
-                .map(|a| a.canonical_name.clone())
-                .unwrap_or_else(|| entry.sql_name.clone())
-        } else {
-            entry.sql_name.clone()
-        };
-        arm_for.entry(key.clone()).or_insert_with(|| {
-            let i = next_arm;
-            next_arm += 1;
-            i
-        });
-        // Also bind the entry's own sql_name to the same arm so
-        // create_accumulator can dispatch alias-keyed callers.
-        let canonical_arm = *arm_for.get(&key).unwrap();
-        arm_for
+        let arm_idx = arm_for
             .entry(entry.sql_name.clone())
-            .or_insert(canonical_arm);
+            .or_insert_with(|| {
+                let i = next_arm;
+                next_arm += 1;
+                i
+            })
+            .to_owned();
+        for alias in &entry.aliases {
+            arm_for.entry(alias.clone()).or_insert(arm_idx);
+        }
     }
 
     let mut metas_block = String::new();
@@ -1279,68 +1258,63 @@ fn build_aggregate_registry_impl(
     for entry in agg_entries {
         let escaped = entry.sql_name.replace('"', "\\\"");
         let arm_idx = *arm_for.get(&entry.sql_name).unwrap();
-        let is_alias = name_idx.alias_set.contains(&entry.sql_name);
 
-        if seen_meta.insert(entry.sql_name.clone()) && !is_alias {
-            // ---- metadata entry ----
-            let mut sig_block = String::new();
-            sig_block.push_str("vec![vec![");
-            // Streaming accumulator arg signature: Blob (WKB or
-            // raster binary).
-            sig_block.push_str("ftypes::LogicalType::Binary, ");
-            for p in &entry.shape.extra_args {
-                let lt = dispatch::paramshape_to_logicaltype(p);
-                sig_block.push_str(&lt);
-                sig_block.push_str(", ");
-            }
-            sig_block.push_str("]]");
-            // config-arg-indices: positions 1..=extras_len map to
-            // the constant config args (after the streaming arg).
-            let mut cfg_indices = String::new();
-            for j in 0..entry.shape.extra_args.len() {
-                let i1 = j + 1;
-                cfg_indices.push_str(&format!("{i1}u32, "));
-            }
-            let accepts_config = !entry.shape.extra_args.is_empty();
-            let aliases_lit = aliases_literal(
-                name_idx
-                    .canonical_aliases
-                    .get(&entry.sql_name)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]),
-            );
-            metas_block.push_str(&format!(
-                "        ftypes::AggregateFunctionMeta {{\n\
-                 \x20           name: \"{escaped}\".to_string(),\n\
-                 \x20           aliases: {aliases_lit},\n\
-                 \x20           param_types: {sig_block},\n\
-                 \x20           supports_grouped: true,\n\
-                 \x20           supports_partial: true,\n\
-                 \x20           is_order_sensitive: false,\n\
-                 \x20           accepts_config: {accepts_config},\n\
-                 \x20           config_arg_indices: vec![{cfg_indices}],\n\
-                 \x20       }},\n",
-            ));
-
-            let ret_logical =
-                dispatch::aggregate_ret_logicaltype(&entry.shape);
-            return_arms.push_str(&format!(
-                "            \"{escaped}\" => Ok({ret_logical}),\n",
-            ));
+        // Safety dedupe: if two extensions ever expose the same
+        // canonical aggregate name, only emit the meta once
+        // (matches the pre-Phase-1A `seen_meta` behaviour).
+        if !seen_meta.insert(entry.sql_name.clone()) {
+            continue;
         }
 
-        if seen_create.insert(entry.sql_name.clone()) {
-            create_arms.push_str(&format!(
-                "            \"{escaped}\" => {arm_idx}usize,\n",
+        // ---- metadata entry (canonical only — aliases ride the
+        // canonical's `aliases:` literal) ----
+        let mut sig_block = String::new();
+        sig_block.push_str("vec![vec![");
+        // Streaming accumulator arg signature: Blob (WKB or
+        // raster binary).
+        sig_block.push_str("ftypes::LogicalType::Binary, ");
+        for p in &entry.shape.extra_args {
+            let lt = dispatch::paramshape_to_logicaltype(p);
+            sig_block.push_str(&lt);
+            sig_block.push_str(", ");
+        }
+        sig_block.push_str("]]");
+        // config-arg-indices: positions 1..=extras_len map to
+        // the constant config args (after the streaming arg).
+        let mut cfg_indices = String::new();
+        for j in 0..entry.shape.extra_args.len() {
+            let i1 = j + 1;
+            cfg_indices.push_str(&format!("{i1}u32, "));
+        }
+        let accepts_config = !entry.shape.extra_args.is_empty();
+        let aliases_lit = aliases_literal(&entry.aliases);
+        metas_block.push_str(&format!(
+            "        ftypes::AggregateFunctionMeta {{\n\
+             \x20           name: \"{escaped}\".to_string(),\n\
+             \x20           aliases: {aliases_lit},\n\
+             \x20           param_types: {sig_block},\n\
+             \x20           supports_grouped: true,\n\
+             \x20           supports_partial: true,\n\
+             \x20           is_order_sensitive: false,\n\
+             \x20           accepts_config: {accepts_config},\n\
+             \x20           config_arg_indices: vec![{cfg_indices}],\n\
+             \x20       }},\n",
+        ));
+
+        // ---- return_type + create arms (canonical + each alias)
+        // — alias-keyed dispatch must still resolve without
+        // host-side pre-resolution. ----
+        let ret_logical = dispatch::aggregate_ret_logicaltype(&entry.shape);
+        for name in std::iter::once(entry.sql_name.as_str())
+            .chain(entry.aliases.iter().map(|s| s.as_str()))
+        {
+            let name_escaped = name.replace('"', "\\\"");
+            return_arms.push_str(&format!(
+                "            \"{name_escaped}\" => Ok({ret_logical}),\n",
             ));
-            // For aliases, also emit the return_type arm (it was
-            // skipped above because the meta block was skipped) so
-            // alias-keyed return-type lookups still resolve.
-            if is_alias {
-                let ret_logical =
-                    dispatch::aggregate_ret_logicaltype(&entry.shape);
-                return_arms.push_str(&format!(
-                    "            \"{escaped}\" => Ok({ret_logical}),\n",
+            if seen_create.insert(name.to_string()) {
+                create_arms.push_str(&format!(
+                    "            \"{name_escaped}\" => {arm_idx}usize,\n",
                 ));
             }
         }

@@ -337,61 +337,71 @@ pub fn render_aggregates(
         std::collections::HashSet::new();
     let mut arm_idx: usize = 0;
     for entry in agg_entries {
-        if !seen.insert(entry.sql_name.clone()) {
-            // first writer wins — mirrors build_aggregate_arms's dedupe.
-            continue;
-        }
-        // Arg 0 is the streaming accumulator column: Blob for both
-        // Geom and Raster aggregates (the WKB / raster-binary the
-        // bridge decodes inside the dispatch arm).
-        //
-        // #607 Phase 1: AccKind::Record aggregates are not yet
-        // wired on the DuckDB target — the dispatch arm short-
-        // circuits to a runtime stub. Skip the register entry so
-        // DuckDB doesn't advertise an unimplemented aggregate;
-        // Phase 2 (per the aggregate-substrate plan) replaces this
-        // skip with the real Logicaltype mapping.
-        let mut args_block = String::new();
-        let acc_logical = match &entry.shape.accumulator_kind {
-            AccKind::Geom | AccKind::Raster => "types::Logicaltype::Blob",
-            // Record / RecordToScalar / RecordToTuple accumulators
-            // stream wit-value payloads through column 0. Host-side
-            // registration on the DuckDB target is still pending
-            // wider runtime wiring (the dispatch arm is emitted, but
-            // the `register_aggregates` block doesn't currently
-            // advertise the Logicaltype::Complex accumulator —
-            // matches the pre-#611 pattern for AccKind::Record).
-            AccKind::Record { .. }
-            | AccKind::RecordToScalar { .. }
-            | AccKind::RecordToTuple { .. } => continue,
-        };
-        args_block.push_str(&format!(
-            "            runtime::Funcarg {{\n\
-             \x20               name: Some(\"arg0\".into()),\n\
-             \x20               logical: {acc_logical},\n\
-             \x20           }},\n",
-        ));
-        for (i, p) in entry.shape.extra_args.iter().enumerate() {
-            let logical = paramshape_to_logicaltype(p);
-            let i1 = i + 1;
+        // Phase 1A: each AggregateEntry now carries its canonical
+        // sql_name + `aliases: Vec<String>` inline. Iterate canonical
+        // + each alias so the per-name handle / arm_idx assignments
+        // mirror the pre-Phase-1A per-entry walk (where each alias
+        // was a separate `AggregateEntry`). The arm_idx counter still
+        // advances per registered name so `build_aggregate_arms`'s
+        // dispatch arms stay aligned.
+        for name in std::iter::once(entry.sql_name.clone())
+            .chain(entry.aliases.iter().cloned())
+        {
+            if !seen.insert(name.clone()) {
+                // first writer wins — mirrors build_aggregate_arms's dedupe.
+                continue;
+            }
+            // Arg 0 is the streaming accumulator column: Blob for both
+            // Geom and Raster aggregates (the WKB / raster-binary the
+            // bridge decodes inside the dispatch arm).
+            //
+            // #607 Phase 1: AccKind::Record aggregates are not yet
+            // wired on the DuckDB target — the dispatch arm short-
+            // circuits to a runtime stub. Skip the register entry so
+            // DuckDB doesn't advertise an unimplemented aggregate;
+            // Phase 2 (per the aggregate-substrate plan) replaces this
+            // skip with the real Logicaltype mapping.
+            let mut args_block = String::new();
+            let acc_logical = match &entry.shape.accumulator_kind {
+                AccKind::Geom | AccKind::Raster => "types::Logicaltype::Blob",
+                // Record / RecordToScalar / RecordToTuple accumulators
+                // stream wit-value payloads through column 0. Host-side
+                // registration on the DuckDB target is still pending
+                // wider runtime wiring (the dispatch arm is emitted, but
+                // the `register_aggregates` block doesn't currently
+                // advertise the Logicaltype::Complex accumulator —
+                // matches the pre-#611 pattern for AccKind::Record).
+                AccKind::Record { .. }
+                | AccKind::RecordToScalar { .. }
+                | AccKind::RecordToTuple { .. } => continue,
+            };
             args_block.push_str(&format!(
                 "            runtime::Funcarg {{\n\
-                 \x20               name: Some(\"arg{i1}\".into()),\n\
-                 \x20               logical: {logical},\n\
+                 \x20               name: Some(\"arg0\".into()),\n\
+                 \x20               logical: {acc_logical},\n\
                  \x20           }},\n",
             ));
-        }
-        let ret_logical = retshape_to_logicaltype(&entry.shape.ret);
-        let deterministic =
-            det.get(&entry.sql_name).copied().unwrap_or(true);
-        let attrs = if deterministic {
-            "types::Funcflags::DETERMINISTIC | types::Funcflags::STATELESS"
-        } else {
-            "types::Funcflags::STATELESS"
-        };
-        let sql_name = entry.sql_name.replace('"', "\\\"");
-        s.push_str(&format!(
-            r##"    {{
+            for (i, p) in entry.shape.extra_args.iter().enumerate() {
+                let logical = paramshape_to_logicaltype(p);
+                let i1 = i + 1;
+                args_block.push_str(&format!(
+                    "            runtime::Funcarg {{\n\
+                     \x20               name: Some(\"arg{i1}\".into()),\n\
+                     \x20               logical: {logical},\n\
+                     \x20           }},\n",
+                ));
+            }
+            let ret_logical = retshape_to_logicaltype(&entry.shape.ret);
+            let deterministic =
+                det.get(&name).copied().unwrap_or(true);
+            let attrs = if deterministic {
+                "types::Funcflags::DETERMINISTIC | types::Funcflags::STATELESS"
+            } else {
+                "types::Funcflags::STATELESS"
+            };
+            let sql_name = name.replace('"', "\\\"");
+            s.push_str(&format!(
+                r##"    {{
         let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         aggregate_handle_table()
             .lock()
@@ -414,8 +424,9 @@ pub fn render_aggregates(
         )?;
     }}
 "##,
-        ));
-        arm_idx += 1;
+            ));
+            arm_idx += 1;
+        }
     }
 
     s.push_str("    Ok(())\n}\n");

@@ -1063,28 +1063,37 @@ fn emit_aggregate_impl(
     let mut seen_inverse = std::collections::HashSet::new();
 
     for entry in agg_entries {
-        let Some(&id) = agg_id_for.get(entry.sql_name.as_str()) else {
-            continue;
-        };
-        if seen_step.insert(id) {
-            let step_body = dispatch::emit_aggregate_step_body(
-                &entry.shape,
-                &entry.sql_name,
-                "                ",
-            );
-            step_arms.push_str(&format!(
-                "            {id} => {{\n{step_body}\n            }}\n",
-            ));
-        }
-        if seen_final.insert(id) {
-            let final_body = dispatch::emit_aggregate_finalize_body(
-                &entry.shape,
-                &entry.sql_name,
-                "                ",
-            );
-            final_arms.push_str(&format!(
-                "            {id} => {{\n{final_body}\n            }}\n",
-            ));
+        // Phase 1A: AggregateEntry now carries one canonical sql_name
+        // and an inline `aliases` Vec (rather than each alias being a
+        // distinct entry). Iterate canonical + each alias here so each
+        // SQL name still gets its own dispatch arm keyed by func_id —
+        // byte-identical to the pre-Phase-1A per-entry walk.
+        for name in std::iter::once(entry.sql_name.as_str())
+            .chain(entry.aliases.iter().map(|s| s.as_str()))
+        {
+            let Some(&id) = agg_id_for.get(name) else {
+                continue;
+            };
+            if seen_step.insert(id) {
+                let step_body = dispatch::emit_aggregate_step_body(
+                    &entry.shape,
+                    name,
+                    "                ",
+                );
+                step_arms.push_str(&format!(
+                    "            {id} => {{\n{step_body}\n            }}\n",
+                ));
+            }
+            if seen_final.insert(id) {
+                let final_body = dispatch::emit_aggregate_finalize_body(
+                    &entry.shape,
+                    name,
+                    "                ",
+                );
+                final_arms.push_str(&format!(
+                    "            {id} => {{\n{final_body}\n            }}\n",
+                ));
+            }
         }
     }
 
