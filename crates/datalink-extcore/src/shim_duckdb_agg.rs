@@ -170,18 +170,26 @@ macro_rules! duckdb_agg_shim {
                 fn call_scalar_batch(
                     handle: u32,
                     rows: ::std::vec::Vec<::std::vec::Vec<types::Duckvalue>>,
-                    ctx: types::Invokeinfo,
+                    _ctx: types::Invokeinfo,
                 ) -> Result<::std::vec::Vec<types::Duckvalue>, types::Duckerror> {
-                    let base = ctx.rowindex.unwrap_or(0);
-                    let mut out = ::std::vec::Vec::with_capacity(rows.len());
-                    for (i, args) in rows.into_iter().enumerate() {
-                        let row_ctx = types::Invokeinfo {
-                            rowindex: Some(base + i as u64),
-                            iswindow: ctx.iswindow,
-                        };
-                        out.push(Self::call_scalar(handle, args, row_ctx)?);
-                    }
-                    Ok(out)
+                    // Per-chunk batching: resolve the handle ONCE (was a mutex
+                    // lock + HashMap lookup PER ROW via `call_scalar`) and reuse a
+                    // single neutral scratch Vec across rows (was one allocation
+                    // per row). Semantically identical to the per-row loop.
+                    let idx = idx_for(handle)?;
+                    let decl = &<Core as $crate::ExtCore>::DECLS[idx];
+                    let propagate =
+                        matches!(decl.null_handling, $crate::NullHandling::Propagate);
+                    $crate::scalar_batch(
+                        idx,
+                        propagate,
+                        rows,
+                        to_neutral,
+                        from_neutral,
+                        || types::Duckvalue::Null,
+                        <Core as $crate::ExtCore>::dispatch,
+                        duckerr,
+                    )
                 }
 
                 fn call_scalar(

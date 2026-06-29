@@ -45,6 +45,56 @@ pub use datalink_valuemodel::{
 };
 
 use alloc::string::String;
+use alloc::vec::Vec;
+
+/// Shared per-chunk scalar dispatch loop used by the generated `duckdb`
+/// shims ([`duckdb_shim!`](crate::duckdb_shim) /
+/// [`duckdb_agg_shim!`](crate::duckdb_agg_shim)).
+///
+/// # Batching wins
+///
+/// This is the hot path a scalar query pays for every DataChunk. The
+/// caller resolves the handle ONCE (`idx`) and reads the function's
+/// NULL-handling ONCE (`propagate`) before the loop, instead of the old
+/// shape that delegated to `call_scalar` PER ROW — each delegation took a
+/// `Mutex` lock + a `HashMap` lookup to re-resolve the same handle. The
+/// loop also reuses a single neutral scratch `Vec` across all rows
+/// (cleared + refilled), so the per-row inner allocation that the old
+/// `args.iter().map(to_neutral).collect()` made every row vanishes after
+/// the first.
+///
+/// Generic over the host value type `V` (a contract's `duckvalue`) so the
+/// same loop serves any `duckdb:extension` minor without naming a WIT
+/// type. Semantically IDENTICAL to calling `call_scalar` per row: row `i`
+/// maps to `out[i]`, and a [`NullHandling::Propagate`] function yields
+/// NULL for any row with a NULL argument WITHOUT invoking the core.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn scalar_batch<V, E>(
+    idx: usize,
+    propagate: bool,
+    rows: Vec<Vec<V>>,
+    to_neutral: impl Fn(&V) -> NeutralValue,
+    from_neutral: impl Fn(NeutralValue) -> V,
+    null_value: impl Fn() -> V,
+    dispatch: impl Fn(usize, &[NeutralValue]) -> Result<NeutralValue, String>,
+    map_err: impl Fn(String) -> E,
+) -> Result<Vec<V>, E> {
+    let mut out = Vec::with_capacity(rows.len());
+    // One reused scratch buffer for the whole chunk (was one alloc/row).
+    let mut neutral: Vec<NeutralValue> = Vec::new();
+    for args in rows.into_iter() {
+        neutral.clear();
+        neutral.extend(args.iter().map(&to_neutral));
+        if propagate && neutral.iter().any(NeutralValue::is_null) {
+            out.push(null_value());
+            continue;
+        }
+        let res = dispatch(idx, &neutral).map_err(&map_err)?;
+        out.push(from_neutral(res));
+    }
+    Ok(out)
+}
 
 /// The contract an extension core implements. `declare!` generates this
 /// impl; the shim macros consume it. Cores are `no_std`-friendly and

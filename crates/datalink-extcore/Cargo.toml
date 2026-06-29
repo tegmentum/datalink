@@ -12,3 +12,9 @@ path = "src/lib.rs"
 
 [dependencies]
 datalink-valuemodel = { path = "../datalink-valuemodel" }
+
+# Native before/after micro-bench for the guest scalar batching win (no
+# external deps; std::time::Instant). `cargo bench --bench scalar_batch`.
+[[bench]]
+name = "scalar_batch"
+harness = false
