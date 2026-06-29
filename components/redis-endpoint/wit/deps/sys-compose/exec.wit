@@ -1,0 +1,63 @@
+/// Exec interface - execution and reflection
+interface exec {
+  use types.{error, digest};
+  use plan.{plan-v1};
+
+  /// Export metadata for reflection
+  record export-info {
+    name: string,
+    /// WIT type signature (canonical representation)
+    type-sig: string,
+  }
+
+  /// Execution result
+  record exec-result {
+    /// Exit code (0 = success)
+    exit-code: u32,
+    /// Standard output
+    stdout: list<u8>,
+    /// Standard error
+    stderr: list<u8>,
+    /// Exec cache key for this execution
+    exec-key: digest,
+  }
+
+  /// HTTP request for serve-http mode
+  record http-request {
+    method: string,
+    path: string,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  /// HTTP response from serve-http mode
+  record http-response {
+    status: u32,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  /// Execute plan as a CLI application
+  /// Args and environment are passed to the root component
+  run-cli: func(plan: plan-v1, args: list<string>, env: list<tuple<string, string>>) -> result<exec-result, error>;
+
+  /// Invoke a specific exported function by name
+  /// Args are encoded as canonical CBOR
+  invoke: func(plan: plan-v1, export-name: string, args: list<u8>) -> result<list<u8>, error>;
+
+  /// Serve HTTP requests using the plan's HTTP handler
+  /// This is typically long-running and processes multiple requests
+  serve-http: func(plan: plan-v1, port: u16) -> result<_, error>;
+
+  /// Handle a single HTTP request (used by serve-http or standalone)
+  handle-http: func(plan: plan-v1, request: http-request) -> result<http-response, error>;
+
+  /// List all exports from the root component
+  list-exports: func(plan: plan-v1) -> result<list<string>, error>;
+
+  /// Describe a specific export (get type signature)
+  describe-export: func(plan: plan-v1, export-name: string) -> result<export-info, error>;
+
+  /// Check if an execution is cached by exec-key
+  check-cache: func(exec-key: digest) -> option<exec-result>;
+}
