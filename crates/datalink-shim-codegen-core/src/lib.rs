@@ -18,3 +18,4 @@ pub mod name_match;
 pub mod override_tables;
 pub mod record_registry;
 pub mod wit_parse;
+pub mod wit_paths;

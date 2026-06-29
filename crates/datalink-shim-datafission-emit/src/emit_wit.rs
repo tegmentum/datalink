@@ -18,11 +18,14 @@
 //!
 //! ## Source locations
 //!
-//! Per-primary upstream-shim WIT (same as the SQLite + DuckDB
-//! targets):
-//!   * `postgis`     → `~/git/sqlink/extensions/postgis-bridge/wit/deps`
-//!   * `mobilitydb`  → `~/git/mobilitydb-sqlink-bridge/wit/deps`
-//!                 (or `~/git/mobilitydb-wasm/wit/deps`)
+//! Per-primary upstream-shim WIT resolution is shared with the
+//! SQLite + DuckDB targets via
+//! `datalink-shim-codegen-core::wit_paths::source_shim_deps_dir`
+//! (#654). The default path is the upstream-synthesised tree
+//! (#651) — `~/git/postgis-wasm/wit/` or
+//! `~/git/mobilitydb-wasm/crates/mdb-temporal-wasm/wit/` —
+//! falling back to the bridge's vendored `wit/deps/` when
+//! upstream isn't checked out.
 //!
 //! Datafission extension WIT:
 //!   * `$DATAFISSION_EXTENSION_WIT_DEPS=...` (overrides the search;
@@ -44,6 +47,12 @@ use anyhow::{anyhow, Context, Result};
 
 use shim_bridge_codegen_core::BridgePlan;
 use datalink_shim_codegen_core::wit_parse::{self, WitPackage};
+
+// #654: WIT-deps resolution (incl. #651 upstream synthesis) lifted
+// to `datalink-shim-codegen-core::wit_paths` so every emit target
+// shares one implementation. Re-exported so existing callers like
+// `emit_wit::source_shim_deps_dir(...)` keep working unchanged.
+pub use datalink_shim_codegen_core::wit_paths::source_shim_deps_dir;
 
 /// Write `wit/world.wit`.
 pub fn write_world(plan: &BridgePlan, dest: &Path) -> Result<()> {
@@ -117,65 +126,6 @@ pub fn write_deps(plan: &BridgePlan, deps_dir: &Path) -> Result<()> {
         })?;
     }
     Ok(())
-}
-
-/// Locate the source `wit/deps/` directory for the upstream shim
-/// WIT packages. Same lookup tree as sqlite-emit and duckdb-emit —
-/// the wasm component imports are identical between the three
-/// targets; only the contract (sqlite:extension / duckdb:extension /
-/// datafission:extension) differs at the export surface.
-pub fn source_shim_deps_dir(primary: &str) -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("SQLINK_SHIM_WIT_DEPS") {
-        let p = PathBuf::from(p);
-        if p.is_dir() {
-            return Ok(p);
-        }
-        return Err(anyhow!(
-            "SQLINK_SHIM_WIT_DEPS={} does not exist",
-            p.display()
-        ));
-    }
-    let env_per_primary = match primary {
-        "postgis" => Some("SQLINK_POSTGIS_BRIDGE_WIT_DEPS"),
-        "mobilitydb" => Some("SQLINK_MOBILITYDB_BRIDGE_WIT_DEPS"),
-        _ => None,
-    };
-    if let Some(var) = env_per_primary {
-        if let Ok(p) = std::env::var(var) {
-            let p = PathBuf::from(p);
-            if p.is_dir() {
-                return Ok(p);
-            }
-            return Err(anyhow!("{}={} does not exist", var, p.display()));
-        }
-    }
-    let candidates: Vec<PathBuf> = match primary {
-        "postgis" => vec![
-            home_path("git/sqlink/extensions/postgis-bridge/wit/deps"),
-            Some(PathBuf::from("../sqlink/extensions/postgis-bridge/wit/deps")),
-        ],
-        "mobilitydb" => vec![
-            home_path("git/mobilitydb-sqlink-bridge/wit/deps"),
-            home_path("git/mobilitydb-wasm/wit/deps"),
-            Some(PathBuf::from("../mobilitydb-wasm/wit/deps")),
-        ],
-        _ => vec![home_path(&format!(
-            "git/{}-sqlink-bridge/wit/deps",
-            primary
-        ))],
-    }
-    .into_iter()
-    .flatten()
-    .collect();
-    for c in &candidates {
-        if c.is_dir() {
-            return Ok(c.clone());
-        }
-    }
-    Err(anyhow!(
-        "cannot locate shim wit/deps for primary '{primary}'. Set \
-         SQLINK_SHIM_WIT_DEPS=/path/to/wit/deps"
-    ))
 }
 
 /// Locate the canonical datafission WIT root.
@@ -456,10 +406,6 @@ pub(crate) fn primary_extension_name(plan: &BridgePlan) -> &str {
 /// (mirrors the helper in sqlite-emit / duckdb-emit's emit_wit).
 pub fn package_belongs_to_primary(package: &str, primary: &str) -> bool {
     package.split(':').next().map(|ns| ns == primary).unwrap_or(false)
-}
-
-fn home_path(rel: &str) -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rel))
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
