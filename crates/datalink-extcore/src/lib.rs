@@ -354,6 +354,7 @@ impl ArgExt for [NeutralValue] {
 }
 
 mod declare;
+mod shim_columnar_bridge;
 mod shim_duckdb;
 mod shim_duckdb_agg;
 mod shim_embed;
