@@ -1,0 +1,15 @@
+[package]
+name = "duckdbcompat-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `duckdbcompat` cross-compat pack: DuckDB-native scalars that SQLite does NOT ship (bar, even, gamma, lgamma, nextafter). Single-direction: the per-DB shim is generated ONLY for sqlink (sqlite:extension), so SQLite users get the DuckDB-named/semantics functions. DuckDB already has these as builtins, so no ducklink shim. `bar` is a faithful port of DuckDB's unicode-block bar(). Written ONCE via datalink-extcore; NULL -> NULL."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "duckdbcompat_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+libm = "0.2"
