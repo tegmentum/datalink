@@ -664,6 +664,17 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         return Err(anyhow!("source {} is not a directory", src.display()));
     }
     fs::create_dir_all(dst)?;
+    // #642: when the upstream shim splits an umbrella `world.wit` into
+    // per-interface .wit files, a stale `dst/world.wit` left over from
+    // a previous regen still declares the same interfaces inline,
+    // triggering a "duplicate item" parse error. Drop the stale file
+    // before copying — if the source still owns a `world.wit`, the
+    // loop below copies it right back; if not, it stays gone.
+    let stale_world = dst.join("world.wit");
+    if stale_world.exists() {
+        fs::remove_file(&stale_world)
+            .with_context(|| format!("removing stale {}", stale_world.display()))?;
+    }
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
