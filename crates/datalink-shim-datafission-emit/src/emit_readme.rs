@@ -3,7 +3,7 @@
 
 use shim_bridge_codegen_core::BridgePlan;
 
-pub fn readme(plan: &BridgePlan, crate_name: &str) -> String {
+pub fn readme(plan: &BridgePlan, crate_name: &str, has_compose_wac: bool) -> String {
     let primary = plan
         .extensions
         .first()
@@ -32,6 +32,48 @@ pub fn readme(plan: &BridgePlan, crate_name: &str) -> String {
     };
 
     let crate_underscore = crate_name.replace('-', "_");
+
+    // Pick the compose recipe — `wac compose` when a compose.wac
+    // was auto-emitted (single-namespace upstream or stub-plug
+    // present), `wac plug` otherwise. The compose.wac script
+    // encodes per-bridge plug → plug wiring that `wac plug`
+    // can't synthesise on its own.
+    let compose_section = if has_compose_wac {
+        format!(
+            r##"```sh
+# Build the bridge crate.
+cargo build --target wasm32-wasip2 --release
+
+# Compose. Pass each `let <alias> = new <pkg> {{ ... }};` package
+# from compose.wac via `-d <pkg>=<path-to-wasm>`.
+wac compose compose.wac \
+  -d 'mobilitydb:temporal=/path/to/mdb-temporal-wasm.wasm' \
+  -d 'datafission-bridge:{primary}=target/wasm32-wasip2/release/{crate_underscore}.wasm' \
+  -o {primary}-datafission-loadable.wasm
+```
+
+The composed artifact loads into df-plugin-loader via
+`CREATE EXTENSION <name> FROM '<path>'`.
+"##,
+            primary = primary,
+            crate_underscore = crate_underscore,
+        )
+    } else {
+        format!(
+            r##"```sh
+wac plug \
+  --plug ~/git/{primary}-wasm/{primary}-composed.wasm \
+  -o {primary}-datafission-loadable.wasm \
+  target/wasm32-wasip2/release/{crate_underscore}.wasm
+```
+
+The composed artifact loads into df-plugin-loader via
+`CREATE EXTENSION <name> FROM '<path>'`.
+"##,
+            primary = primary,
+            crate_underscore = crate_underscore,
+        )
+    };
 
     format!(
         r##"# {crate_name}
@@ -72,19 +114,7 @@ target (`rustup target add wasm32-wasip2`).
 
 ## Compose with the upstream shim wasm
 
-The datafission target composes the same way the SQLite and
-DuckDB targets do — `wac plug` the upstream
-`<primary>-composed.wasm` into this crate's wasm:
-
-```sh
-wac plug \
-  --plug ~/git/{primary}-wasm/{primary}-composed.wasm \
-  -o {primary}-datafission-loadable.wasm \
-  target/wasm32-wasip2/release/{crate_underscore}.wasm
-```
-
-The composed artifact loads into df-plugin-loader via
-`CREATE EXTENSION <name> FROM '<path>'`.
+{compose_section}
 
 ## Regenerate
 
@@ -103,7 +133,7 @@ Apache-2.0.
         crate_name = crate_name,
         primary = primary,
         version = version,
-        crate_underscore = crate_underscore,
+        compose_section = compose_section,
         sc = sc,
         ag = ag,
         tf = tf,

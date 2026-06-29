@@ -107,10 +107,27 @@ pub fn emit(plan: &BridgePlan, out_dir: &Path) -> Result<()> {
     let lib_rs_path = out_dir.join("src/lib.rs");
     fs::write(&lib_rs_path, emit_lib::lib_rs(plan, &crate_name)?)?;
 
+    // compose.wac — #645 auto-emit, mirroring the sqlite target's
+    // #563 emission. Emitted when the bridge needs explicit
+    // `wac compose` plug → plug wiring; skipped for the postgis
+    // case where postgis-composed.wasm packs the upstream
+    // namespaces and plain `wac plug` is sufficient.
+    let primary = emit_wit::primary_extension_name(plan).to_string();
+    let shim_deps = emit_wit::source_shim_deps_dir(&primary)?;
+    let shim_packages = emit_wit::discover_shim_packages(&shim_deps)?;
+    let bridge_pkg_name = format!("datafission-bridge:{primary}");
+    let has_compose_wac = datalink_shim_codegen_core::compose_emit::write_compose_wac(
+        out_dir,
+        &primary,
+        &bridge_pkg_name,
+        &shim_packages,
+    )
+    .context("emitting compose.wac")?;
+
     // README.md
     fs::write(
         out_dir.join("README.md"),
-        emit_readme::readme(plan, &crate_name),
+        emit_readme::readme(plan, &crate_name, has_compose_wac),
     )?;
 
     // rustfmt the emitted Rust source. Best-effort.

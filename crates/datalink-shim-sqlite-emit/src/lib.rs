@@ -68,13 +68,21 @@ pub fn emit(plan: &BridgePlan, out_dir: &Path) -> Result<()> {
     fs::write(&lib_rs_path, emit_lib::lib_rs(plan, &crate_name)?)?;
 
     // compose.wac — #563 auto-emit. Skipped when no stub-plug
-    // is present (postgis bridge today: plug → socket alone
-    // satisfies the composition via `wac plug`).
+    // is present AND the bridge imports from multiple shim
+    // namespaces (postgis bridge today: postgis-composed.wasm
+    // packs postgis:wasm + sfcgal:component so plain `wac plug`
+    // satisfies the composition).
     let primary = emit_wit::primary_extension_name(plan).to_string();
     let shim_deps = emit_wit::source_shim_deps_dir(&primary)?;
     let shim_packages = emit_wit::discover_shim_packages(&shim_deps)?;
-    let has_compose_wac = datalink_shim_codegen_core::compose_emit::write_compose_wac(out_dir, &primary, &shim_packages)
-        .context("emitting compose.wac")?;
+    let bridge_pkg_name = format!("sqlink-bridge:{primary}");
+    let has_compose_wac = datalink_shim_codegen_core::compose_emit::write_compose_wac(
+        out_dir,
+        &primary,
+        &bridge_pkg_name,
+        &shim_packages,
+    )
+    .context("emitting compose.wac")?;
 
     // README.md
     fs::write(
