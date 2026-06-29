@@ -311,10 +311,41 @@ pub struct WitRet {
 /// `package postgis:wasm@...;` declaration are still scanned —
 /// the postgis-wasm/ deps directory contains only postgis-wasm
 /// files in practice.
+///
+/// #658: WIT allows a package to declare its `package ns:name@ver;`
+/// in a SINGLE file and have sibling files belong to that same
+/// package without repeating the declaration (e.g. upstream
+/// `postgis-wasm/wit/accessors.wit` opens straight to `interface
+/// postgis-accessors { ... }` without a `package` line — the
+/// declaration lives in `aggregates.wit`, `world.wit`, etc.).
+/// Pre-scan all files for the directory's package decl so every
+/// `WitFunction.package` ends up tagged with the real
+/// `postgis:wasm` namespace instead of falling back to
+/// `unknown:unknown` (which then propagates into the emitted
+/// `use bindings::unknown::unknown::...` lines on the bridge crate).
 pub fn parse_dir(dir: &Path) -> Result<Vec<WitFunction>> {
+    let dir_default = directory_package_decl(dir)?;
     let mut out = Vec::new();
-    for_each_wit_file(dir, |text| parse_text(text, &mut out))?;
+    for_each_wit_file(dir, |text| {
+        parse_text_with_default(text, dir_default.as_ref(), &mut out)
+    })?;
     Ok(out)
+}
+
+/// Scan every `.wit` file in `dir` for a `package NS:NAME@VER;`
+/// declaration, returning the first one found (files are visited
+/// in sorted order). Used as a per-directory default for sibling
+/// files that omit their own package declaration. See `parse_dir`.
+fn directory_package_decl(dir: &Path) -> Result<Option<(String, String)>> {
+    let mut found: Option<(String, String)> = None;
+    for_each_wit_file(dir, |text| {
+        if found.is_none() {
+            if let Some(decl) = parse_package_decl(text) {
+                found = Some(decl);
+            }
+        }
+    })?;
+    Ok(found)
 }
 
 /// Parse one WIT package directory — a single dir containing one
@@ -896,7 +927,25 @@ fn parse_resource_decl(line: &str) -> Option<String> {
 }
 
 /// Parse one WIT source's text into the running collection.
+/// Test-only thin wrapper around `parse_text_with_default` — the
+/// `parse_dir` callers pass a per-directory default through the
+/// underlying helper so multi-file packages with a single
+/// `package` decl classify correctly (#658).
+#[cfg(test)]
 fn parse_text(text: &str, out: &mut Vec<WitFunction>) {
+    parse_text_with_default(text, None, out)
+}
+
+/// Like `parse_text` but takes a directory-level default package
+/// declaration to apply when the individual file lacks its own
+/// `package` line (#658). Used by `parse_dir` so multi-file WIT
+/// packages classify every function under the real package name
+/// even when only one file in the directory declares it.
+fn parse_text_with_default(
+    text: &str,
+    dir_default: Option<&(String, String)>,
+    out: &mut Vec<WitFunction>,
+) {
     // Strip block comments `/* ... */` up front so they don't
     // confuse the brace counter; line comments and doc comments
     // are handled per-line below.
@@ -905,7 +954,15 @@ fn parse_text(text: &str, out: &mut Vec<WitFunction>) {
     // Phase D: stamp the owning package on every WitFunction so
     // emit_lib can route imports per-shim instead of hardcoding
     // `bindings::postgis::wasm::...`.
+    //
+    // #658: prefer the file's own `package` decl; fall back to the
+    // sibling-file decl scanned by `parse_dir` so single-file
+    // package declarations cover every file in the directory; the
+    // historical `unknown:unknown` placeholder is the last resort
+    // (single-file callers from tests, or a dir whose files all
+    // lack a `package` line).
     let (pkg_ns_name, pkg_version) = parse_package_decl(text)
+        .or_else(|| dir_default.cloned())
         .unwrap_or_else(|| ("unknown:unknown".to_string(), "0.0.0".to_string()));
 
     let mut current_interface: Option<String> = None;
@@ -1972,6 +2029,67 @@ const POSTGIS_ALIAS_TO_MODULE: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #658: a multi-file WIT package where only some files declare
+    /// `package postgis:wasm@0.1.0;` should still tag every parsed
+    /// function with the real package — not the historical
+    /// `unknown:unknown` placeholder that propagated into the
+    /// emitted `use bindings::unknown::unknown::...` lines on the
+    /// postgis bridge crate.
+    #[test]
+    fn parse_dir_propagates_package_decl_across_sibling_files() {
+        let tmp = std::env::temp_dir().join(format!(
+            "datalink-658-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // File A: carries the package decl.
+        fs::write(
+            tmp.join("aggregates.wit"),
+            "package postgis:wasm@0.1.0;\n\
+             interface postgis-aggregates {\n  \
+                 use postgis-types.{geometry, postgis-error};\n  \
+                 st-union-aggregate: func(geoms: list<borrow<geometry>>) -> \
+                    result<geometry, postgis-error>;\n\
+             }\n",
+        )
+        .expect("write aggregates");
+        // File B: NO package decl — mirrors upstream postgis-wasm
+        // `accessors.wit` etc. Pre-#658 these files stamped
+        // `unknown:unknown` on every function.
+        fs::write(
+            tmp.join("accessors.wit"),
+            "interface postgis-accessors {\n  \
+                 use postgis-types.{geometry, postgis-error};\n  \
+                 st-area: func(geom: borrow<geometry>) -> result<f64, postgis-error>;\n\
+             }\n",
+        )
+        .expect("write accessors");
+
+        let fns = parse_dir(&tmp).expect("parse_dir");
+        let by_iface: std::collections::HashMap<&str, &WitFunction> = fns
+            .iter()
+            .map(|f| (f.interface.as_str(), f))
+            .collect();
+        let agg = by_iface
+            .get("postgis-aggregates")
+            .expect("aggregates function");
+        let acc = by_iface
+            .get("postgis-accessors")
+            .expect("accessors function");
+        assert_eq!(agg.package, "postgis:wasm");
+        // The fix: file without its own `package` decl picks up the
+        // sibling's decl instead of falling back to `unknown:unknown`.
+        assert_eq!(acc.package, "postgis:wasm");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn parses_simple_interface() {
