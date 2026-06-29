@@ -1123,75 +1123,23 @@ use bindings::datafission::function_plugin::types as types;
         primary = primary,
     ));
 
-    // ---- index-plugin: stub ----
-    s.push_str(&format!(
-        r##"impl index::Guest for Component {{
-    fn name() -> String {{ "{primary}-stub-index".into() }}
-    fn type_id() -> u32 {{ 0 }}
-    fn supported_types() -> Vec<ixtypes::LogicalType> {{ Vec::new() }}
-    fn capabilities() -> ixtypes::IndexCapabilities {{
-        ixtypes::IndexCapabilities {{
-            point_lookup: false,
-            range_scan: false,
-            prefix_scan: false,
-            ordering: false,
-            spatial_search: false,
-            fulltext_search: false,
-            approximate_membership: false,
-        }}
-    }}
-    fn create(_options: Vec<(String, String)>) -> Result<u64, ixtypes::IndexError> {{
-        Err(unimpl_index_err())
-    }}
-    fn destroy(_handle: u64) {{}}
-    fn insert(_handle: u64, _key: Vec<ixtypes::ScalarValue>, _row_id: u64) -> Result<(), ixtypes::IndexError> {{
-        Err(unimpl_index_err())
-    }}
-    fn delete(_handle: u64, _key: Vec<ixtypes::ScalarValue>) -> Result<bool, ixtypes::IndexError> {{
-        Err(unimpl_index_err())
-    }}
-    fn contains(_handle: u64, _key: Vec<ixtypes::ScalarValue>) -> Result<bool, ixtypes::IndexError> {{
-        Err(unimpl_index_err())
-    }}
-    fn get(_handle: u64, _key: Vec<ixtypes::ScalarValue>) -> Result<Option<u64>, ixtypes::IndexError> {{
-        Err(unimpl_index_err())
-    }}
-    fn begin_scan(
-        _handle: u64,
-        _start: ixtypes::ScanBound,
-        _end: ixtypes::ScanBound,
-        _direction: ixtypes::ScanDirection,
-        _limit: Option<u64>,
-    ) -> Result<u64, ixtypes::IndexError> {{
-        Err(unimpl_index_err())
-    }}
-    fn next(_cursor: u64) -> Option<Result<ixtypes::IndexEntry, ixtypes::IndexError>> {{
-        None
-    }}
-    fn close_scan(_cursor: u64) {{}}
-    fn stats(_handle: u64) -> Result<ixtypes::IndexStats, ixtypes::IndexError> {{
-        Err(unimpl_index_err())
-    }}
-    fn bulk_load(_handle: u64, _entries: Vec<ixtypes::IndexEntry>) -> Result<(), ixtypes::IndexError> {{
-        Err(unimpl_index_err())
-    }}
-    fn serialize(_handle: u64) -> Result<Vec<u8>, ixtypes::IndexError> {{
-        Err(unimpl_index_err())
-    }}
-    fn deserialize(_data: Vec<u8>) -> Result<u64, ixtypes::IndexError> {{
-        Err(unimpl_index_err())
-    }}
-}}
-
-fn unimpl_index_err() -> ixtypes::IndexError {{
-    ixtypes::IndexError::Internal(
-        "1D index not implemented in this {primary} bridge (scalar-first cut)".into(),
-    )
-}}
-
-"##,
-        primary = primary,
-    ));
+    // ---- index-plugin (#621 Phase 2C): honest no-op ----
+    //
+    // The `datafission:index-plugin/index` interface advertises a
+    // generic (non-spatial) custom-index type — R-tree, GIN, HNSW,
+    // etc. The BridgePlan substrate has no `indexes` field today
+    // (only `spatial_indexes`, which is wired through the sibling
+    // spatial-index-plugin export); none of the upstream wasm
+    // shims (postgis, mobilitydb) currently advertise a generic
+    // 1-D index plugin. The Guest impl is therefore wired as an
+    // honest no-op: capabilities all false, advertise no
+    // supported logical types, and each per-op method returns a
+    // diagnostic `IndexError::Internal` that names both the SQL
+    // surface (the primary shim) and the method that was called.
+    // The dispatch table is structurally complete so a host that
+    // probes the export gets a clean "not advertised here" answer
+    // rather than a missing-export crash.
+    s.push_str(&build_index_plugin_impl(primary));
 
     // Export the Component as the world's entry point.
     s.push_str("bindings::export!(Component with_types_in bindings);\n");
@@ -2370,6 +2318,131 @@ fn build_multi_custom_type_impl(records: &[RecordType]) -> String {
             "no per-call codec wired for custom type id {{type_id}} (advertisement-only cut)"
         )))
     }}
+}}
+
+"##,
+    )
+}
+
+/// #621 Phase 2C: honest no-op `index-plugin::Guest` impl.
+///
+/// Render the per-bridge `impl index::Guest for Component` block.
+/// The BridgePlan substrate carries no generic (non-spatial) index
+/// data — `Extension` exposes only `spatial_indexes`, which is
+/// wired through the sibling `spatial-index-plugin` export. None
+/// of the upstream wasm shims (postgis, mobilitydb) advertise a
+/// 1-D / R-tree / GIN / HNSW plugin today, so the trait surface
+/// is wired structurally and every per-op method returns a clearly
+/// labelled `IndexError::Internal`. Each error string carries both
+/// the primary shim name and the WIT method name so a host that
+/// probes the export gets a diagnostic naming exactly where the
+/// call landed:
+///
+/// ```text
+/// postgis index-plugin: insert not implemented
+///   (no generic index advertised by this bridge)
+/// ```
+///
+/// `name()` reports a stable `<primary>-stub-index` so a host that
+/// dumps the export by name doesn't mistake it for a real plugin;
+/// `type_id()` returns 0 (reserved for "no custom type") and
+/// `supported_types()` returns an empty list — the host therefore
+/// cannot route any logical type through this guest. The whole
+/// block is built from a single `primary` parameter so the
+/// emission is deterministic across regens.
+fn build_index_plugin_impl(primary: &str) -> String {
+    let methods: &[(&str, &str, &str)] = &[
+        (
+            "create",
+            "_options: Vec<(String, String)>",
+            "Result<u64, ixtypes::IndexError>",
+        ),
+        (
+            "insert",
+            "_handle: u64, _key: Vec<ixtypes::ScalarValue>, _row_id: u64",
+            "Result<(), ixtypes::IndexError>",
+        ),
+        (
+            "delete",
+            "_handle: u64, _key: Vec<ixtypes::ScalarValue>",
+            "Result<bool, ixtypes::IndexError>",
+        ),
+        (
+            "contains",
+            "_handle: u64, _key: Vec<ixtypes::ScalarValue>",
+            "Result<bool, ixtypes::IndexError>",
+        ),
+        (
+            "get",
+            "_handle: u64, _key: Vec<ixtypes::ScalarValue>",
+            "Result<Option<u64>, ixtypes::IndexError>",
+        ),
+        (
+            "stats",
+            "_handle: u64",
+            "Result<ixtypes::IndexStats, ixtypes::IndexError>",
+        ),
+        (
+            "bulk_load",
+            "_handle: u64, _entries: Vec<ixtypes::IndexEntry>",
+            "Result<(), ixtypes::IndexError>",
+        ),
+        (
+            "serialize",
+            "_handle: u64",
+            "Result<Vec<u8>, ixtypes::IndexError>",
+        ),
+        (
+            "deserialize",
+            "_data: Vec<u8>",
+            "Result<u64, ixtypes::IndexError>",
+        ),
+    ];
+    let mut per_op = String::new();
+    for (method, params, ret) in methods {
+        per_op.push_str(&format!(
+            "    fn {method}({params}) -> {ret} {{\n\
+             \x20       Err(unimpl_index_err(\"{method}\"))\n\
+             \x20   }}\n",
+        ));
+    }
+    format!(
+        r##"impl index::Guest for Component {{
+    fn name() -> String {{ "{primary}-stub-index".into() }}
+    fn type_id() -> u32 {{ 0 }}
+    fn supported_types() -> Vec<ixtypes::LogicalType> {{ Vec::new() }}
+    fn capabilities() -> ixtypes::IndexCapabilities {{
+        ixtypes::IndexCapabilities {{
+            point_lookup: false,
+            range_scan: false,
+            prefix_scan: false,
+            ordering: false,
+            spatial_search: false,
+            fulltext_search: false,
+            approximate_membership: false,
+        }}
+    }}
+    fn destroy(_handle: u64) {{}}
+    fn begin_scan(
+        _handle: u64,
+        _start: ixtypes::ScanBound,
+        _end: ixtypes::ScanBound,
+        _direction: ixtypes::ScanDirection,
+        _limit: Option<u64>,
+    ) -> Result<u64, ixtypes::IndexError> {{
+        Err(unimpl_index_err("begin_scan"))
+    }}
+    fn next(_cursor: u64) -> Option<Result<ixtypes::IndexEntry, ixtypes::IndexError>> {{
+        None
+    }}
+    fn close_scan(_cursor: u64) {{}}
+{per_op}}}
+
+fn unimpl_index_err(op: &str) -> ixtypes::IndexError {{
+    ixtypes::IndexError::Internal(format!(
+        "{primary} index-plugin: {{op}} not implemented \
+         (no generic index advertised by this bridge)"
+    ))
 }}
 
 "##,

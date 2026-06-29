@@ -49,8 +49,18 @@
 //!     nothing; `build` returns `SpatialError::UnsupportedOperation`).
 //!   * `system-catalog-plugin/system-catalog` — `catalog-name`
 //!     returns the primary; `list-tables` returns empty.
-//!   * `index-plugin/index` — stub `name` + empty types /
-//!     capabilities; per-op methods return `IndexError::Internal`.
+//!   * `index-plugin/index` — honest no-op (#621). The BridgePlan
+//!     substrate has no generic-index field today (only
+//!     `spatial_indexes`, handled by the sibling
+//!     `spatial-index-plugin` export) and no current upstream shim
+//!     advertises a 1-D / R-tree / GIN / HNSW plugin, so the trait
+//!     surface is wired structurally: `name` returns
+//!     `<primary>-stub-index`, `type_id` returns 0, `capabilities`
+//!     are all false, `supported_types` is empty, and per-op
+//!     methods return an `IndexError::Internal` whose message names
+//!     both the primary shim and the WIT method that was called
+//!     (`"<primary> index-plugin: <method> not implemented ..."`)
+//!     so a probing host sees exactly where the call landed.
 //!
 //! The verification gate at this step is "the generated bridge
 //! crate COMPILES against the `datafission:extension@1.0.0`
