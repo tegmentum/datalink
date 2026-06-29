@@ -259,7 +259,8 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
 //! hot-path columnar methods (call-scalar-batch-col /
 //! call-aggregate-col / call-cast-col, #653) lift their colvec
 //! args to row-major up-front and route through the cold-path
-//! row-major bodies. The call-pragma stub (#617) returns
+//! row-major bodies. The call-pragma arm (#617 stub, refactored
+//! in #625 into `build_pragma_dispatch_impl`) returns
 //! `Duckerror::Unsupported` until a real pragma surface lands.
 
 #![allow(unused_imports, dead_code)]
@@ -584,27 +585,13 @@ impl callback_dispatch::Guest for {bridge_struct} {{
         }}
     }}
 
-    // #617: pragma dispatch stub. The codegen does not currently
-    // emit pragma registrations (no `pragma-registry` registration
-    // is wired in register.rs), so the host should never invoke this
-    // path. The stub is present to satisfy the @4.0.0 trait surface;
-    // if the host ever calls it, an Unsupported error makes the
-    // omission visible rather than triggering a no-fn panic.
-    fn call_pragma(
-        _handle: u32,
-        _args: Vec<types::Duckvalue>,
-    ) -> Result<Option<types::Duckvalue>, types::Duckerror> {{
-        Err(types::Duckerror::Unsupported(
-            format!("{primary}: call_pragma not implemented (no pragmas registered)")
-        ))
-    }}
-{cast_arm}}}
+{pragma_arm}{cast_arm}}}
 "##,
         bridge_struct = bridge_struct,
         scalar_arms = scalar_arms,
         aggregate_arms = aggregate_arms,
         table_arms = table_arms,
-        primary = primary,
+        pragma_arm = build_pragma_dispatch_impl(primary),
         cast_arm = if has_casts {
             // #624: call_cast forwards into call_scalar at the
             // matching arm. `register_casts()` slotted the cast
@@ -804,6 +791,76 @@ fn build_aggregate_arms(
         }
     }
     next
+}
+
+/// #625: build the `call_pragma` arm of the
+/// `callback_dispatch::Guest` impl.
+///
+/// The `duckdb:extension@4.0.0` callback-dispatch trait surface
+/// requires a `call-pragma` method on every bridge. Real
+/// dispatch will route by handle into a per-pragma arm body,
+/// parallel to `call_scalar` / `call_aggregate` / `call_table`,
+/// once the substrate carrying pragma metadata lands. That
+/// substrate is missing today on three axes:
+///
+///  1. **Extractor**: `shim-interface-core` walks each shim's
+///     WIT + Rust source for scalar / aggregate / UDTF / cast
+///     surfaces but has no pragma extraction pass. No upstream
+///     shim (`postgis`, `mobilitydb`, the query.farm cores)
+///     advertises a pragma in its sources, so the extractor
+///     has no test corpus to drive a pass against.
+///  2. **Interface DB**: the schema has tables for
+///     `scalars` / `aggregates` / `table_functions` /
+///     `cast_rewrites` / `system_catalog_tables` /
+///     `spatial_indexes`, but no `pragmas` table. A new
+///     `pragmas` table + `BridgePlan.pragmas: Vec<PragmaEntry>`
+///     field (mirroring `cast_rewrites`) is the substrate
+///     shape the dispatch will read from.
+///  3. **Register emission**: `register::render` emits
+///     `register_scalars` / `register_aggregates` /
+///     `register_tables` / `register_casts` bodies that thread
+///     each handle into the matching `handle_table` map. A
+///     `register::render_pragmas` body keyed off
+///     `pragma-registry.register-call` (advertised on the
+///     `runtime` interface) is the missing emission step.
+///
+/// Mirrors the honest-stub pattern of #620 (system-catalog) and
+/// #621 (index-plugin): the trait method is present so a probing
+/// host gets a diagnostic rather than a missing-export crash,
+/// and the error string names both the primary shim and the
+/// dispatch arm so the failure mode is unambiguous in logs.
+///
+/// When the first shim registers a pragma, the helper grows
+/// the same shape as `build_scalar_arms` / `build_aggregate_arms`
+/// (a `pragma_handle_table` lookup → arm-index → arm body
+/// rendered by `dispatch::emit_pragma_arm_body`) and the static
+/// `_handle` / `_args` bindings become live.
+fn build_pragma_dispatch_impl(primary: &str) -> String {
+    format!(
+        "    // #625: pragma dispatch placeholder. The
+    // duckdb:extension@4.0.0 callback-dispatch surface
+    // requires a call-pragma arm, but the codegen has no
+    // substrate carrying pragma metadata yet --
+    // shim-interface-core does not extract pragmas and the
+    // interface DB schema has no `pragmas` table. Real
+    // per-arm dispatch (parallel to `call_scalar` /
+    // `call_aggregate`) lands once a shim registers its first
+    // pragma; until then the host gets an Unsupported
+    // diagnostic naming the primary shim and dispatch arm.
+    // See `build_pragma_dispatch_impl` for the substrate
+    // extension path.
+    fn call_pragma(
+        _handle: u32,
+        _args: Vec<types::Duckvalue>,
+    ) -> Result<Option<types::Duckvalue>, types::Duckerror> {{
+        Err(types::Duckerror::Unsupported(format!(
+            \"{primary} pragma dispatch: not implemented \
+             (no pragmas registered by this bridge)\"
+        )))
+    }}
+",
+        primary = primary,
+    )
 }
 
 /// Build the per-arm UDTF dispatch match arms. Same dedupe
