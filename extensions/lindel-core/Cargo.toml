@@ -1,0 +1,15 @@
+[package]
+name = "lindel-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the lindel extension (morton/hilbert space-filling curve encode/decode): logic + capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "lindel_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+

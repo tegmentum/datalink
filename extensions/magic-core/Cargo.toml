@@ -1,0 +1,15 @@
+[package]
+name = "magic-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the magic extension (content-type sniffing via infer): logic + capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "magic_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+infer = { version = "0.16", default-features = false, features = ["alloc"] }

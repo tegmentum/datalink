@@ -1,0 +1,15 @@
+[package]
+name = "transliterate-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `transliterate` extension (Unicode -> ASCII transliteration via deunicode): the logic + capability declaration, written ONCE. The per-DB shims are generated from this declaration by datalink-extcore."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "transliterate_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+deunicode = "1"

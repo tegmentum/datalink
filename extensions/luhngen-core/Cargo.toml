@@ -1,0 +1,15 @@
+[package]
+name = "luhngen-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the luhngen extension (luhn_check_digit / luhn_append): logic + capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "luhngen_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+

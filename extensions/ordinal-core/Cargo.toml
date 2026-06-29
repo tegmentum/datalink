@@ -1,0 +1,14 @@
+[package]
+name = "ordinal-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `ordinal` extension (ordinal-number suffixing: 1st/2nd/3rd/11th/21st), written ONCE. The per-DB shims are generated from this declaration by datalink-extcore."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "ordinal_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
