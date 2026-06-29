@@ -59,6 +59,7 @@ macro_rules! columnar_bridge {
         target = $target:ty ;
         scalar = $scalar:path ;
         $( cast = $cast:path ; )?
+        $( scalar_batch_col = $sbc:path ; )?
     ) => {
         const _: () = {
             use $t as types;
@@ -78,23 +79,44 @@ macro_rules! columnar_bridge {
                 ))
             }
 
+            // The columnar hot path. By default this is the generic
+            // `colvec` -> row -> per-row-`scalar` -> `colvec` adapter (zero
+            // logic change for a migrated component). A component that supplies
+            // `scalar_batch_col = <fn>;` gets a TRUE column-at-a-time kernel
+            // instead: the override reads the typed `colvec`s directly (no
+            // per-row `Vec<Vec<duckvalue>>` materialization, no per-cell
+            // `duckvalue` boxing/string clone) and builds the output column
+            // directly. The override is byte-identical to the per-row `scalar`;
+            // it only removes the marshalling that the columnar ABI made
+            // unnecessary. This is where the compute-heavy components claw back
+            // the row-materialization overhead the bridge otherwise pays.
+            #[allow(clippy::all, unreachable_code, unused_variables)]
+            fn __bridge_scalar_batch_col(
+                handle: u32,
+                args: &[callback_dispatch::Colvec],
+                ctx: types::Invokeinfo,
+            ) -> ::std::result::Result<callback_dispatch::Colvec, types::Duckerror> {
+                $( return $sbc(handle, args, ctx); )?
+                let base = ctx.rowindex.unwrap_or(0);
+                let rows = __bridge_colvecs_to_rows(args);
+                let mut out = ::std::vec::Vec::with_capacity(rows.len());
+                for (i, a) in rows.into_iter().enumerate() {
+                    let row_ctx = types::Invokeinfo {
+                        rowindex: ::std::option::Option::Some(base + i as u64),
+                        iswindow: ctx.iswindow,
+                    };
+                    out.push($scalar(handle, a, row_ctx)?);
+                }
+                ::std::result::Result::Ok(__bridge_vals_to_colvec(out))
+            }
+
             impl callback_dispatch::Guest for $target {
                 fn call_scalar_batch_col(
                     handle: u32,
                     args: ::std::vec::Vec<callback_dispatch::Colvec>,
                     ctx: types::Invokeinfo,
                 ) -> ::std::result::Result<callback_dispatch::Colvec, types::Duckerror> {
-                    let base = ctx.rowindex.unwrap_or(0);
-                    let rows = __bridge_colvecs_to_rows(&args);
-                    let mut out = ::std::vec::Vec::with_capacity(rows.len());
-                    for (i, a) in rows.into_iter().enumerate() {
-                        let row_ctx = types::Invokeinfo {
-                            rowindex: ::std::option::Option::Some(base + i as u64),
-                            iswindow: ctx.iswindow,
-                        };
-                        out.push($scalar(handle, a, row_ctx)?);
-                    }
-                    ::std::result::Result::Ok(__bridge_vals_to_colvec(out))
+                    __bridge_scalar_batch_col(handle, &args, ctx)
                 }
 
                 fn call_aggregate_col(
