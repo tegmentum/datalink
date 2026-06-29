@@ -808,6 +808,33 @@ pub enum AccKind {
         output: ScalarReturnKind,
         optional: bool,
     },
+    /// #640: record-typed list input, primitive-tuple output.
+    ///
+    /// Structurally identical to `RecordToScalar` on the input side
+    /// (decode each per-row witvalue payload via the per-input-record
+    /// `arg_witvalue_<snake>` helper). The output side serialises the
+    /// upstream Rust tuple to a JSON-array text via
+    /// `serde_json::to_string` (matches the `JsonRetKind::TuplePrim`
+    /// / `OptionTuplePrim` pattern used by the scalar return paths) —
+    /// each emit target wraps that string in its native Text / Utf8
+    /// variant.
+    ///
+    /// `optional = true` covers `func(list<X-sequence>) -> option<tuple<T,U,...>>`
+    /// where each Ti is a primitive matching `ScalarReturnKind`. Today's
+    /// surface (mobilitydb): `tint-range-aggregate` returns
+    /// `option<tuple<s64, s64>>` — finalize emits the target's native
+    /// NULL on `None`, JSON-array text on `Some(t)`.
+    ///
+    /// `output` carries one `ScalarReturnKind` per tuple element. The
+    /// Vec layout (rather than `output_a` / `output_b` pair) mirrors
+    /// `JsonRetKind::TuplePrim(Vec<ListPrimElem>)` and generalises
+    /// trivially to n-element tuples — the emit body is the same
+    /// `serde_json::to_string` shape regardless of arity.
+    RecordToTuple {
+        input: RecordSpec,
+        output: Vec<ScalarReturnKind>,
+        optional: bool,
+    },
 }
 
 /// #614: primitive scalar return for `AccKind::RecordToScalar`.
@@ -1379,11 +1406,70 @@ pub fn classify_aggregate_shape(
                         output: scalar_out,
                         optional: true,
                     }
+                } else if let WitType::Tuple(elems) = inner.as_ref() {
+                    // #640: list<record> → option<tuple<T,U,...>>
+                    // over primitives. Each tuple element must
+                    // match `ScalarReturnKind`; the emit body
+                    // serialises the upstream Rust tuple via
+                    // `serde_json::to_string` and wraps the result
+                    // in the target's Text / Utf8 variant
+                    // (`Some(t)` → JSON-array text, `None` →
+                    // native NULL). Today's surface (mobilitydb):
+                    // `tint-range-aggregate` returns
+                    // `option<tuple<s64, s64>>`.
+                    let outs: Option<Vec<ScalarReturnKind>> =
+                        elems.iter().map(scalar_return_kind).collect();
+                    if let Some(outs) = outs {
+                        if outs.is_empty() {
+                            return Err(format!(
+                                "AccKind::Record aggregate input `{}` but return shape is option<tuple<>> (empty tuple not supported)",
+                                input.kebab_name,
+                            ));
+                        }
+                        AccKind::RecordToTuple {
+                            input,
+                            output: outs,
+                            optional: true,
+                        }
+                    } else {
+                        return Err(format!(
+                            "AccKind::Record aggregate input `{}` but return shape is option<tuple<{:?}>> (tuple element not a recognised primitive scalar)",
+                            input.kebab_name,
+                            elems,
+                        ));
+                    }
                 } else {
                     return Err(format!(
                         "AccKind::Record aggregate input `{}` but return shape is option<{:?}> (inner not a recognised primitive scalar)",
                         input.kebab_name,
                         inner,
+                    ));
+                }
+            } else if let WitType::Tuple(elems) = &f.ret.inner {
+                // #640: list<record> → tuple<T,U,...> (bare) over
+                // primitives. Symmetric with the optional arm
+                // above; no known mobilitydb aggregate uses this
+                // bare shape today, but the variant is wired so
+                // a future entry doesn't need a classifier patch.
+                let outs: Option<Vec<ScalarReturnKind>> =
+                    elems.iter().map(scalar_return_kind).collect();
+                if let Some(outs) = outs {
+                    if outs.is_empty() {
+                        return Err(format!(
+                            "AccKind::Record aggregate input `{}` but return shape is tuple<> (empty tuple not supported)",
+                            input.kebab_name,
+                        ));
+                    }
+                    AccKind::RecordToTuple {
+                        input,
+                        output: outs,
+                        optional: false,
+                    }
+                } else {
+                    return Err(format!(
+                        "AccKind::Record aggregate input `{}` but return shape is tuple<{:?}> (tuple element not a recognised primitive scalar)",
+                        input.kebab_name,
+                        elems,
                     ));
                 }
             } else {

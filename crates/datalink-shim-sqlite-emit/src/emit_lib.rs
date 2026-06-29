@@ -488,6 +488,7 @@ use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
             e.shape.accumulator_kind,
             dispatch::AccKind::Record { .. }
                 | dispatch::AccKind::RecordToScalar { .. }
+                | dispatch::AccKind::RecordToTuple { .. }
         )
     });
     // #616 Phase 1: only emit window-function state machinery
@@ -2336,15 +2337,17 @@ fn collect_referenced_records(
         // (#612: `tgeompoint-st-extent`, `t*-temporal-count`) both
         // need to be present.
         //
-        // #614: `RecordToScalar` only references the INPUT-side
-        // `arg_witvalue_<in>` helper — the output is a primitive
-        // scalar wrap, not a record codec call.
+        // #614 + #640: `RecordToScalar` / `RecordToTuple` only
+        // reference the INPUT-side `arg_witvalue_<in>` helper — the
+        // output is a primitive scalar wrap (#614) or a JSON-encoded
+        // primitive tuple (#640), not a record codec call.
         match &entry.shape.accumulator_kind {
             dispatch::AccKind::Record { input, output } => {
                 out.insert(input.kebab_name.clone());
                 out.insert(output.kebab_name.clone());
             }
-            dispatch::AccKind::RecordToScalar { input, .. } => {
+            dispatch::AccKind::RecordToScalar { input, .. }
+            | dispatch::AccKind::RecordToTuple { input, .. } => {
                 out.insert(input.kebab_name.clone());
             }
             dispatch::AccKind::Geom | dispatch::AccKind::Raster => {}

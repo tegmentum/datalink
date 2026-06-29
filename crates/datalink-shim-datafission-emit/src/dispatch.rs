@@ -850,6 +850,16 @@ pub fn emit_aggregate_finalize_body(
             shape, sql_name, arm_indent,
         );
     }
+    // #640: RecordToTuple — same record-decode input side; output
+    // side serialises the upstream Rust tuple to JSON-array text
+    // and wraps it in ScalarValue::Utf8 (None → ScalarValue::Null
+    // when optional). Today's surface: mobilitydb
+    // `tint-range-aggregate`.
+    if let AccKind::RecordToTuple { .. } = &shape.accumulator_kind {
+        return emit_aggregate_finalize_body_record_to_tuple(
+            shape, sql_name, arm_indent,
+        );
+    }
 
     // Decode accumulated blobs into a typed Vec<Resource>; build
     // refs slice for the upstream call.
@@ -877,6 +887,9 @@ pub fn emit_aggregate_finalize_body(
         AccKind::Record { .. } => unreachable!("handled by Phase 2 stub above"),
         AccKind::RecordToScalar { .. } => {
             unreachable!("handled by #614 RecordToScalar stub above")
+        }
+        AccKind::RecordToTuple { .. } => {
+            unreachable!("handled by #640 RecordToTuple stub above")
         }
     }
 
@@ -1301,6 +1314,174 @@ fn emit_aggregate_finalize_body_record_to_scalar(
     s.push_str(&format!(
         "{i}let __r = {module}::{func}({call_args});\n\
          {i}{wrap}\n",
+    ));
+    s
+}
+
+/// #640: Datafission-target aggregate finalize body for
+/// `AccKind::RecordToTuple` — mobilitydb `tint-range-aggregate`
+/// (and any future record-input aggregate returning a primitive
+/// tuple). Input side mirrors
+/// `emit_aggregate_finalize_body_record_to_scalar` (decode each
+/// `st.blobs` entry via the per-input-record `arg_witvalue_<in_snake>`
+/// helper); output side serialises the upstream Rust tuple to
+/// JSON-array text via `serde_json::to_string` and wraps it in
+/// `ScalarValue::Utf8`. The `optional = true` path emits
+/// `None → ScalarValue::Null` / `Some(t) → JSON text`.
+fn emit_aggregate_finalize_body_record_to_tuple(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::RecordToTuple { input, output: _, optional } = &shape.accumulator_kind else {
+        unreachable!("invariant: caller checks AccKind::RecordToTuple");
+    };
+    let optional = *optional;
+    let in_snake = input.kebab_name.replace('-', "_");
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "{i}let mut upstream_vec = Vec::with_capacity(st.blobs.len());\n\
+         {i}for b in &st.blobs {{\n\
+         {i}    let __args = [ftypes::ScalarValue::Binary(b.clone())];\n\
+         {i}    upstream_vec.push(arg_witvalue_{in_snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}}}\n",
+    ));
+
+    // Re-decode extras into Rust-typed bindings — same JSON-config
+    // shape as the RecordToScalar aggregate finalize path.
+    let mut call_extras: Vec<String> = Vec::new();
+    if !shape.extra_args.is_empty() {
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            let getc = format!(
+                "{i}let extra{j}_str = st.extras.get({j})\n\
+                 {i}    .ok_or_else(|| ftypes::FunctionError::ExecutionError(\n\
+                 {i}        format!(\"{sql_name}: missing config arg #{j}\")))?;\n",
+            );
+            match p {
+                ParamShape::Text => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: &str = extra{j}_str.as_str();\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::F64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: f64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S32 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: i32 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: i64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U32 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: u32 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U64 => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: u64 = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Bool => {
+                    s.push_str(&getc);
+                    s.push_str(&format!(
+                        "{i}let extra{j}: bool = serde_json::from_str(extra{j}_str)\n\
+                         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+                         {i}        format!(\"{sql_name}: arg #{j} parse: {{}}\", e)))?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::OptionNone => {
+                    call_extras.push("None".to_string());
+                }
+                ParamShape::Blob
+                | ParamShape::Geom
+                | ParamShape::Geog
+                | ParamShape::Raster
+                | ParamShape::Topology
+                | ParamShape::ListGeom
+                | ParamShape::WitValueRecord { .. }
+                | ParamShape::Enum { .. }
+                | ParamShape::ListPrim(_)
+                | ParamShape::ListRecord { .. }
+                | ParamShape::ListTuple { .. } => {
+                    return format!(
+                        "{i}Err(ftypes::FunctionError::ExecutionError(\
+                         format!(\"{sql_name}: aggregate config arg #{j} shape not wired\")))",
+                    );
+                }
+            }
+        }
+    }
+
+    let call_args = if call_extras.is_empty() {
+        "&upstream_vec".to_string()
+    } else {
+        format!("&upstream_vec, {}", call_extras.join(", "))
+    };
+
+    // JSON-encode the upstream Rust tuple. serde-derives produce a
+    // fixed-length JSON array (same render as
+    // `JsonRetKind::TuplePrim` / `OptionTuplePrim` on the scalar
+    // surface). `optional = true` wraps `Some(t)` in Utf8 and emits
+    // ScalarValue::Null on `None`.
+    let body = if optional {
+        format!(
+            "match __r {{\n\
+             {i}    Some(__t) => {{\n\
+             {i}        let __json = serde_json::to_string(&__t)\n\
+             {i}            .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+             {i}                format!(\"{sql_name}: encode JSON: {{}}\", e)))?;\n\
+             {i}        Ok(ftypes::ScalarValue::Utf8(__json))\n\
+             {i}    }}\n\
+             {i}    None => Ok(ftypes::ScalarValue::Null),\n\
+             {i}}}",
+        )
+    } else {
+        format!(
+            "{{\n\
+             {i}    let __json = serde_json::to_string(&__r)\n\
+             {i}        .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+             {i}            format!(\"{sql_name}: encode JSON: {{}}\", e)))?;\n\
+             {i}    Ok(ftypes::ScalarValue::Utf8(__json))\n\
+             {i}}}",
+        )
+    };
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}({call_args});\n\
+         {i}{body}\n",
     ));
     s
 }

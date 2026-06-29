@@ -274,15 +274,17 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     // the output record. Same-record aggregates have `input ==
     // output`; different-record aggregates carry distinct kebabs.
     for entry in &aggregate_entries {
-        // #614: RecordToScalar uses the same per-input-record
-        // decoder as Record but no output-record encoder (the
-        // output is a primitive scalar wrap).
+        // #614 + #640: RecordToScalar / RecordToTuple use the same
+        // per-input-record decoder as Record but no output-record
+        // encoder (the output is a primitive scalar wrap (#614) or
+        // a JSON-encoded primitive tuple (#640)).
         match &entry.shape.accumulator_kind {
             interface_db::AccKind::Record { input, output } => {
                 referenced_records.insert(input.kebab_name.clone());
                 referenced_records.insert(output.kebab_name.clone());
             }
-            interface_db::AccKind::RecordToScalar { input, .. } => {
+            interface_db::AccKind::RecordToScalar { input, .. }
+            | interface_db::AccKind::RecordToTuple { input, .. } => {
                 referenced_records.insert(input.kebab_name.clone());
             }
             interface_db::AccKind::Geom | interface_db::AccKind::Raster => {}

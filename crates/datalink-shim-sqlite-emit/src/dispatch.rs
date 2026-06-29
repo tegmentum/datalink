@@ -782,14 +782,16 @@ pub fn emit_aggregate_step_body(
     arm_indent: &str,
 ) -> String {
     let i = arm_indent;
-    // #607 Phase 1 + #614: AccKind::Record / RecordToScalar use a
-    // different per-row shape (WitValuePayload extracted from
-    // SqlValue::WitValue rather than a raw blob). The step body
-    // is structurally identical for both — only finalize diverges
-    // — so reuse the existing record step emitter.
+    // #607 Phase 1 + #614 + #640: AccKind::Record / RecordToScalar
+    // / RecordToTuple use a different per-row shape (WitValuePayload
+    // extracted from SqlValue::WitValue rather than a raw blob). The
+    // step body is structurally identical for all three — only
+    // finalize diverges — so reuse the existing record step emitter.
     if matches!(
         &shape.accumulator_kind,
-        AccKind::Record { .. } | AccKind::RecordToScalar { .. }
+        AccKind::Record { .. }
+            | AccKind::RecordToScalar { .. }
+            | AccKind::RecordToTuple { .. }
     ) {
         return emit_aggregate_step_body_record(shape, sql_name, arm_indent);
     }
@@ -798,7 +800,9 @@ pub fn emit_aggregate_step_body(
     let push = match &shape.accumulator_kind {
         AccKind::Geom => "push_geom_state",
         AccKind::Raster => "push_raster_state",
-        AccKind::Record { .. } | AccKind::RecordToScalar { .. } => {
+        AccKind::Record { .. }
+        | AccKind::RecordToScalar { .. }
+        | AccKind::RecordToTuple { .. } => {
             unreachable!("handled above")
         }
     };
@@ -889,6 +893,15 @@ pub fn emit_aggregate_finalize_body(
             shape, sql_name, arm_indent,
         );
     }
+    // #640: RecordToTuple — same record-decode input side; output
+    // side serialises the upstream Rust tuple to JSON-array text
+    // and wraps it in SqlValue::Text (None → SqlValue::Null when
+    // optional). Today's surface: mobilitydb `tint-range-aggregate`.
+    if let AccKind::RecordToTuple { .. } = &shape.accumulator_kind {
+        return emit_aggregate_finalize_body_record_to_tuple(
+            shape, sql_name, arm_indent,
+        );
+    }
     let mut s = String::new();
     // #548 (W3.2): per-kind accumulator take + decode. Both paths
     // materialise `refs: Vec<&Resource>` so the downstream
@@ -913,7 +926,9 @@ pub fn emit_aggregate_finalize_body(
                  {i}let refs: Vec<&Raster> = rasters.iter().collect();\n",
             ));
         }
-        AccKind::Record { .. } | AccKind::RecordToScalar { .. } => {
+        AccKind::Record { .. }
+        | AccKind::RecordToScalar { .. }
+        | AccKind::RecordToTuple { .. } => {
             unreachable!("handled above")
         }
     }
@@ -1327,6 +1342,168 @@ fn emit_aggregate_finalize_body_record_to_scalar(
     s.push_str(&format!(
         "{i}let __r = {module}::{func}({call_args});\n\
          {i}{wrap}",
+    ));
+    s
+}
+
+/// #640: aggregate finalize body for `AccKind::RecordToTuple` —
+/// mobilitydb `tint-range-aggregate` (and any future record-input
+/// aggregate returning a primitive tuple). Input side mirrors
+/// `emit_aggregate_finalize_body_record_to_scalar` (drain the
+/// witvalue accumulator, decode each payload to UPSTREAM via the
+/// per-input-record helper); output side serialises the upstream
+/// Rust tuple to a JSON-array text via `serde_json::to_string` and
+/// wraps the result in `SqlValue::Text`. The `optional = true`
+/// path emits `None → SqlValue::Null` / `Some(t) → JSON text`.
+///
+/// `output` (the Vec<ScalarReturnKind>) is informational only at
+/// this layer: serde-derives auto-implement `Serialize` for tuples
+/// of `Serialize` types, so the upstream Rust tuple (e.g.
+/// `(i64, i64)` for `option<tuple<s64, s64>>`) serialises directly
+/// without per-element matching. The element kinds are captured by
+/// the classifier so a future emit could pick a typed render
+/// (e.g. boolean → JSON `true`/`false`) without revisiting the
+/// classifier.
+fn emit_aggregate_finalize_body_record_to_tuple(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::RecordToTuple { input, output: _, optional } = &shape.accumulator_kind else {
+        unreachable!("invariant: caller checks AccKind::RecordToTuple");
+    };
+    let optional = *optional;
+    let in_snake = input.kebab_name.replace('-', "_");
+
+    let mut s = String::new();
+    // Drain the per-context witvalue accumulator + decode each
+    // payload to UPSTREAM. Identical to the RecordToScalar path.
+    s.push_str(&format!(
+        "{i}let payloads = take_witvalue_state(context_id);\n\
+         {i}let mut upstream_vec = Vec::with_capacity(payloads.len());\n\
+         {i}for pw in payloads {{\n\
+         {i}    let __args = [SqlValue::WitValue(pw)];\n\
+         {i}    upstream_vec.push(arg_witvalue_{in_snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}}}\n",
+    ));
+
+    // Re-decode the extras into Rust-typed bindings; mirrors the
+    // RecordToScalar finalize extras-decode block. Only the
+    // primitive ParamShape arms are reachable here (today's surface
+    // — mobilitydb `tint-range-aggregate` — takes no extras).
+    let mut call_extras: Vec<String> = Vec::new();
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}let extras = take_extras_state(context_id);\n",
+        ));
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            match p {
+                ParamShape::Text => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_text(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::F64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_f64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? as i32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? as u32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? as u64;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Bool => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? != 0;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Blob => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_blob(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::OptionNone => {
+                    call_extras.push("None".to_string());
+                }
+                ParamShape::Geom
+                | ParamShape::Geog
+                | ParamShape::Raster
+                | ParamShape::Topology
+                | ParamShape::ListGeom
+                | ParamShape::WitValueRecord { .. }
+                | ParamShape::Enum { .. }
+                | ParamShape::ListPrim(_)
+                | ParamShape::ListRecord { .. }
+                | ParamShape::ListTuple { .. } => {
+                    return format!(
+                        "{i}Err(format!(\"{sql_name}: aggregate extra arg #{j} shape not wired\"))",
+                    );
+                }
+            }
+        }
+    }
+
+    let call_args = if call_extras.is_empty() {
+        "&upstream_vec".to_string()
+    } else {
+        format!("&upstream_vec, {}", call_extras.join(", "))
+    };
+
+    // JSON-encode the upstream Rust tuple. serde-derives produce a
+    // fixed-length JSON array (same render as
+    // `JsonRetKind::TuplePrim` / `OptionTuplePrim` on the scalar
+    // surface). `optional = true` wraps `Some(t)` in Text and emits
+    // SQL NULL on `None`.
+    let body = if optional {
+        format!(
+            "match __r {{\n\
+             {i}    Some(__t) => {{\n\
+             {i}        let __json = serde_json::to_string(&__t)\n\
+             {i}            .map_err(|e| format!(\"{sql_name}: encode JSON: {{}}\", e))?;\n\
+             {i}        Ok(SqlValue::Text(__json))\n\
+             {i}    }}\n\
+             {i}    None => Ok(SqlValue::Null),\n\
+             {i}}}",
+        )
+    } else {
+        format!(
+            "{{\n\
+             {i}    let __json = serde_json::to_string(&__r)\n\
+             {i}        .map_err(|e| format!(\"{sql_name}: encode JSON: {{}}\", e))?;\n\
+             {i}    Ok(SqlValue::Text(__json))\n\
+             {i}}}",
+        )
+    };
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}({call_args});\n\
+         {i}{body}",
     ));
     s
 }

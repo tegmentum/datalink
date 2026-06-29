@@ -707,6 +707,15 @@ pub fn emit_aggregate_arm_body(
             shape, sql_name, arm_indent,
         );
     }
+    // #640: RecordToTuple — same record-decode input side; output
+    // side serialises the upstream Rust tuple to JSON-array text
+    // and wraps it in Duckvalue::Text (None → Duckvalue::Null when
+    // optional). Today's surface: mobilitydb `tint-range-aggregate`.
+    if matches!(&shape.accumulator_kind, AccKind::RecordToTuple { .. }) {
+        return emit_aggregate_arm_body_record_to_tuple(
+            shape, sql_name, arm_indent,
+        );
+    }
 
     // Accumulator iteration: walk `rows`, skip rows whose
     // streaming arg is NULL, collect raw blobs. Mirrors
@@ -726,6 +735,7 @@ pub fn emit_aggregate_arm_body(
         ),
         AccKind::Record { .. } => unreachable!("handled above"),
         AccKind::RecordToScalar { .. } => unreachable!("handled above"),
+        AccKind::RecordToTuple { .. } => unreachable!("handled above"),
     };
     let decode_call = decode_call.replace("AGG_NAME", sql_name);
 
@@ -795,6 +805,9 @@ pub fn emit_aggregate_arm_body(
         AccKind::Record { .. } => unreachable!("handled by emit_aggregate_arm_body_record above"),
         AccKind::RecordToScalar { .. } => {
             unreachable!("handled by emit_aggregate_arm_body_record_to_scalar above")
+        }
+        AccKind::RecordToTuple { .. } => {
+            unreachable!("handled by emit_aggregate_arm_body_record_to_tuple above")
         }
     }
 
@@ -1211,6 +1224,178 @@ fn emit_aggregate_arm_body_record_to_scalar(
     s.push_str(&format!(
         "{i}let __r = {module}::{func}({call_args});\n\
          {i}{wrap}",
+    ));
+    s
+}
+
+/// #640: DuckDB-target aggregate body for
+/// `AccKind::RecordToTuple` — mobilitydb `tint-range-aggregate`
+/// (and any future record-input aggregate returning a primitive
+/// tuple). Walks `rows` and decodes column 0 of each non-null row
+/// via the per-input-record `arg_witvalue_<in_snake>` helper
+/// (identical to the RecordToScalar input path), then serialises
+/// the upstream Rust tuple to JSON-array text via
+/// `serde_json::to_string` and wraps it in `Duckvalue::Text`.
+///
+/// Extras are latched + re-decoded with the same shape arms the
+/// RecordToScalar path uses; today's surface
+/// (`tint-range-aggregate`) takes no extras.
+fn emit_aggregate_arm_body_record_to_tuple(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::RecordToTuple { input, output: _, optional } = &shape.accumulator_kind else {
+        unreachable!("invariant: caller checks AccKind::RecordToTuple");
+    };
+    let optional = *optional;
+    let in_snake = input.kebab_name.replace('-', "_");
+
+    let mut s = String::new();
+
+    // Extras latch (constant across rows by SQL semantics, so the
+    // first non-null row's tail is the canonical extras vector).
+    let extras_pre = if shape.extra_args.is_empty() {
+        String::new()
+    } else {
+        format!("{i}let mut extras: Option<Vec<types::Duckvalue>> = None;\n")
+    };
+    let extras_latch = if shape.extra_args.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{i}    if extras.is_none() {{\n\
+             {i}        extras = Some(row[1..].to_vec());\n\
+             {i}    }}\n",
+        )
+    };
+
+    s.push_str(&extras_pre);
+    s.push_str(&format!(
+        "{i}let mut upstream_vec = Vec::with_capacity(rows.len());\n\
+         {i}for row in &rows {{\n\
+         {i}    if row.is_empty() {{ continue; }}\n\
+         {i}    if matches!(row[0], types::Duckvalue::Null) {{ continue; }}\n\
+         {i}    upstream_vec.push(arg_witvalue_{in_snake}(row, 0, \"{sql_name}\")?);\n\
+         {extras_latch}{i}}}\n",
+    ));
+
+    // Re-decode extras into Rust-typed bindings. Same per-shape
+    // arms as the RecordToScalar aggregate finalize path.
+    let mut call_extras: Vec<String> = Vec::new();
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}let extras = extras.unwrap_or_default();\n",
+        ));
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            match p {
+                ParamShape::Text => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_text(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::F64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_f64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")? as i32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")? as u32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")? as u64;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Bool => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_bool(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Blob => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_blob(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::OptionNone => {
+                    call_extras.push("None".to_string());
+                }
+                ParamShape::Geom
+                | ParamShape::Geog
+                | ParamShape::Raster
+                | ParamShape::Topology
+                | ParamShape::ListGeom
+                | ParamShape::WitValueRecord { .. }
+                | ParamShape::Enum { .. }
+                | ParamShape::ListPrim(_)
+                | ParamShape::ListRecord { .. }
+                | ParamShape::ListTuple { .. } => {
+                    return format!(
+                        "{i}Err(types::Duckerror::Unsupported(format!(\
+                         \"{sql_name}: aggregate extra arg #{j} shape not wired\")))",
+                    );
+                }
+            }
+        }
+    }
+
+    let call_args = if call_extras.is_empty() {
+        "&upstream_vec".to_string()
+    } else {
+        format!("&upstream_vec, {}", call_extras.join(", "))
+    };
+
+    // JSON-encode the upstream Rust tuple. serde-derives produce a
+    // fixed-length JSON array (same render as
+    // `JsonRetKind::TuplePrim` / `OptionTuplePrim` on the scalar
+    // surface). `optional = true` wraps `Some(t)` in Text and emits
+    // Duckvalue::Null on `None`.
+    let body = if optional {
+        format!(
+            "match __r {{\n\
+             {i}    Some(__t) => {{\n\
+             {i}        let __json = serde_json::to_string(&__t)\n\
+             {i}            .map_err(|e| types::Duckerror::Internal(format!(\"{sql_name}: encode JSON: {{}}\", e)))?;\n\
+             {i}        Ok(types::Duckvalue::Text(__json))\n\
+             {i}    }}\n\
+             {i}    None => Ok(types::Duckvalue::Null),\n\
+             {i}}}",
+        )
+    } else {
+        format!(
+            "{{\n\
+             {i}    let __json = serde_json::to_string(&__r)\n\
+             {i}        .map_err(|e| types::Duckerror::Internal(format!(\"{sql_name}: encode JSON: {{}}\", e)))?;\n\
+             {i}    Ok(types::Duckvalue::Text(__json))\n\
+             {i}}}",
+        )
+    };
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}({call_args});\n\
+         {i}{body}",
     ));
     s
 }
