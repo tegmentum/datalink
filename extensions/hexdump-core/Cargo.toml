@@ -1,0 +1,14 @@
+[package]
+name = "hexdump-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `hexdump` extension (classic hex dumps: hexdump (xxd / hexdump -C style) + hex_pretty (space-separated bytes)), written ONCE. The per-DB shims are generated from this declaration by datalink-extcore. NULL -> NULL; never panics."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "hexdump_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }

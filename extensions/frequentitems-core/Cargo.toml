@@ -1,0 +1,15 @@
+[package]
+name = "frequentitems-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `frequentitems` extension (top-K / heavy-hitters over a JSON array: top_k -> {value,count} pairs + top_k_value -> just the K most frequent values), written ONCE. The per-DB shims are generated from this declaration by datalink-extcore. Exact counts via hashmap + sort, ties broken by first-seen order (deterministic). NULL / bad input / k <= 0 -> NULL; never panics."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "frequentitems_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+serde_json = "1"
