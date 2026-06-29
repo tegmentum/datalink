@@ -111,11 +111,30 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     // serde-ops responsibility (the helper components carry their
     // own codecs elsewhere); ignoring them here keeps
     // `additional_derives` strictly scoped to the primary records.
+    //
+    // #660: wit-bindgen matches `additional_derives_ignore` on KEBAB
+    // NAME, not full path. When a helper package declares a record
+    // whose name overlaps with a primary-shim record (e.g.
+    // flatgeobuf-format's `bbox` vs postgis-wasm's `bbox`, or
+    // flatgeobuf-format's `coordinate` vs postgis-wasm's `coord`),
+    // adding the helper's name to the ignore list also suppresses
+    // derives on the primary's copy and on the local serde-ops copy
+    // exported by the bridge world. Skip helper records whose kebab
+    // name overlaps with a primary-shim record so the local
+    // serde-ops Bbox/Coord/etc still derive Serialize+Deserialize.
+    let primary_record_names: std::collections::BTreeSet<String> = shim_packages
+        .iter()
+        .filter(|p| emit_wit::package_belongs_to_primary(&p.ns_name, primary))
+        .flat_map(|p| p.records.iter().map(|r| r.kebab_name.clone()))
+        .collect();
     for pkg in &shim_packages {
         if emit_wit::package_belongs_to_primary(&pkg.ns_name, primary) {
             continue;
         }
         for r in &pkg.records {
+            if primary_record_names.contains(&r.kebab_name) {
+                continue;
+            }
             derives_ignore.insert(r.kebab_name.clone());
         }
         for v in &pkg.variants {
@@ -378,9 +397,17 @@ use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
     // only when the shim's WIT actually declares them. For non-postgis
     // shims (mobilitydb etc.) this `use` line is skipped along with
     // the `from_wkb` / `geog_from_wkb` / `postgis_err_string` helpers.
+    //
+    // #660: pick the PRIMARY shim package (postgis-wasm for postgis,
+    // mobilitydb-temporal for mobilitydb, ...) rather than the first
+    // non-contract package alphabetically. The latter would land on
+    // a helper package like `flatgeobuf-format` whose WIT has no
+    // `resource geometry`, leaving the resource flags false and the
+    // helpers/use lines unemitted — the source of the 895 build errors
+    // on regenerated postgis-sqlink-bridge.
     let shim_pkg = shim_packages
         .iter()
-        .find(|p| p.ns_name != "sqlite:extension")
+        .find(|p| emit_wit::package_belongs_to_primary(&p.ns_name, primary))
         .cloned();
     let shim_has_geometry_resource = shim_pkg
         .as_ref()
