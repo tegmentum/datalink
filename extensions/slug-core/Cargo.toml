@@ -1,0 +1,15 @@
+[package]
+name = "slug-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `slug` extension (URL-safe slug generation via the `slug` crate): the logic + the capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "slug_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+slug = "0.1"

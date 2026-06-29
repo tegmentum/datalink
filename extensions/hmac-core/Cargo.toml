@@ -1,0 +1,17 @@
+[package]
+name = "hmac-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `hmac` extension (keyed HMAC: hmac_sha256 / hmac_sha512 -> hex, via `hmac` + `sha2`), written ONCE. The per-DB shims are generated from this declaration by datalink-extcore. NULL in either argument -> NULL."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "hmac_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"

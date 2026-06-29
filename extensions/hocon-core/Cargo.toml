@@ -1,0 +1,16 @@
+[package]
+name = "hocon-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `hocon` extension (HOCON / Typesafe Config parsing: hocon_to_json + hocon_get over a dotted path), written ONCE. The per-DB shims are generated from this declaration by datalink-extcore. URL-include support is compiled out (no network from wasm); invalid input / absent path -> NULL; never panics."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "hocon_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+hocon = { version = "0.9", default-features = false, features = ["serde-support"] }
+serde_json = "1"

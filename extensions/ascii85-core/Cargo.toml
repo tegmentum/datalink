@@ -1,0 +1,15 @@
+[package]
+name = "ascii85-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the ascii85 extension (Ascii85/Base85 encode/decode)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "ascii85_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+ascii85 = "*"

@@ -1,0 +1,15 @@
+[package]
+name = "base58check-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the base58check extension (Base58Check encode/decode)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "base58check_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+bs58 = { version = "0.5", features = ["check"] }

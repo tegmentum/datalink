@@ -1,0 +1,15 @@
+[package]
+name = "dice-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `dice` extension (RPG dice-notation roll/min/max via rand): the logic + the capability declaration, written ONCE. The per-DB shims are generated from this declaration by datalink-extcore."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "dice_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+rand = "0.8"

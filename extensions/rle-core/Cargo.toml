@@ -1,0 +1,14 @@
+[package]
+name = "rle-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `rle` extension (run-length encode/decode of text): the algorithm + the capability declaration, written ONCE. The per-DB shims (ducklink duckdb:extension, sqlink) are generated from this declaration by datalink-extcore."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "rle_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }

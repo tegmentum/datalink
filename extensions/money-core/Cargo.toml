@@ -1,0 +1,15 @@
+[package]
+name = "money-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the money extension (format_money via iso_currency): logic + capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "money_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+iso_currency = "0.5"

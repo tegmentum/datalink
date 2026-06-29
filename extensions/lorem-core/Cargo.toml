@@ -1,0 +1,15 @@
+[package]
+name = "lorem-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the lorem extension (lorem ipsum text generation): logic + capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "lorem_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+lipsum = "0.9"

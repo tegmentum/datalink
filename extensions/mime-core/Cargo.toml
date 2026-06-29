@@ -1,0 +1,15 @@
+[package]
+name = "mime-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the mime extension (filename/ext -> MIME type via mime_guess): logic + capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "mime_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+mime_guess = "2"

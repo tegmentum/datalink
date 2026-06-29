@@ -1,0 +1,14 @@
+[package]
+name = "braille-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the braille extension (text -> Unicode Braille, grade-1)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "braille_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }

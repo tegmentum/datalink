@@ -1,0 +1,15 @@
+[package]
+name = "numwords-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `numwords` extension (spell numbers as cardinal/ordinal words via num2words), written ONCE. The per-DB shims are generated from this declaration by datalink-extcore."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "numwords_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+num2words = "*"

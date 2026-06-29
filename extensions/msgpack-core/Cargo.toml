@@ -1,0 +1,17 @@
+[package]
+name = "msgpack-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the msgpack extension (JSON <-> MessagePack hex): logic + capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "msgpack_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+rmp-serde = "1"
+serde_json = "1"
+hex = "0.4"

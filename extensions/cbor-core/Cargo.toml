@@ -1,0 +1,17 @@
+[package]
+name = "cbor-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the cbor extension (JSON <-> CBOR hex via ciborium)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "cbor_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+ciborium = "*"
+serde_json = "*"
+hex = "*"

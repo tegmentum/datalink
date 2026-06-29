@@ -1,0 +1,16 @@
+[package]
+name = "escape-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `escape` extension (HTML + URL encode/decode: html_escape / html_unescape / url_encode / url_decode), written ONCE. The per-DB shims are generated from this declaration by datalink-extcore. NULL -> NULL."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "escape_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+html-escape = "0.2"
+percent-encoding = "2"

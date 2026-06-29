@@ -1,0 +1,14 @@
+[package]
+name = "haversine-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `haversine` extension (great-circle distance: haversine_km / haversine_mi over 4 coordinates), written ONCE. The per-DB shims are generated from this declaration by datalink-extcore. NULL argument -> NULL."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "haversine_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }

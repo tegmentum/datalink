@@ -1,0 +1,16 @@
+[package]
+name = "jsonschema-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the jsonschema extension (json_schema_valid): logic + capability declaration, written ONCE."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "jsonschema_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+jsonschema = "0.46"
+serde_json = "1"

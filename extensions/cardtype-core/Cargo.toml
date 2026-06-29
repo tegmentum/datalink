@@ -1,0 +1,14 @@
+[package]
+name = "cardtype-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral core for the cardtype extension (credit-card brand by IIN range)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "cardtype_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
