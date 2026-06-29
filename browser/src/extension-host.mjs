@@ -186,7 +186,16 @@ export function createExtensionHost(opts) {
 
     // Imports the CORE component needs (pass via its additionalImports). Routes
     // each callback to the extension that owns the handle (the multi-ext router).
-    coreImports() {
+    //
+    // @param {object} [coreOpts]
+    // @param {boolean} [coreOpts.syncScalarBatch]  build a SYNCHRONOUS
+    //   call-scalar-batch (a plain loop, no Promise). Required for the non-JSPI
+    //   worker fallback, where the core is transpiled in sync mode and a
+    //   Promise-returning import would break. Safe because the per-row scalar
+    //   dispatch is itself synchronous when the extension is sync-transpiled
+    //   (the catalog's scalar extensions; socket-using scalars need JSPI).
+    coreImports(coreOpts = {}) {
+      const { syncScalarBatch = false } = coreOpts
       // Resolve a core dispatch handle (global) to { instance, original }: the
       // owning extension + the handle IT expects (its original local handle).
       const route = (handle) => {
@@ -197,6 +206,34 @@ export function createExtensionHost(opts) {
       const dispatch = (method) => (handle, ...rest) => {
         const { instance, original } = route(handle)
         return instance.callbackDispatch[method](original, ...rest)
+      }
+
+      // One per-row scalar call (shared by the async + sync batch paths).
+      const callScalarRow = (instance, original, row, base, i, ctx) =>
+        instance.callbackDispatch.callScalar(original, row, {
+          rowindex: base + BigInt(i),
+          iswindow: ctx.iswindow,
+        })
+
+      // SYNC batch: a plain loop, no await. The extension's per-row callScalar is
+      // synchronous (sync-transpiled), so the whole batch returns synchronously —
+      // the core (sync-transpiled in the worker) gets a plain array.
+      const callScalarBatchSync = (handle, rows, ctx) => {
+        const { instance, original } = route(handle)
+        const base = ctx.rowindex ?? 0n
+        const out = new Array(rows.length)
+        for (let i = 0; i < rows.length; i++) out[i] = callScalarRow(instance, original, rows[i], base, i, ctx)
+        return out
+      }
+
+      // ASYNC batch (JSPI): each per-row call may suspend on async socket I/O, so
+      // await sequentially to preserve row + connection-state ordering.
+      const callScalarBatchAsync = async (handle, rows, ctx) => {
+        const { instance, original } = route(handle)
+        const base = ctx.rowindex ?? 0n
+        const out = []
+        for (let i = 0; i < rows.length; i++) out.push(await callScalarRow(instance, original, rows[i], base, i, ctx))
+        return out
       }
 
       return {
@@ -220,23 +257,10 @@ export function createExtensionHost(opts) {
         'duckdb:extension/callback-dispatch': {
           callScalar: dispatch('callScalar'),
           // The core->host crossing is batched (one call per chunk); the
-          // extension is invoked per row. Each per-row call may be JSPI-promised
-          // (socket-using scalars suspend on async I/O), so await sequentially to
-          // preserve row + connection-state ordering. Row i's index is base + i.
-          callScalarBatch: async (handle, rows, ctx) => {
-            const { instance, original } = route(handle)
-            const base = ctx.rowindex ?? 0n
-            const out = []
-            for (let i = 0; i < rows.length; i++) {
-              out.push(
-                await instance.callbackDispatch.callScalar(original, rows[i], {
-                  rowindex: base + BigInt(i),
-                  iswindow: ctx.iswindow,
-                }),
-              )
-            }
-            return out
-          },
+          // extension is invoked per row. Row i's index is base + i. The sync
+          // variant (worker fallback) returns a plain array; the async variant
+          // (JSPI) awaits each row so socket-using scalars can suspend.
+          callScalarBatch: syncScalarBatch ? callScalarBatchSync : callScalarBatchAsync,
           callTable: dispatch('callTable'),
           callAggregate: dispatch('callAggregate'),
           callPragma: dispatch('callPragma'),
