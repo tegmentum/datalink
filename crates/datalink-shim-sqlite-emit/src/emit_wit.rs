@@ -6,23 +6,25 @@
 //! `deps/` directory holds the dependency WIT packages that
 //! `wit-bindgen::generate!` resolves at build time.
 //!
-//! ## Phase D: per-shim source layout
+//! ## Per-shim source layout
 //!
 //! `source_shim_deps_dir(primary)` resolves the source WIT-deps
-//! tree per primary shim:
+//! tree per primary shim in this order:
 //!
-//!   - `postgis`  →  `~/git/sqlink/extensions/postgis-bridge/wit/deps`
-//!   - `mobilitydb` → `~/git/mobilitydb-wasm/wit/deps` (best-effort
-//!     fallback; the mobilitydb temporal package isn't usually
-//!     vendored here, so the output mostly carries helper-component
-//!     imports — Phase E will land a proper deps root once the
-//!     mobilitydb-bridge crate is created).
-//!
-//! `SQLINK_SHIM_WIT_DEPS=/path/...` overrides per-shim defaults.
-//! Per-shim env overrides keep the old single-shim worktrees
-//! working without forcing every caller to set the new var:
-//!   - `SQLINK_POSTGIS_BRIDGE_WIT_DEPS=...`     (postgis)
-//!   - `SQLINK_MOBILITYDB_BRIDGE_WIT_DEPS=...`  (mobilitydb)
+//!   1. `$SQLINK_SHIM_WIT_DEPS`                      (catch-all override)
+//!   2. Per-primary env override (`SQLINK_{POSTGIS,MOBILITYDB}_BRIDGE_WIT_DEPS`)
+//!   3. **Upstream WIT** — preferred default. The bridge's own
+//!      vendored `wit/deps/` is stale-by-definition during a regen,
+//!      so the resolver synthesizes a deps tree from upstream
+//!      sources (#651). Upstream layouts don't always match the
+//!      flat `deps/<pkg>/` shape, so this step copies the relevant
+//!      `*.wit` files into `$TMPDIR/sqlink-codegen-upstream-<primary>/`
+//!      laid out as a proper deps tree.
+//!         - `mobilitydb` → `~/git/mobilitydb-wasm/crates/mdb-temporal-wasm/wit/temporal.wit`
+//!         - `postgis`    → `~/git/postgis-wasm/wit/*.wit`
+//!                          plus `wit/deps/sfcgal-wasm/` for the helper.
+//!   4. Bridge's own vendored `wit/deps/` (last-resort fallback,
+//!      e.g. `~/git/mobilitydb-sqlink-bridge/wit/deps`).
 //!
 //! ## Phase D: dynamic world.wit
 //!
@@ -112,14 +114,17 @@ pub fn write_deps(plan: &BridgePlan, deps_dir: &Path) -> Result<()> {
 }
 
 /// Locate the source `wit/deps/` directory for the upstream shim
-/// WIT packages. Phase D adds per-primary lookups so the codegen
-/// can target mobilitydb (and future shims) alongside postgis.
+/// WIT packages.
 ///
-/// Resolution order:
+/// Resolution order (#651):
 ///   1. `$SQLINK_SHIM_WIT_DEPS`     (catch-all explicit override)
 ///   2. Per-primary env override (e.g. `SQLINK_POSTGIS_BRIDGE_WIT_DEPS`).
-///   3. Per-primary default path under `$HOME/git/...`.
-///   4. Per-primary fallback path relative to current working dir.
+///   3. **Upstream** WIT, synthesized into a temp deps tree when
+///      the upstream repo is checked out. Preferred default — the
+///      bridge's own vendored copy is stale-by-definition during
+///      a regen, so without this step regen would silently miss
+///      new functions added upstream.
+///   4. Bridge's own vendored `wit/deps/` (last-resort fallback).
 pub fn source_shim_deps_dir(primary: &str) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("SQLINK_SHIM_WIT_DEPS") {
         let p = PathBuf::from(p);
@@ -145,22 +150,22 @@ pub fn source_shim_deps_dir(primary: &str) -> Result<PathBuf> {
             return Err(anyhow!("{}={} does not exist", var, p.display()));
         }
     }
+    // (3) UPSTREAM (preferred) — synthesize a deps tree from upstream
+    //     sources if the upstream repo is checked out at the expected
+    //     paths. The bridge's own wit/deps/ is stale-by-definition
+    //     during regen, so falling through to it silently drops any
+    //     new functions added upstream (the #651 symptom).
+    if let Some(p) = try_synthesize_upstream_deps(primary)? {
+        return Ok(p);
+    }
+    // (4) Bridge's own vendored copy (last-resort fallback).
     let candidates: Vec<PathBuf> = match primary {
         "postgis" => vec![
             home_path("git/sqlink/extensions/postgis-bridge/wit/deps"),
             Some(PathBuf::from("../sqlink/extensions/postgis-bridge/wit/deps")),
         ],
         "mobilitydb" => vec![
-            // Phase D best-effort: mobilitydb-wasm vendors helper
-            // components in wit/deps/. The mobilitydb:temporal
-            // package itself lives at
-            // crates/mdb-temporal-wasm/wit/temporal.wit; once a
-            // mobilitydb-bridge crate exists with a deps/ tree that
-            // includes a `mobilitydb-temporal/` subdir, that path
-            // becomes the preferred resolution.
             home_path("git/mobilitydb-sqlink-bridge/wit/deps"),
-            home_path("git/mobilitydb-wasm/wit/deps"),
-            Some(PathBuf::from("../mobilitydb-wasm/wit/deps")),
         ],
         _ => vec![home_path(&format!(
             "git/{}-sqlink-bridge/wit/deps",
@@ -179,6 +184,110 @@ pub fn source_shim_deps_dir(primary: &str) -> Result<PathBuf> {
         "cannot locate shim wit/deps for primary '{primary}'. Set \
          SQLINK_SHIM_WIT_DEPS=/path/to/wit/deps"
     ))
+}
+
+/// Synthesize a `wit/deps/`-shaped tree from upstream-shim sources.
+/// Returns `None` when the upstream repo isn't checked out at the
+/// expected paths.
+///
+/// Upstream layouts don't always match the flat `deps/<pkg>/` shape
+/// the bridge expects:
+///   - `mobilitydb`: the `mobilitydb:temporal` package lives at
+///     `~/git/mobilitydb-wasm/crates/mdb-temporal-wasm/wit/temporal.wit`,
+///     NOT at `~/git/mobilitydb-wasm/wit/deps/`. The helpers under
+///     upstream `wit/deps/` are imported via wac plug at compose time
+///     and aren't part of the bridge's `wit/deps/`.
+///   - `postgis`: `~/git/postgis-wasm/wit/*.wit` holds the primary
+///     `postgis:wasm` package as a multi-file dir; the helper
+///     `sfcgal:component` lives at `~/git/postgis-wasm/wit/deps/sfcgal-wasm/`.
+///
+/// The synthesized tree is rooted at
+/// `$TMPDIR/sqlink-codegen-upstream-<primary>/` and is repopulated
+/// from scratch on every call so the bridge always picks up
+/// the latest upstream WIT.
+fn try_synthesize_upstream_deps(primary: &str) -> Result<Option<PathBuf>> {
+    let sources = upstream_pkg_sources(primary);
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    let dest =
+        std::env::temp_dir().join(format!("sqlink-codegen-upstream-{primary}"));
+    if dest.exists() {
+        fs::remove_dir_all(&dest)
+            .with_context(|| format!("clearing {}", dest.display()))?;
+    }
+    fs::create_dir_all(&dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    for (subdir, src) in &sources {
+        let to = dest.join(subdir);
+        copy_top_level_wit_files(src, &to).with_context(|| {
+            format!(
+                "synthesizing upstream {} -> {}",
+                src.display(),
+                to.display()
+            )
+        })?;
+    }
+    Ok(Some(dest))
+}
+
+/// Upstream-shim package sources. Each entry is
+/// `(deps_subdir_name, source_dir_with_*.wit_files)`. Empty when the
+/// upstream repo isn't checked out.
+fn upstream_pkg_sources(primary: &str) -> Vec<(&'static str, PathBuf)> {
+    let mut out = Vec::<(&'static str, PathBuf)>::new();
+    match primary {
+        "mobilitydb" => {
+            if let Some(p) =
+                home_path("git/mobilitydb-wasm/crates/mdb-temporal-wasm/wit")
+            {
+                if p.is_dir() {
+                    out.push(("mobilitydb-temporal", p));
+                }
+            }
+        }
+        "postgis" => {
+            if let Some(p) = home_path("git/postgis-wasm/wit") {
+                if p.is_dir() {
+                    out.push(("postgis-wasm", p));
+                    if let Some(s) =
+                        home_path("git/postgis-wasm/wit/deps/sfcgal-wasm")
+                    {
+                        if s.is_dir() {
+                            out.push(("sfcgal-component", s));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Copy only top-level `*.wit` files from `src` to `dst`, ignoring
+/// any subdirectories. Used when synthesizing the upstream deps tree
+/// — e.g. `~/git/postgis-wasm/wit/` has a nested `deps/` subdir we
+/// don't want to flatten into the bridge's `wit/deps/<pkg>/`.
+fn copy_top_level_wit_files(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Err(anyhow!("source {} is not a directory", src.display()));
+    }
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        if !from.is_file() {
+            continue;
+        }
+        if from.extension().and_then(|s| s.to_str()) != Some("wit") {
+            continue;
+        }
+        let to = dst.join(entry.file_name());
+        fs::copy(&from, &to)
+            .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
+    }
+    Ok(())
 }
 
 /// Locate sqlink's `sqlite-loader-wit/wit/` directory — the
