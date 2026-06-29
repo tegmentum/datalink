@@ -32,6 +32,7 @@
 /// duckdb_shim! {
 ///     core = aba_core::Core;
 ///     types = duckdb::extension::types;
+///     column_types = duckdb::extension::column_types;
 ///     runtime = duckdb::extension::runtime;
 ///     callback_dispatch = exports::duckdb::extension::callback_dispatch;
 ///     guest = exports::duckdb::extension::guest;
@@ -43,6 +44,7 @@ macro_rules! duckdb_shim {
     (
         core = $core:path ;
         types = $types:path ;
+        column_types = $ct:path ;
         runtime = $rt:path ;
         callback_dispatch = $cbd:path ;
         guest = $guest:path ;
@@ -51,6 +53,7 @@ macro_rules! duckdb_shim {
         const _: () = {
             use $crate::ExtCore as _;
             use $types as types;
+            use $ct as col;
             use $rt as runtime;
             use $cbd as callback_dispatch;
             use $guest as guest;
@@ -122,6 +125,112 @@ macro_rules! duckdb_shim {
                 types::Duckerror::Invalidargument(e)
             }
 
+            // ---- Columnar marshalling: colvec <-> NeutralColVec ----
+            //
+            // The major-4 hot path. A `colvec` arrives as a typed contiguous
+            // column (the core memcpy'd it from `duckdb_vector_get_data`) plus
+            // an out-of-band packed validity bitmap (empty => all valid, the
+            // exact layout of `NeutralColVec`). Lifting a fixed-width column is a
+            // bulk `clone()` of the slice; var-width (text/blob) and the
+            // `complex` escape hatch are element-wise (unavoidable). Cores
+            // declare only the neutral closed type set, so the physical-int /
+            // temporal arms are widened defensively (never lossy in practice).
+
+            fn colvec_to_neutral(c: &col::Colvec) -> $crate::NeutralColVec {
+                let data = match &c.data {
+                    col::Column::Boolean(v) => $crate::NeutralColumn::Boolean(v.clone()),
+                    col::Column::Int64(v) => $crate::NeutralColumn::Int64(v.clone()),
+                    col::Column::Float64(v) => $crate::NeutralColumn::Float64(v.clone()),
+                    col::Column::Text(v) => $crate::NeutralColumn::Text(
+                        v.iter().map(|s| ::std::string::String::from(s.as_str())).collect(),
+                    ),
+                    col::Column::Blob(v) => $crate::NeutralColumn::Blob(v.clone()),
+                    col::Column::Complex(v) => {
+                        let type_expr = v
+                            .first()
+                            .map(|e| ::std::string::String::from(e.type_expr.as_str()))
+                            .unwrap_or_default();
+                        let json = v
+                            .iter()
+                            .map(|e| ::std::string::String::from(e.json.as_str()))
+                            .collect();
+                        $crate::NeutralColumn::Complex { type_expr, json }
+                    }
+                    // physical-int / temporal arms widen to Int64 (defensive).
+                    col::Column::Int32(v) => {
+                        $crate::NeutralColumn::Int64(v.iter().map(|&x| x as i64).collect())
+                    }
+                    col::Column::Int16(v) => {
+                        $crate::NeutralColumn::Int64(v.iter().map(|&x| x as i64).collect())
+                    }
+                    col::Column::Int8(v) => {
+                        $crate::NeutralColumn::Int64(v.iter().map(|&x| x as i64).collect())
+                    }
+                    col::Column::Uint64(v) => {
+                        $crate::NeutralColumn::Int64(v.iter().map(|&x| x as i64).collect())
+                    }
+                    col::Column::Uint32(v) => {
+                        $crate::NeutralColumn::Int64(v.iter().map(|&x| x as i64).collect())
+                    }
+                    col::Column::Uint16(v) => {
+                        $crate::NeutralColumn::Int64(v.iter().map(|&x| x as i64).collect())
+                    }
+                    col::Column::Uint8(v) => {
+                        $crate::NeutralColumn::Int64(v.iter().map(|&x| x as i64).collect())
+                    }
+                    col::Column::Date(v) => {
+                        $crate::NeutralColumn::Int64(v.iter().map(|&x| x as i64).collect())
+                    }
+                    col::Column::Time(v) => $crate::NeutralColumn::Int64(v.clone()),
+                    col::Column::Timestamp(v) => $crate::NeutralColumn::Int64(v.clone()),
+                    col::Column::Timestamptz(v) => $crate::NeutralColumn::Int64(v.clone()),
+                    col::Column::Float32(v) => {
+                        $crate::NeutralColumn::Float64(v.iter().map(|&x| x as f64).collect())
+                    }
+                    // composite physical types ride the escape hatch.
+                    col::Column::Decimal(v) => $crate::NeutralColumn::Complex {
+                        type_expr: "DECIMAL".into(),
+                        json: v.iter().map(|d| ::std::format!("{:?}", d)).collect(),
+                    },
+                    col::Column::Interval(v) => $crate::NeutralColumn::Complex {
+                        type_expr: "INTERVAL".into(),
+                        json: v.iter().map(|d| ::std::format!("{:?}", d)).collect(),
+                    },
+                    col::Column::Uuid(v) => $crate::NeutralColumn::Complex {
+                        type_expr: "UUID".into(),
+                        json: v.iter().map(|d| ::std::format!("{:?}", d)).collect(),
+                    },
+                };
+                $crate::NeutralColVec {
+                    data,
+                    validity: c.validity.clone(),
+                    rows: c.rows as usize,
+                }
+            }
+
+            fn neutral_to_colvec(n: $crate::NeutralColVec) -> col::Colvec {
+                let rows = n.rows as u32;
+                let validity = n.validity;
+                let data = match n.data {
+                    $crate::NeutralColumn::Boolean(v) => col::Column::Boolean(v),
+                    $crate::NeutralColumn::Int64(v) => col::Column::Int64(v),
+                    $crate::NeutralColumn::Float64(v) => col::Column::Float64(v),
+                    $crate::NeutralColumn::Text(v) => {
+                        col::Column::Text(v.into_iter().map(|s| s.into()).collect())
+                    }
+                    $crate::NeutralColumn::Blob(v) => col::Column::Blob(v),
+                    $crate::NeutralColumn::Complex { type_expr, json } => col::Column::Complex(
+                        json.into_iter()
+                            .map(|j| col::Complexvalue {
+                                type_expr: type_expr.clone().into(),
+                                json: j.into(),
+                            })
+                            .collect(),
+                    ),
+                };
+                col::Colvec { data, validity, rows }
+            }
+
             // ---- guest::Guest (load / reconfigure / shutdown) ----
 
             impl guest::Guest for Extension {
@@ -158,18 +267,17 @@ macro_rules! duckdb_shim {
             // ---- callback_dispatch::Guest ----
 
             impl callback_dispatch::Guest for Extension {
-                fn call_scalar_batch(
+                // major-4 HOT PATH: one columnar call per DataChunk. The args
+                // arrive as typed `colvec`s (bulk-memcpy'd by the core from the
+                // DuckDB vectors); `scalar_batch_col` bridges to the existing
+                // per-row neutral `dispatch` so the core needs ZERO changes,
+                // applies NULL propagation, and accumulates one typed output
+                // column. Semantically identical to the major-3 per-row loop.
+                fn call_scalar_batch_col(
                     handle: u32,
-                    rows: ::std::vec::Vec<::std::vec::Vec<types::Duckvalue>>,
+                    args: ::std::vec::Vec<callback_dispatch::Colvec>,
                     _ctx: types::Invokeinfo,
-                ) -> Result<::std::vec::Vec<types::Duckvalue>, types::Duckerror> {
-                    // Per-chunk batching: resolve the handle ONCE (was a mutex
-                    // lock + HashMap lookup PER ROW via `call_scalar`), reuse a
-                    // single neutral scratch Vec across all rows (was one
-                    // allocation per row), and drop the unused per-row
-                    // `Invokeinfo` construction. `call_scalar`'s `ctx` is unused,
-                    // so this is semantically identical to the per-row loop while
-                    // eliminating ~rows mutex locks + ~rows heap allocations.
+                ) -> Result<callback_dispatch::Colvec, types::Duckerror> {
                     let idx = handle_table()
                         .lock()
                         .expect("scalar handle mutex poisoned")
@@ -181,16 +289,35 @@ macro_rules! duckdb_shim {
                     let decl = &<Core as $crate::ExtCore>::DECLS[idx];
                     let propagate =
                         matches!(decl.null_handling, $crate::NullHandling::Propagate);
-                    $crate::scalar_batch(
+                    let neutral_args: ::std::vec::Vec<$crate::NeutralColVec> =
+                        args.iter().map(colvec_to_neutral).collect();
+                    let out = $crate::scalar_batch_col(
                         idx,
                         propagate,
-                        rows,
-                        to_neutral,
-                        from_neutral,
-                        || types::Duckvalue::Null,
+                        &decl.ret,
+                        &neutral_args,
                         <Core as $crate::ExtCore>::dispatch,
-                        duckerr,
                     )
+                    .map_err(duckerr)?;
+                    Ok(neutral_to_colvec(out))
+                }
+
+                fn call_aggregate_col(
+                    _handle: u32,
+                    _args: ::std::vec::Vec<callback_dispatch::Colvec>,
+                ) -> Result<types::Duckvalue, types::Duckerror> {
+                    Err(types::Duckerror::Unsupported(
+                        ::std::format!("{}: no aggregates", <Core as $crate::ExtCore>::NAME),
+                    ))
+                }
+
+                fn call_cast_col(
+                    _handle: u32,
+                    _arg: callback_dispatch::Colvec,
+                ) -> Result<callback_dispatch::Colvec, types::Duckerror> {
+                    Err(types::Duckerror::Unsupported(
+                        ::std::format!("{}: no casts", <Core as $crate::ExtCore>::NAME),
+                    ))
                 }
 
                 fn call_scalar(
@@ -228,14 +355,6 @@ macro_rules! duckdb_shim {
                 ) -> Result<types::Resultset, types::Duckerror> {
                     Err(types::Duckerror::Unsupported(
                         ::std::format!("{}: no table functions", <Core as $crate::ExtCore>::NAME),
-                    ))
-                }
-                fn call_aggregate(
-                    _handle: u32,
-                    _rows: types::Rowbatch,
-                ) -> Result<types::Duckvalue, types::Duckerror> {
-                    Err(types::Duckerror::Unsupported(
-                        ::std::format!("{}: no aggregates", <Core as $crate::ExtCore>::NAME),
                     ))
                 }
                 fn call_pragma(
