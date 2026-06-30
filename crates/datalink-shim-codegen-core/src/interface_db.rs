@@ -980,6 +980,34 @@ pub fn augment_plan_with_upstream_wit_scalars(
     let aliases = collect_package_aliases(wit_deps_dir);
     let wit_fns = resolve_function_aliases(wit_fns, &aliases);
 
+    // #706: drop helper-package WIT functions before synthesising
+    // SQL scalars. The synthesiser used to walk every WIT package
+    // under `wit_deps_dir` (postgis-wasm + sfcgal-component +
+    // gdal-core + geos-geometry + proj-wasm + every other helper
+    // imported via wac plug), producing ~600 spurious bare-name
+    // entries (`alpha_shape`, `area`, `buffer`, `centroid`, ...)
+    // that have no matching free function in the primary shim's
+    // WIT. The dispatcher then walks `pick_primary_shim_dir(...)`
+    // ONLY — so these synthetics all unwire with
+    // "no WIT function matches", flooding the regen log without
+    // adding any SQL surface (the real `st_alpha_shape`,
+    // `st_area`, `st_buffer`, ... entries already exist in the
+    // interface DB and wire fine through `postgis-wasm/sfcgal.wit`
+    // etc.).  Keep only functions whose owning WIT package belongs
+    // to the primary extension's namespace (e.g. for `postgis`,
+    // only `postgis:wasm`; for `mobilitydb`, only `mobilitydb:*`).
+    let primary = plan.extensions[0].name.clone();
+    let wit_fns: Vec<wit_parse::WitFunction> = wit_fns
+        .into_iter()
+        .filter(|f| {
+            f.package
+                .split(':')
+                .next()
+                .map(|ns| ns == primary)
+                .unwrap_or(false)
+        })
+        .collect();
+
     // Collect every SQL name already wired across every extension
     // and every function category. A new WIT function whose
     // kebab→snake name collides with an existing aggregate /
