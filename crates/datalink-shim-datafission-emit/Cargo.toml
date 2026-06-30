@@ -11,7 +11,7 @@ name = "datalink_shim_datafission_emit"
 path = "src/lib.rs"
 
 [dependencies]
-shim-bridge-codegen-core = { git = "https://github.com/tegmentum/shim-bridge-codegen-core.git", rev = "0e25c2929845b9051e8481746f63061a3944037a" }
+shim-bridge-codegen-core = { git = "https://github.com/tegmentum/shim-bridge-codegen-core.git", rev = "4cfd54965a930fb0f77c40ed71633dbc0347f3e0" }
 datalink-shim-codegen-core = { path = "../datalink-shim-codegen-core" }
 anyhow = "1"
 # Canonical-WIT shape hashing — present for symmetry with the
