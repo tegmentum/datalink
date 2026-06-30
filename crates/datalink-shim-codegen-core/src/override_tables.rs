@@ -174,6 +174,14 @@ pub fn tuple_pick_override_for<'a>(
 ///     - `tgeompoint_centroid_agg` → `tgeompoint-temporal-centroid`:
 ///       same `temporal-` infix mismatch (`tgeompoint_centroid` vs
 ///       `tgeompoint-temporal-centroid`).
+/// - #660 batch — five postgis aggregates whose SQL canonical names
+///   (`st_clusterintersecting`, `st_makeline`, `st_union`,
+///   `st_polygonize`, `st_rast_union`) share no stem with the upstream
+///   WIT kebabs (long-form + `-aggregate` suffix). The
+///   `_aggregate`-suffix strip on the candidate side can't bridge a
+///   bare SQL stem to an `_aggregate`-suffixed WIT name, so route each
+///   directly. Four go to `postgis-aggregates`; the raster variant
+///   goes to `postgis-raster-aggregates`.
 pub fn aggregate_function_overrides() -> &'static [(&'static str, &'static str, &'static str)] {
     // (sql_name, wit_interface, wit_kebab_name)
     &[
@@ -226,6 +234,40 @@ pub fn aggregate_function_overrides() -> &'static [(&'static str, &'static str, 
             "tint_range_agg",
             "temporal-aggregate-ops",
             "tint-range-aggregate",
+        ),
+        // #660 batch — postgis aggregate name-match misses. The SQL
+        // canonical names (no underscores, e.g. `st_clusterintersecting`
+        // / `st_makeline`) and the upstream WIT kebabs (long-form +
+        // `-aggregate` suffix, e.g. `st-cluster-intersecting-aggregate`)
+        // share no stem after snake/kebab normalisation, so the
+        // candidate-list lookup misses. The `_aggregate`-suffix-strip
+        // fallback strips FROM the candidate, not from the WIT name, so
+        // it can't bridge a bare SQL stem to an `_aggregate`-suffixed
+        // WIT name either. Route each directly. The classifier still
+        // picks up the return shape (`list<geometry>` →
+        // `RetShape::FirstGeomBlob` for cluster-intersecting; bare
+        // `geometry` → `RetShape::GeomBlob` for the rest; bare `raster`
+        // → `RetShape::RasterBlob` for the rast variant).
+        (
+            "st_clusterintersecting",
+            "postgis-aggregates",
+            "st-cluster-intersecting-aggregate",
+        ),
+        (
+            "st_makeline",
+            "postgis-aggregates",
+            "st-make-line-aggregate",
+        ),
+        ("st_union", "postgis-aggregates", "st-union-aggregate"),
+        (
+            "st_polygonize",
+            "postgis-aggregates",
+            "st-polygonize-aggregate",
+        ),
+        (
+            "st_rast_union",
+            "postgis-raster-aggregates",
+            "st-rast-union-aggregate",
         ),
     ]
 }
