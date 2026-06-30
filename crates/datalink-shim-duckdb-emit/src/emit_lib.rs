@@ -990,11 +990,27 @@ fn build_window_dispatch_impl(
     // is whole-partition compute, not state-machine. They survive
     // as stubs so the trait surface is complete.
     //
-    // `call_aggregate_window` is the live arm: per output row the
-    // host hands the bridge the whole partition's rows + a
-    // WindowFrame. The arm looks up the per-handle arm-index from
-    // `window_handle_table` and routes to the per-window-function
-    // body emitted by `dispatch::emit_window_arm_body`.
+    // `call_aggregate_window` is the alternative-path arm: per
+    // output row the host would hand the bridge the whole
+    // partition's rows + a WindowFrame. The arm looks up the
+    // per-handle arm-index from `window_handle_table` and routes
+    // to the per-window-function body emitted by
+    // `dispatch::emit_window_arm_body`.
+    //
+    // DORMANT (#662): the 10 postgis window functions (#661)
+    // execute end-to-end via the vanilla C aggregate API --
+    // DuckDB-core registers all aggregates (window-flagged or not)
+    // via the C aggregate registration surface, and DuckDB's
+    // window engine drives them through the existing init/update/
+    // combine/finalize callbacks. The corresponding host-side
+    // wrapper (`ducklink-runtime` `aggregate_window`) currently
+    // has zero callers, so this generated `call_aggregate_window`
+    // body is also dormant in practice. Per
+    // duckdb-wasm/docs/v3-core-shim-plan.md: WINDOW executes via
+    // the aggregate path; this is an alternative dispatch path,
+    // not the primary one. The arm survives generation so the
+    // alternative path can be activated by ducklink-host wiring
+    // without re-emitting the bridge.
 
     let mut window_arms = String::new();
     let arm_count = build_window_arms(&mut window_arms, window_entries);
