@@ -275,6 +275,10 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
         // JsonText: nested compound returns rendered as JSON
         // string for SQL `json_each` consumption.
         RetShape::JsonText { .. } => "types::Logicaltype::Text".to_string(),
+        // #677: `list<bool>` / `list<list<u8>>` batch returns
+        // rendered as JSON text (symmetric with the param-side
+        // ListListU8 convention).
+        RetShape::ListBool | RetShape::ListListU8 => "types::Logicaltype::Text".to_string(),
         // TuplePick: surface element kind drives the declaration.
         RetShape::TuplePick { elem, .. } => match elem {
             datalink_shim_codegen_core::interface_db::ListPrimElem::F64

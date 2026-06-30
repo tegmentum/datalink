@@ -762,6 +762,19 @@ pub fn emit_arm_body(
                  {i}}}"
             ),
         },
+        // #677: `list<bool>` / `list<list<u8>>` batch returns —
+        // serde-encode the upstream `Vec<bool>` / `Vec<Vec<u8>>`
+        // directly to a JSON array text. Symmetric with the
+        // param-side `ParamShape::ListListU8` convention. SQL
+        // callers unpack via SQLite's JSON1 ops.
+        RetShape::ListBool | RetShape::ListListU8 => format!(
+            "{{\n\
+             {i}    let __r = {call_expr}{unwrap_chain};\n\
+             {i}    let __json = serde_json::to_string(&__r)\n\
+             {i}        .map_err(|e| format!(\"{sql_name}: encode JSON: {{}}\", e))?;\n\
+             {i}    Ok(SqlValue::Text(__json))\n\
+             {i}}}"
+        ),
         // #564: tuple-pick — call the underlying tuple-returning
         // function and surface element `index` as the matching
         // SqlValue primitive variant. Wired by `tuple_pick_overrides()`

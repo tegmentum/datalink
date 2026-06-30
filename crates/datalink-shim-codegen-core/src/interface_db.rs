@@ -25,8 +25,9 @@ use anyhow::Result;
 
 use crate::name_match::{
     aggregate_name_candidates, candidates_sorted, collect_package_aliases,
-    collect_package_enums, find_resource_concat_match, find_resource_family_free_fn,
-    find_resource_method, find_same_interface_free_fn, find_wit_fn,
+    collect_package_enums, find_dim_variant_match, find_resource_concat_match,
+    find_resource_family_free_fn, find_resource_method, find_same_interface_free_fn,
+    find_wit_fn,
     index_resource_interfaces, index_resource_methods, index_resource_methods_concat,
     index_wit_fns, index_wit_fns_nohyphen,
     resolve_function_aliases, sql_name_candidates, table_fn_name_candidates,
@@ -500,6 +501,23 @@ pub enum RetShape {
     /// JSON; SQLite's `json_each` lets them unpack rows without a
     /// host-side codec. No per-shape type-id is required.
     JsonText { kind: JsonRetKind },
+    /// #677: `list<bool>` return — batched predicate result from
+    /// postgis's `st_*_batch` predicate family. Encoded as
+    /// SqlValue::Text holding a JSON array `[true,false,...]`.
+    /// SQL callers consume via SQLite's JSON1 ops / DuckDB's
+    /// `json_each`. Symmetric with the param-side
+    /// `ParamShape::ListListU8` JSON convention; chose JSON over a
+    /// first-element projection because the batch contract is
+    /// "one input → one output" and surfacing only the first
+    /// element silently drops data.
+    ListBool,
+    /// #677: `list<list<u8>>` return — batched geometry result
+    /// from postgis's `st_*_batch` geometry family
+    /// (`st_buffer_batch`, `st_centroid_batch`, etc.). Encoded
+    /// as SqlValue::Text holding a JSON array of int-arrays
+    /// (e.g. `[[1,2,3],[4,5,6]]`), symmetric with the param-side
+    /// `ParamShape::ListListU8` convention.
+    ListListU8,
     /// #564: pick element `index` of a tuple-shaped return and
     /// surface it as the matching `SqlValue` primitive variant.
     ///
@@ -2158,6 +2176,24 @@ pub fn classify_return(
             }
             WitType::F64 | WitType::F32 => RetShape::FirstReal,
             WitType::String => RetShape::FirstText,
+            // #677: `list<bool>` — batched predicate result from
+            // postgis's `st_*_batch` predicate family
+            // (`st_intersects_batch`, `st_contains_batch`, etc.).
+            // Surface as JSON array text (e.g. `[true,false,true]`).
+            // Symmetric with the param-side `ListListU8` JSON
+            // convention; SQL callers consume via `json_each` /
+            // SQLite's JSON1 ops.
+            WitType::Bool => RetShape::ListBool,
+            // #677: `list<list<u8>>` — batched geometry result
+            // from postgis's `st_*_batch` geometry family
+            // (`st_buffer_batch`, `st_centroid_batch`, etc.). The
+            // parser surfaces `list<u8>` as `WitType::ListU8`
+            // (not `List(Box<U8>)`), so this case sits OUTSIDE
+            // the `WitType::List(inner2)` nested arm below.
+            // Encode as JSON-of-int-arrays (e.g.
+            // `[[1,2,3],[4,5,6]]`), symmetric with the param-side
+            // `ParamShape::ListListU8` convention.
+            WitType::ListU8 => RetShape::ListListU8,
             // Round-490: list<raster> — first element rendered as
             // BLOB via the resource's `as-binary` method (Null if
             // empty). Mirrors `FirstGeomBlob`.
@@ -2584,13 +2620,20 @@ pub fn build_full(
                 &resource_iface_index,
             ) {
                 Some(f)
+            } else if let Some(f) = find_resource_concat_match(
+                &candidates,
+                &method_concat_index,
+                &wit_nohyphen,
+                &resource_iface_index,
+            ) {
+                Some(f)
             } else {
-                find_resource_concat_match(
-                    &candidates,
-                    &method_concat_index,
-                    &wit_nohyphen,
-                    &resource_iface_index,
-                )
+                // #677: dim-variant matching. Routes SQL aliases
+                // like `st_3dintersects`, `st_force_2d`,
+                // `st_length2d`, `st_perimeter_twod` to the
+                // kebab-fix WIT form (`st-<verb>-threed`,
+                // `st-force-twod`, etc.).
+                find_dim_variant_match(&candidates, &wit_index, &wit_nohyphen)
             };
             let Some(f) = matched else {
                 unwired.push(UnwiredScalar {
@@ -2715,6 +2758,11 @@ pub fn build_full(
                         &wit_nohyphen,
                         &resource_iface_index,
                     )
+                })
+                .or_else(|| {
+                    // #677: dim-variant matching for cast-rewrite
+                    // synthesis path.
+                    find_dim_variant_match(&candidates, &wit_index, &wit_nohyphen)
                 });
             let Some(f) = matched else {
                 unwired.push(UnwiredScalar {

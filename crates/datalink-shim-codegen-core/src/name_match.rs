@@ -648,3 +648,140 @@ pub fn find_resource_family_free_fn<'a>(
     }
     None
 }
+
+/// #677: dim-variant name matching. PostGIS exposes a fan of
+/// dim-tagged SQL aliases (`st_3d_intersects`, `st_3dintersects`,
+/// `st_intersects_3d`, `st_force_2d`, `st_force2d`, `st_length2d`,
+/// `st_perimeter_twod`, ...) whose WIT counterparts live under
+/// the kebab-fix convention (`st-<verb>-threed`, `st-force-twod`,
+/// `st-length-twod`, etc., per #655). The earlier passes
+/// (snake / no-hyphen / resource-method) can't bridge these
+/// because the dim token (`2d`, `3d`, `3dm`, `3dz`, `4d`) lives in
+/// a different position on the SQL side than its `twod`/`threed`/
+/// `threedm`/`threedz`/`fourd` translation on the WIT side.
+///
+/// Strategy: for each candidate (after stripping `st_`), try to
+/// recognise a dim token at one of four positions:
+///   1. Trailing with underscore: `<verb>_<dim>` (e.g. `length_2d`)
+///   2. Trailing concat:           `<verb><dim>` (e.g. `length2d`)
+///   3. Leading with underscore:  `<dim>_<verb>` (e.g. `3d_dwithin`)
+///   4. Leading concat:            `<dim><verb>` (e.g. `3ddwithin`)
+///
+/// For each match, build two key candidates against the WIT side:
+///   - `<verb>_<wit_dim>` (snake form, e.g. `length_twod`)
+///   - `<verb_no_underscore><wit_dim>` (nohyphen form, e.g.
+///     `lineinterpolatepointthreed`)
+///
+/// As a final fallback, when the dim token is `2d` (or its
+/// translated form `twod`) AND no `<verb>_twod` mapping exists,
+/// try the bare `<verb>` form — PostGIS treats `ST_Perimeter2D`
+/// as a deprecated alias of `ST_Perimeter`, and the WIT only
+/// declares the bare form for that family.
+pub fn find_dim_variant_match<'a>(
+    candidates: &[String],
+    snake_idx: &HashMap<String, &'a WitFunction>,
+    nohyphen_idx: &HashMap<String, Vec<&'a WitFunction>>,
+) -> Option<&'a WitFunction> {
+    // SQL token -> WIT token. Order matters: longer tokens must
+    // come first so `3dz` / `3dm` win over `3d` (otherwise `3dz`
+    // is misread as `3d` + verb `z`).
+    const DIM_TOKENS: &[(&str, &str)] = &[
+        ("3dz", "threedz"),
+        ("3dm", "threedm"),
+        ("twod", "twod"),
+        ("2d", "twod"),
+        ("3d", "threed"),
+        ("4d", "fourd"),
+    ];
+
+    for cand in candidates {
+        let raw = cand.strip_prefix("st_").unwrap_or(cand);
+        for (sql_dim, wit_dim) in DIM_TOKENS {
+            // Position 1: trailing `_<dim>` suffix.
+            if let Some(verb) = raw.strip_suffix(&format!("_{}", sql_dim)) {
+                if let Some(f) = try_dim_lookup(verb, wit_dim, snake_idx, nohyphen_idx, cand) {
+                    return Some(f);
+                }
+            }
+            // Position 2: trailing concat `<dim>` (no underscore).
+            // Gate: must have non-empty verb, and verb must not
+            // already end with `_` (that case is Position 1).
+            if let Some(verb) = raw.strip_suffix(sql_dim) {
+                if !verb.is_empty() && !verb.ends_with('_') {
+                    if let Some(f) =
+                        try_dim_lookup(verb, wit_dim, snake_idx, nohyphen_idx, cand)
+                    {
+                        return Some(f);
+                    }
+                }
+            }
+            // Position 3: leading `<dim>_` prefix.
+            if let Some(verb) = raw.strip_prefix(&format!("{}_", sql_dim)) {
+                if let Some(f) = try_dim_lookup(verb, wit_dim, snake_idx, nohyphen_idx, cand) {
+                    return Some(f);
+                }
+            }
+            // Position 4: leading concat `<dim>` (no underscore).
+            if let Some(verb) = raw.strip_prefix(sql_dim) {
+                if !verb.is_empty() && !verb.starts_with('_') {
+                    if let Some(f) =
+                        try_dim_lookup(verb, wit_dim, snake_idx, nohyphen_idx, cand)
+                    {
+                        return Some(f);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// #677 helper: given a recognised `<verb>` + `<wit_dim>` split,
+/// probe the snake / no-hyphen indexes for the WIT-side form.
+///
+/// Three lookups, in order:
+///   1. `<verb>_<wit_dim>` against `snake_idx`.
+///   2. `<verb_no_underscore><wit_dim>` against `nohyphen_idx`
+///      (covers concat-form SQL like `st_3dlineinterpolatepoint`
+///      where the verb has no separators).
+///   3. Bare `<verb>` against `snake_idx` IFF the dim translates
+///      to `twod`. PostGIS treats `2D` as the default dim for
+///      legacy aliases (`ST_Perimeter2D` ≡ `ST_Perimeter`), and
+///      the WIT only declares the bare form for that family.
+fn try_dim_lookup<'a>(
+    verb: &str,
+    wit_dim: &str,
+    snake_idx: &HashMap<String, &'a WitFunction>,
+    nohyphen_idx: &HashMap<String, Vec<&'a WitFunction>>,
+    cand: &str,
+) -> Option<&'a WitFunction> {
+    if verb.is_empty() {
+        return None;
+    }
+    // 1. Snake form.
+    let snake_key = format!("{}_{}", verb, wit_dim);
+    if let Some(f) = snake_idx.get(&snake_key) {
+        return Some(*f);
+    }
+    // 2. No-hyphen form.
+    let nh_key = format!("{}{}", verb.replace('_', ""), wit_dim);
+    if let Some(fs) = nohyphen_idx.get(&nh_key) {
+        if let Some(f) = pick_tiebreak(cand, fs) {
+            return Some(f);
+        }
+    }
+    // 3. 2D-as-default fallback. Only fires when the SQL dim
+    // translates to `twod` AND neither dim-tagged lookup hit.
+    if wit_dim == "twod" {
+        if let Some(f) = snake_idx.get(verb) {
+            return Some(*f);
+        }
+        let bare_nh = verb.replace('_', "");
+        if let Some(fs) = nohyphen_idx.get(&bare_nh) {
+            if let Some(f) = pick_tiebreak(cand, fs) {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
