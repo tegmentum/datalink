@@ -1331,6 +1331,52 @@ fn parse_json_list_list_u8(args: &[types::Duckvalue], idx: usize, name: &str) ->
         .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of byte arrays ({e})")))
 }
 
+// #695: `list<list<X>>` param helpers for primitive non-u8
+// elements. Today's surface: postgis raster `st-set-values`
+// (`list<list<f64>>`) + flatgeobuf coord-list constructors.
+// Symmetric with the `RetShape::JsonText { ListListPrim }` return.
+fn parse_json_list_list_f64(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<Vec<f64>>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<f64>>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of f64 arrays ({e})")))
+}
+
+fn parse_json_list_list_i32(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<Vec<i32>>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<i32>>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of s32 arrays ({e})")))
+}
+
+fn parse_json_list_list_i64(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<Vec<i64>>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<i64>>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of s64 arrays ({e})")))
+}
+
+fn parse_json_list_list_u32(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<Vec<u32>>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<u32>>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of u32 arrays ({e})")))
+}
+
+fn parse_json_list_list_u64(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<Vec<u64>>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<u64>>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of u64 arrays ({e})")))
+}
+
+fn parse_json_list_list_bool(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<Vec<bool>>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<bool>>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of bool arrays ({e})")))
+}
+
+fn parse_json_list_list_string(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<Vec<String>>, types::Duckerror> {
+    let text = dv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<String>>>(text)
+        .map_err(|e| types::Duckerror::Invalidargument(format!("{name}: arg {idx} must be JSON array of string arrays ({e})")))
+}
+
 "##;
 
 /// Columnar <-> row-major conversion helpers (#653).

@@ -260,6 +260,19 @@ pub fn emit_scalar_arm_body(
                 ));
                 call_args.push(format!("&arg{idx}"));
             }
+            ParamShape::ListListPrim(elem) => {
+                // #695: `list<list<X>>` over a primitive non-u8
+                // element. Mirrors `ListListU8` with the per-element
+                // helper name and Rust inner type. Today's surface:
+                // postgis raster `st-set-values` + flatgeobuf
+                // coord-list constructors.
+                let suffix = elem.helper_suffix();
+                let rust_ty = elem.rust_elem();
+                s.push_str(&format!(
+                    "{i}let arg{idx}: Vec<Vec<{rust_ty}>> = parse_json_list_list_{suffix}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
             ParamShape::WitValueRecord {
                 kebab_name,
                 upstream_by_value,
@@ -742,7 +755,8 @@ pub fn paramshape_to_logicaltype(p: &ParamShape) -> String {
         ParamShape::ListPrim(_)
         | ParamShape::ListRecord { .. }
         | ParamShape::ListTuple { .. }
-        | ParamShape::ListListU8 => "types::LogicalType::Utf8".to_string(),
+        | ParamShape::ListListU8
+        | ParamShape::ListListPrim(_) => "types::LogicalType::Utf8".to_string(),
         ParamShape::Enum { .. } => "types::LogicalType::Int64".to_string(),
         ParamShape::WitValueRecord { .. } => "types::LogicalType::Binary".to_string(),
         ParamShape::OptionNone => "types::LogicalType::Utf8".to_string(),
@@ -1034,7 +1048,8 @@ pub fn emit_aggregate_finalize_body(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
-                | ParamShape::ListListU8 => {
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_) => {
                     return format!(
                         "{i}Err(ftypes::FunctionError::ExecutionError(\
                          format!(\"{sql_name}: aggregate config arg #{j} shape not wired\")))",
@@ -1324,7 +1339,8 @@ fn emit_aggregate_finalize_body_record_to_scalar(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
-                | ParamShape::ListListU8 => {
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_) => {
                     return format!(
                         "{i}Err(ftypes::FunctionError::ExecutionError(\
                          format!(\"{sql_name}: aggregate config arg #{j} shape not wired\")))",
@@ -1500,7 +1516,8 @@ fn emit_aggregate_finalize_body_record_to_tuple(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
-                | ParamShape::ListListU8 => {
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_) => {
                     return format!(
                         "{i}Err(ftypes::FunctionError::ExecutionError(\
                          format!(\"{sql_name}: aggregate config arg #{j} shape not wired\")))",
@@ -1593,6 +1610,7 @@ pub fn emit_udtf_begin_body(
             ParamShape::ListTuple { .. } => Some((idx, "list<tuple>")),
             ParamShape::ListPrim(_) => Some((idx, "list<primitive>")),
             ParamShape::ListListU8 => Some((idx, "list<list<u8>>")),
+            ParamShape::ListListPrim(_) => Some((idx, "list<list<primitive>>")),
             ParamShape::Enum { .. } => Some((idx, "enum")),
             _ => None,
         }
@@ -1863,7 +1881,8 @@ fn emit_udtf_param_marshal_df(
             | ParamShape::ListRecord { .. }
             | ParamShape::ListTuple { .. }
             | ParamShape::ListPrim(_)
-            | ParamShape::ListListU8 => {
+            | ParamShape::ListListU8
+            | ParamShape::ListListPrim(_) => {
                 s.push_str(&format!(
                     "{i}return Err(ftypes::FunctionError::ExecutionError(format!(\"{sql_name}: UDTF param shape not wired\")));\n",
                 ));

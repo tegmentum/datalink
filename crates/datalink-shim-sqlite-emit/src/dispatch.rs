@@ -270,6 +270,25 @@ pub fn emit_arm_body(
                 ));
                 call_args.push(format!("&arg{idx}"));
             }
+            ParamShape::ListListPrim(elem) => {
+                // #695: `list<list<X>>` over a primitive non-u8
+                // element. Mirrors `ListListU8` byte-for-byte
+                // except for the per-element helper name and the
+                // Rust inner type. The
+                // `parse_json_list_list_<suffix>` helper is
+                // emitted unconditionally in the prelude (same
+                // dead-code convention as the flat-list
+                // helpers). Today's surface: postgis
+                // `st-set-values` (`list<list<f64>>` values) and
+                // flatgeobuf `make-polygon-with-holes` /
+                // `make-multilinestring`.
+                let suffix = elem.helper_suffix();
+                let rust_ty = elem.rust_elem();
+                s.push_str(&format!(
+                    "{i}let arg{idx}: Vec<Vec<{rust_ty}>> = parse_json_list_list_{suffix}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
             ParamShape::ListTuple { elements } => {
                 // W2 Phase 2 mop-up (#555): `list<tuple<T1, T2,
                 // ...>>` param via JSON-as-TEXT marshaling.
@@ -1060,7 +1079,8 @@ pub fn emit_aggregate_finalize_body(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
-                | ParamShape::ListListU8 => {
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_) => {
                     // Extra args that are themselves geometries or
                     // record-typed don't appear in the postgis
                     // aggregate surface, and Phase E doesn't try to
@@ -1377,7 +1397,8 @@ fn emit_aggregate_finalize_body_record_to_scalar(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
-                | ParamShape::ListListU8 => {
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_) => {
                     return format!(
                         "{i}Err(format!(\"{sql_name}: aggregate extra arg #{j} shape not wired\"))",
                     );
@@ -1555,7 +1576,8 @@ fn emit_aggregate_finalize_body_record_to_tuple(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
-                | ParamShape::ListListU8 => {
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_) => {
                     return format!(
                         "{i}Err(format!(\"{sql_name}: aggregate extra arg #{j} shape not wired\"))",
                     );

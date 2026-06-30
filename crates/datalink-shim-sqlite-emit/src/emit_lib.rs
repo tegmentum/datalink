@@ -856,6 +856,62 @@ fn parse_json_list_list_u8(args: &[SqlValue], idx: usize, name: &str) -> Result<
     serde_json::from_str::<Vec<Vec<u8>>>(text)
         .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of byte arrays ({{e}})"))
 }}
+
+// #695: `list<list<X>>` param helpers for primitive non-u8
+// elements. Today's surface: postgis raster `st-set-values`
+// (`list<list<f64>>`) + flatgeobuf coord-list constructors.
+// SQL passes JSON text matching `Vec<Vec<T>>` (e.g.
+// `'[[1.0, 2.0], [3.0]]'`); the dispatch arm decodes via
+// `serde_json::from_str::<Vec<Vec<T>>>`. Symmetric with the
+// `RetShape::JsonText` ListListPrim return convention.
+#[allow(dead_code)]
+fn parse_json_list_list_f64(args: &[SqlValue], idx: usize, name: &str) -> Result<Vec<Vec<f64>>, String> {{
+    let text = arg_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<f64>>>(text)
+        .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of f64 arrays ({{e}})"))
+}}
+
+#[allow(dead_code)]
+fn parse_json_list_list_i32(args: &[SqlValue], idx: usize, name: &str) -> Result<Vec<Vec<i32>>, String> {{
+    let text = arg_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<i32>>>(text)
+        .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of s32 arrays ({{e}})"))
+}}
+
+#[allow(dead_code)]
+fn parse_json_list_list_i64(args: &[SqlValue], idx: usize, name: &str) -> Result<Vec<Vec<i64>>, String> {{
+    let text = arg_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<i64>>>(text)
+        .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of s64 arrays ({{e}})"))
+}}
+
+#[allow(dead_code)]
+fn parse_json_list_list_u32(args: &[SqlValue], idx: usize, name: &str) -> Result<Vec<Vec<u32>>, String> {{
+    let text = arg_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<u32>>>(text)
+        .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of u32 arrays ({{e}})"))
+}}
+
+#[allow(dead_code)]
+fn parse_json_list_list_u64(args: &[SqlValue], idx: usize, name: &str) -> Result<Vec<Vec<u64>>, String> {{
+    let text = arg_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<u64>>>(text)
+        .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of u64 arrays ({{e}})"))
+}}
+
+#[allow(dead_code)]
+fn parse_json_list_list_bool(args: &[SqlValue], idx: usize, name: &str) -> Result<Vec<Vec<bool>>, String> {{
+    let text = arg_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<bool>>>(text)
+        .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of bool arrays ({{e}})"))
+}}
+
+#[allow(dead_code)]
+fn parse_json_list_list_string(args: &[SqlValue], idx: usize, name: &str) -> Result<Vec<Vec<String>>, String> {{
+    let text = arg_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<String>>>(text)
+        .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of string arrays ({{e}})"))
+}}
 {TUPLE_LIST_HELPERS}{POSTGIS_HELPERS}{FORCE_LINK_BLOCK}
 
 // ── Aggregate state ──

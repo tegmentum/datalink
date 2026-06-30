@@ -1356,10 +1356,17 @@ fn parse_return(after: &str) -> WitRet {
     } else if let Some(rest) = after.strip_prefix("->") {
         rest
     } else {
-        // No return clause — implicit `()`. Treated as Unsupported
-        // for Phase 3 (no PostGIS scalar truly has void return).
+        // #695: void return clause — `func(...);` with no `->` —
+        // surfaces today on `destroy-index`. Map to the same
+        // `Unsupported("_")` sentinel the result<_, E> branch uses
+        // so `classify_return` collapses to `RetShape::Unit` and
+        // the dispatch arm yields `SqlValue::Null`. The `fallible`
+        // flag stays false (no `result<...>` wrapper to unwrap);
+        // `RetShape::Unit`'s emit body already covers both cases
+        // since its `unwrap_chain` is empty for the non-fallible
+        // path.
         return WitRet {
-            inner: WitType::Unsupported(after.trim().to_string()),
+            inner: WitType::Unsupported("_".to_string()),
             fallible: false,
             error_ty: None,
         };

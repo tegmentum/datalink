@@ -221,6 +221,21 @@ pub enum ParamShape {
     /// function. JSON-of-int-arrays matches the symmetric
     /// `RetShape::JsonText { ListListPrim }` output convention.
     ListListU8,
+    /// #695: `list<list<X>>` param for primitive non-u8 elements.
+    /// `list<list<u8>>` keeps the dedicated `ListListU8` variant
+    /// because the WIT parser surfaces `list<u8>` as
+    /// `WitType::ListU8` (not `WitType::List(Box<U8>)`); every
+    /// other primitive inner-inner type lands here. SQL passes a
+    /// JSON-text matching `Vec<Vec<T>>` (e.g.
+    /// `'[[1.0, 2.0], [3.0, 4.0]]'` for `list<list<f64>>`); the
+    /// dispatch arm calls a codegen-emitted
+    /// `parse_json_list_list_<elem>` helper and passes `&arg{idx}`
+    /// (deref to `&[Vec<T>]`) to the WIT function. Today's surface:
+    ///   - postgis `st-set-values` (`list<list<f64>>` values).
+    ///   - flatgeobuf `make-polygon-with-holes` /
+    ///     `make-multilinestring` (`list<list<f64>>` coords).
+    /// Symmetric with `RetShape::JsonText { ListListPrim }`.
+    ListListPrim(ListPrimElem),
     /// W2 Phase 2 mop-up (#555): `list<tuple<T1, T2, ...>>` param
     /// where every Ti is primitive (today: only `list<tuple<s32,
     /// s32>>` is on the surface for mobilitydb's datespanset
@@ -2178,6 +2193,18 @@ pub fn classify_param(
             // `ListU8` doesn't appear in `list_prim_elem`.
             if matches!(inner.as_ref(), WitType::ListU8) {
                 return Ok(ParamShape::ListListU8);
+            }
+            // #695: `list<list<X>>` for primitive non-u8 elements
+            // (`list<list<f64>>` is on the postgis raster surface
+            // via `st-set-values`; flatgeobuf has it for
+            // `make-polygon-with-holes` / `make-multilinestring`).
+            // Sits before the `ListPrim` check so the nested-list
+            // path wins over a misclassification as a flat list of
+            // an unsupported inner type.
+            if let WitType::List(inner_inner) = inner.as_ref() {
+                if let Some(elem) = list_prim_elem(inner_inner) {
+                    return Ok(ParamShape::ListListPrim(elem));
+                }
             }
             // W2 Phase 1 (#542): primitive-element `list<X>` param
             // via JSON-as-TEXT marshaling. SQL passes a JSON array

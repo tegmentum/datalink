@@ -241,6 +241,19 @@ pub fn emit_scalar_arm_body(
                 ));
                 call_args.push(format!("&arg{idx}"));
             }
+            ParamShape::ListListPrim(elem) => {
+                // #695: `list<list<X>>` over a primitive non-u8
+                // element (`list<list<f64>>` on the postgis raster
+                // surface; flatgeobuf coord-list shapes). Mirrors
+                // `ListListU8` with the per-element helper name
+                // and Rust inner type.
+                let suffix = elem.helper_suffix();
+                let rust_ty = elem.rust_elem();
+                s.push_str(&format!(
+                    "{i}let arg{idx}: Vec<Vec<{rust_ty}>> = parse_json_list_list_{suffix}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
             ParamShape::WitValueRecord {
                 kebab_name,
                 upstream_by_value,
@@ -927,7 +940,8 @@ pub fn emit_aggregate_arm_body(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
-                | ParamShape::ListListU8 => {
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_) => {
                     // Record / list / enum extras are not part of
                     // the postgis or mobilitydb aggregate surfaces
                     // today. Bail clearly so the unwired-symbol
@@ -1227,7 +1241,8 @@ fn emit_aggregate_arm_body_record_to_scalar(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
-                | ParamShape::ListListU8 => {
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_) => {
                     return format!(
                         "{i}Err(types::Duckerror::Unsupported(format!(\
                          \"{sql_name}: aggregate extra arg #{j} shape not wired\")))",
@@ -1407,7 +1422,8 @@ fn emit_aggregate_arm_body_record_to_tuple(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
-                | ParamShape::ListListU8 => {
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_) => {
                     return format!(
                         "{i}Err(types::Duckerror::Unsupported(format!(\
                          \"{sql_name}: aggregate extra arg #{j} shape not wired\")))",
@@ -1492,6 +1508,7 @@ pub fn emit_udtf_call_body(
             ParamShape::ListTuple { .. } => Some((idx, "list<tuple>")),
             ParamShape::ListPrim(_) => Some((idx, "list<primitive>")),
             ParamShape::ListListU8 => Some((idx, "list<list<u8>>")),
+            ParamShape::ListListPrim(_) => Some((idx, "list<list<primitive>>")),
             _ => None,
         }
     }) {
@@ -1738,7 +1755,8 @@ fn emit_udtf_param_marshal(
             | ParamShape::ListRecord { .. }
             | ParamShape::ListTuple { .. }
             | ParamShape::ListPrim(_)
-            | ParamShape::ListListU8 => {
+            | ParamShape::ListListU8
+            | ParamShape::ListListPrim(_) => {
                 s.push_str(&format!(
                     "{i}return Err(types::Duckerror::Unsupported(format!(\"{sql_name}: UDTF list-param shape not wired\")));\n",
                 ));

@@ -2751,6 +2751,66 @@ fn parse_json_list_list_u8(args: &[ftypes::ScalarValue], idx: usize, name: &str)
         .map_err(|e| types::FunctionError::ExecutionError(
             format!("{name}: arg {idx} must be JSON array of byte arrays ({e})")))
 }
+
+// #695: `list<list<X>>` param helpers for primitive non-u8
+// elements. Today's surface: postgis raster `st-set-values`
+// (`list<list<f64>>`) + flatgeobuf coord-list constructors.
+// Symmetric with the `RetShape::JsonText { ListListPrim }` return.
+#[allow(dead_code)]
+fn parse_json_list_list_f64(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<Vec<f64>>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<f64>>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of f64 arrays ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_list_i32(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<Vec<i32>>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<i32>>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of s32 arrays ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_list_i64(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<Vec<i64>>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<i64>>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of s64 arrays ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_list_u32(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<Vec<u32>>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<u32>>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of u32 arrays ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_list_u64(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<Vec<u64>>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<u64>>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of u64 arrays ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_list_bool(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<Vec<bool>>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<bool>>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of bool arrays ({e})")))
+}
+
+#[allow(dead_code)]
+fn parse_json_list_list_string(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<Vec<String>>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<String>>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of string arrays ({e})")))
+}
 "##;
 
 /// Render each tuple-list helper into the bridge prelude. Each
