@@ -25,11 +25,11 @@ use anyhow::Result;
 
 use crate::name_match::{
     aggregate_name_candidates, candidates_sorted, collect_package_aliases,
-    collect_package_enums, find_resource_method, find_same_interface_free_fn,
-    find_wit_fn, index_resource_interfaces, index_resource_methods,
-    index_wit_fns, index_wit_fns_nohyphen, resolve_function_aliases,
-    sql_name_candidates, table_fn_name_candidates, AGGREGATE_NAME_SUFFIXES,
-    EnumWithPackage,
+    collect_package_enums, find_resource_family_free_fn, find_resource_method,
+    find_same_interface_free_fn, find_wit_fn, index_resource_interfaces,
+    index_resource_methods, index_wit_fns, index_wit_fns_nohyphen,
+    resolve_function_aliases, sql_name_candidates, table_fn_name_candidates,
+    AGGREGATE_NAME_SUFFIXES, EnumWithPackage,
 };
 use crate::override_tables::{aggregate_override_for, override_for, tuple_pick_override_for};
 use crate::record_registry::RecordType;
@@ -2526,6 +2526,13 @@ pub fn build_full(
             // 5) #556 (W3.1 mop-up) same-interface name-matching:
             //    `<resource>_<func>` → free function `<func>` in
             //    the interface declaring `<resource>`.
+            // 6) #672 resource-family name-matching: relaxes step 5
+            //    to any interface in the `<ns>-<resource>-*` family
+            //    (e.g. `postgis-topology-edit`, `postgis-topology-
+            //    output`, `postgis-topology-query`). Also tries the
+            //    swapped form (`validate_topology` for SQL
+            //    `topology_validate`) and the joined form
+            //    (`create_topology` for SQL `topology_create`).
             let tuple_pick = tuple_pick_override_for(&sc.canonical_name, &wit_fns);
             let matched: Option<&WitFunction> = if let Some((f, _)) = tuple_pick {
                 Some(f)
@@ -2535,8 +2542,14 @@ pub fn build_full(
                 Some(f)
             } else if let Some(f) = find_resource_method(&candidates, &method_index) {
                 Some(f)
+            } else if let Some(f) = find_same_interface_free_fn(
+                &candidates,
+                &wit_index,
+                &resource_iface_index,
+            ) {
+                Some(f)
             } else {
-                find_same_interface_free_fn(
+                find_resource_family_free_fn(
                     &candidates,
                     &wit_index,
                     &resource_iface_index,
@@ -2646,6 +2659,13 @@ pub fn build_full(
                 .or_else(|| find_resource_method(&candidates, &method_index))
                 .or_else(|| {
                     find_same_interface_free_fn(
+                        &candidates,
+                        &wit_index,
+                        &resource_iface_index,
+                    )
+                })
+                .or_else(|| {
+                    find_resource_family_free_fn(
                         &candidates,
                         &wit_index,
                         &resource_iface_index,

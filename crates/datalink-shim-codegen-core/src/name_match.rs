@@ -472,3 +472,85 @@ pub fn find_same_interface_free_fn<'a>(
     }
     None
 }
+
+/// Round (#672): broader sibling of `find_same_interface_free_fn`.
+///
+/// `find_same_interface_free_fn` only matches a free function in
+/// the interface that DECLARES the resource (e.g. `topology` lives
+/// in `postgis-topology-types`, so `topology_from_bytes` resolves
+/// to `postgis-topology-types::from-bytes`). But sibling interfaces
+/// in the same `<ns>-<resource>-*` family — `postgis-topology-edit`,
+/// `postgis-topology-output`, `postgis-topology-query`,
+/// `postgis-topology-topogeom`, plus `postgis-raster-*` for the
+/// raster family — also declare free functions that take a
+/// `borrow<resource>` first parameter and the interface DB advertises
+/// them as `topology_<func>` / `raster_<func>` SQL scalars. Those
+/// miss the declaring-interface gate.
+///
+/// This helper relaxes the interface match from exact-equality to
+/// `<ns>-<resource>-*` prefix-membership. For SQL `topology_mod_edge_heal`:
+///   1. Split at first `_` (after `st_` strip): prefix=`topology`,
+///      suffix=`mod_edge_heal`.
+///   2. Resource `topology` declared in `postgis-topology-types` →
+///      family prefix `postgis-topology-`.
+///   3. Look up `mod_edge_heal` in the snake index → returns
+///      `postgis-topology-edit::mod-edge-heal`. Interface starts with
+///      `postgis-topology-`? Yes → match.
+///
+/// Two extra forms are tried beyond the bare suffix to handle WIT
+/// kebabs that don't follow the verb-after-resource convention:
+///   - `<suffix>_<prefix>` — covers `topology_validate` →
+///     `validate-topology` (kebab puts resource AFTER the verb).
+///   - `<prefix>_<suffix>` — covers `topology_create` →
+///     `create-topology` (resource constructor; kebab is
+///     `create-<resource>` per #556 W3.1).
+///
+/// Returns the first interface-family-restricted hit so behaviour
+/// stays deterministic (parse order is stable file-sort order).
+pub fn find_resource_family_free_fn<'a>(
+    candidates: &[String],
+    snake_idx: &HashMap<String, &'a WitFunction>,
+    resource_iface_idx: &HashMap<String, String>,
+) -> Option<&'a WitFunction> {
+    for cand in candidates {
+        let raw = cand.strip_prefix("st_").unwrap_or(cand);
+        let bytes = raw.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b != b'_' {
+                continue;
+            }
+            let prefix = &raw[..i];
+            let suffix = &raw[i + 1..];
+            if prefix.is_empty() || suffix.is_empty() {
+                continue;
+            }
+            let resource_kebab = prefix.replace('_', "-");
+            let Some(declaring_iface) = resource_iface_idx.get(&resource_kebab) else {
+                continue;
+            };
+            // Family prefix = declaring interface name up to and
+            // including the resource segment. `postgis-topology-types`
+            // → drop the trailing `-types` (the last `-<segment>`)
+            // → family prefix `postgis-topology-`. Sibling interfaces
+            // (`postgis-topology-edit`, etc.) start with that prefix.
+            let Some(last_dash) = declaring_iface.rfind('-') else {
+                continue;
+            };
+            let family_prefix = &declaring_iface[..=last_dash];
+            // Three lookups, in order: bare suffix (verb-only), then
+            // suffix-prefix swap (verb-after-resource kebab shape),
+            // then prefix-suffix join (constructor `create-<resource>`).
+            let bare = suffix.to_string();
+            let swapped = format!("{}_{}", suffix, prefix);
+            let joined = format!("{}_{}", prefix, suffix);
+            for k in [&bare, &swapped, &joined] {
+                if let Some(f) = snake_idx.get(k) {
+                    if f.interface.starts_with(family_prefix) {
+                        return Some(*f);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
