@@ -323,6 +323,25 @@ pub fn aggregate_function_overrides() -> &'static [(&'static str, &'static str, 
         ),
         ("st_unionagg", "postgis-aggregates", "st-union-aggregate"),
         ("st_unionaggregate", "postgis-aggregates", "st-union-aggregate"),
+        // #669: `st_mem_union` / `st_memunion`. Upstream #664 added the
+        // `st-mem-union-aggregate` WIT entry (memory-optimised variant
+        // of `st-union-aggregate`). The SQL aggregate names share no
+        // stem with the WIT kebab (`mem_union` vs `mem-union`) once
+        // the `_aggregate`/`_agg` suffix-strip runs, so name-match
+        // lookup misses for the same reason as the G1 `st_union`
+        // route. Both SQL spellings (`st_mem_union` underscore form
+        // and `st_memunion` collapsed form) appear in the interface
+        // DB's `aggregates` table; each gets its own override row.
+        (
+            "st_mem_union",
+            "postgis-aggregates",
+            "st-mem-union-aggregate",
+        ),
+        (
+            "st_memunion",
+            "postgis-aggregates",
+            "st-mem-union-aggregate",
+        ),
         // #667 (G2): native 2D `ST_Extent`. Upstream `b2534f1` of
         // postgis-wasm added the `st-extent: func(list<borrow<geometry>>)
         // -> bbox` WIT entry (P4 — single-pass `BBOX(...)` aggregate
