@@ -1,0 +1,71 @@
+package sqlite:extension@1.0.0;
+
+/// Minimal slice of the `sqlite:extension@1.0.0` package needed by the
+/// dynlink HOST to satisfy a STREAMING dot-command extension's CLI
+/// stream imports — `cli-stdout` / `cli-stderr` / `cli-state`.
+///
+/// This is intentionally a SUBSET of the full sqlite-loader-wit package
+/// (only the function-bearing CLI interfaces + the `sql-value` /
+/// `sqlite-error` types `cli-state` references). It carries the same
+/// `sqlite:extension@1.0.0` package identity and the same interface
+/// shapes, so the host's implementation structurally satisfies the
+/// `sqlite:extension/cli-stdout@1.0.0` import a composed streaming-
+/// dotcmd provider leaves dangling after `wac plug` (the cli-stream
+/// cycle `wac` cannot express). The host owns the CLI streams, exactly
+/// as the bespoke loader does.
+
+/// The minimal types `cli-state` depends on.
+interface types {
+    /// Unified SQL value representation.
+    variant sql-value {
+        null,
+        integer(s64),
+        real(f64),
+        text(string),
+        blob(list<u8>),
+        wit-value(wit-value-payload),
+    }
+
+    /// Payload for the `sql-value::wit-value` arm.
+    record wit-value-payload {
+        type-id: list<u8>,
+        bytes: list<u8>,
+        symbolic-name: string,
+    }
+
+    /// SQLite error carrying both primary and extended result codes.
+    record sqlite-error {
+        code: s32,
+        extended-code: s32,
+        message: string,
+    }
+}
+
+/// Host-provided stream the streaming dot-command writes its output to.
+/// The host owns where these bytes ultimately land (process stdout, a
+/// capture buffer, `.output FILE`, a pager pipe, ...).
+interface cli-stdout {
+    /// Write a UTF-8 chunk. May span multiple lines.
+    write: func(text: string);
+    /// Flush the buffer.
+    flush: func();
+    /// Insert a row separator suited to the current display mode.
+    row-end: func();
+}
+
+/// Host-provided stderr. Non-fatal warnings.
+interface cli-stderr {
+    write: func(text: string);
+}
+
+/// Read-only access to the cli's session state at dispatch time.
+interface cli-state {
+    use types.{sql-value};
+
+    get-text:  func(key: string) -> string;
+    get-int:   func(key: string) -> s64;
+    get-bool:  func(key: string) -> bool;
+    get-real:  func(key: string) -> f64;
+    get-value: func(key: string) -> sql-value;
+    list-keys: func(prefix: string) -> list<string>;
+}

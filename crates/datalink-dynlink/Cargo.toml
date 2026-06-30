@@ -25,6 +25,10 @@ async-trait = "0.1"
 # consumer) already runs on a tokio runtime. The sync flavor (ducklink) never
 # touches this dependency.
 tokio = { version = "1", features = ["sync"] }
+# The reentrant async host (deep reentrancy + CLI streaming + the dlopen
+# guest-CLI runner) returns rich anyhow errors at the host boundary, exactly
+# as the reference sync host does. The sync/resident bridge does not use it.
+anyhow = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
