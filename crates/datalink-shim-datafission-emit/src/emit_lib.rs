@@ -2739,6 +2739,18 @@ fn parse_json_list_string(args: &[ftypes::ScalarValue], idx: usize, name: &str) 
         .map_err(|e| types::FunctionError::ExecutionError(
             format!("{name}: arg {idx} must be JSON array of string ({e})")))
 }
+
+// #674: `list<list<u8>>` param helper — batched WKB blobs for the
+// postgis `st_*_batch` family. SQL passes a JSON text matching
+// `Vec<Vec<u8>>` (nested arrays of byte integers); symmetric with
+// the `list<list<X>>` return convention.
+#[allow(dead_code)]
+fn parse_json_list_list_u8(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<Vec<u8>>, types::FunctionError> {
+    let text = dfv_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<u8>>>(text)
+        .map_err(|e| types::FunctionError::ExecutionError(
+            format!("{name}: arg {idx} must be JSON array of byte arrays ({e})")))
+}
 "##;
 
 /// Render each tuple-list helper into the bridge prelude. Each

@@ -211,6 +211,15 @@ pub enum ParamShape {
         wit_package: String,
         wit_package_version: String,
     },
+    /// #674: `list<list<u8>>` param — batched WKB blobs surfaced
+    /// by postgis's `st_*_batch` family. SQL passes the value as
+    /// JSON-text matching `Vec<Vec<u8>>` (nested arrays of byte
+    /// integers, e.g. `'[[1,2,3], [4,5,6]]'`); the dispatch arm
+    /// calls a codegen-emitted `parse_json_list_list_u8` helper
+    /// and passes `&arg{idx}` (deref to `&[Vec<u8>]`) to the WIT
+    /// function. JSON-of-int-arrays matches the symmetric
+    /// `RetShape::JsonText { ListListPrim }` output convention.
+    ListListU8,
     /// W2 Phase 2 mop-up (#555): `list<tuple<T1, T2, ...>>` param
     /// where every Ti is primitive (today: only `list<tuple<s32,
     /// s32>>` is on the surface for mobilitydb's datespanset
@@ -1899,6 +1908,15 @@ pub fn classify_param(
             ));
         }
         WitType::List(inner) => {
+            // #674: `list<list<u8>>` — batched WKB blobs surfaced by
+            // postgis's `st_*_batch` family. SQL passes JSON-text
+            // matching `Vec<Vec<u8>>` (nested integer arrays); the
+            // dispatch arm decodes via a codegen-emitted helper.
+            // Take precedence over the generic primitive path since
+            // `ListU8` doesn't appear in `list_prim_elem`.
+            if matches!(inner.as_ref(), WitType::ListU8) {
+                return Ok(ParamShape::ListListU8);
+            }
             // W2 Phase 1 (#542): primitive-element `list<X>` param
             // via JSON-as-TEXT marshaling. SQL passes a JSON array
             // literal (`'[1.0, 2.0]'`); the dispatch arm parses it

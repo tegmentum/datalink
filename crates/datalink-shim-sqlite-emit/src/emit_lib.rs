@@ -842,6 +842,20 @@ fn parse_json_list_string(args: &[SqlValue], idx: usize, name: &str) -> Result<V
     serde_json::from_str::<Vec<String>>(text)
         .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of string ({{e}})"))
 }}
+
+// #674: `list<list<u8>>` param helper — batched WKB blobs for the
+// postgis `st_*_batch` family. SQL passes a JSON text matching
+// `Vec<Vec<u8>>` (nested arrays of byte integers, e.g.
+// `'[[1,2,3], [4,5,6]]'`), parallel to the existing
+// `parse_json_list_u8` shape but nested. The convention is
+// symmetric with the `list<list<X>>` return path (which
+// `serde_json::to_string`s a `Vec<Vec<X>>` directly).
+#[allow(dead_code)]
+fn parse_json_list_list_u8(args: &[SqlValue], idx: usize, name: &str) -> Result<Vec<Vec<u8>>, String> {{
+    let text = arg_text(args, idx, name)?;
+    serde_json::from_str::<Vec<Vec<u8>>>(text)
+        .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of byte arrays ({{e}})"))
+}}
 {TUPLE_LIST_HELPERS}{POSTGIS_HELPERS}{FORCE_LINK_BLOCK}
 
 // ── Aggregate state ──

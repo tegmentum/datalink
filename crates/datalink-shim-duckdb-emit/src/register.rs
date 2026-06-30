@@ -223,7 +223,8 @@ pub fn paramshape_to_logicaltype(p: &ParamShape) -> String {
         ParamShape::ListGeom => "types::Logicaltype::Blob".to_string(),
         ParamShape::ListPrim(_)
         | ParamShape::ListRecord { .. }
-        | ParamShape::ListTuple { .. } => "types::Logicaltype::Text".to_string(),
+        | ParamShape::ListTuple { .. }
+        | ParamShape::ListListU8 => "types::Logicaltype::Text".to_string(),
         ParamShape::Enum { .. } => "types::Logicaltype::Int64".to_string(),
         ParamShape::WitValueRecord { kebab_name, .. } => {
             let n = kebab_name.replace('"', "\\\"");

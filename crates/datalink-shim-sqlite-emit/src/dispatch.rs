@@ -254,6 +254,22 @@ pub fn emit_arm_body(
                 ));
                 call_args.push(format!("&arg{idx}"));
             }
+            ParamShape::ListListU8 => {
+                // #674: `list<list<u8>>` — batched WKB blobs for
+                // postgis's `st_*_batch` family. SQL passes JSON-
+                // text matching `Vec<Vec<u8>>` (nested arrays of
+                // byte integers); the codegen-emitted
+                // `parse_json_list_list_u8` helper in the bridge
+                // lib.rs prelude decodes via
+                // `serde_json::from_str::<Vec<Vec<u8>>>` and the
+                // dispatch arm passes `&arg{idx}` to the WIT call
+                // (wit-bindgen takes `list<list<u8>>` as
+                // `&[Vec<u8>]`).
+                s.push_str(&format!(
+                    "{i}let arg{idx}: Vec<Vec<u8>> = parse_json_list_list_u8(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
             ParamShape::ListTuple { elements } => {
                 // W2 Phase 2 mop-up (#555): `list<tuple<T1, T2,
                 // ...>>` param via JSON-as-TEXT marshaling.
@@ -1019,7 +1035,8 @@ pub fn emit_aggregate_finalize_body(
                 | ParamShape::Enum { .. }
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
-                | ParamShape::ListTuple { .. } => {
+                | ParamShape::ListTuple { .. }
+                | ParamShape::ListListU8 => {
                     // Extra args that are themselves geometries or
                     // record-typed don't appear in the postgis
                     // aggregate surface, and Phase E doesn't try to
@@ -1335,7 +1352,8 @@ fn emit_aggregate_finalize_body_record_to_scalar(
                 | ParamShape::Enum { .. }
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
-                | ParamShape::ListTuple { .. } => {
+                | ParamShape::ListTuple { .. }
+                | ParamShape::ListListU8 => {
                     return format!(
                         "{i}Err(format!(\"{sql_name}: aggregate extra arg #{j} shape not wired\"))",
                     );
@@ -1512,7 +1530,8 @@ fn emit_aggregate_finalize_body_record_to_tuple(
                 | ParamShape::Enum { .. }
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
-                | ParamShape::ListTuple { .. } => {
+                | ParamShape::ListTuple { .. }
+                | ParamShape::ListListU8 => {
                     return format!(
                         "{i}Err(format!(\"{sql_name}: aggregate extra arg #{j} shape not wired\"))",
                     );
