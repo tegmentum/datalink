@@ -269,6 +269,60 @@ pub fn aggregate_function_overrides() -> &'static [(&'static str, &'static str, 
             "postgis-raster-aggregates",
             "st-rast-union-aggregate",
         ),
+        // #663 batch — 11 additional postgis aggregate name-match gaps
+        // surfaced by post-#660 regen. Each canonical name listed below
+        // appears in the interface DB's `aggregates` table as its own row
+        // (not folded into the canonical names already routed above), so
+        // name-match lookup misses for the same reason as #660: the SQL
+        // stems either include the `aggregate`/`agg` suffix outright or
+        // diverge from the WIT kebab by more than the `_aggregate`/`_agg`
+        // suffix-strip can bridge. Route each at the same WIT entry the
+        // #660 canonical already wires. `st_3d_extent` is the underscore
+        // sibling of the existing `st_3dextent` route. `st_clusterwithin`
+        // is the bare-stem aggregate variant of `st-cluster-within`; the
+        // upstream `postgis-aggregates::st-cluster-within-aggregate`
+        // signature (`list<borrow<geometry>>, f64 -> list<geometry>`)
+        // matches the SQL aggregate shape and classifies the same way as
+        // the #660 `st_clusterintersecting` route.
+        ("st_3d_extent", "postgis-aggregates", "st-extent-threed"),
+        (
+            "st_clusterwithin",
+            "postgis-aggregates",
+            "st-cluster-within-aggregate",
+        ),
+        (
+            "st_clusterintersectingaggregate",
+            "postgis-aggregates",
+            "st-cluster-intersecting-aggregate",
+        ),
+        (
+            "st_clusterwithinaggregate",
+            "postgis-aggregates",
+            "st-cluster-within-aggregate",
+        ),
+        ("st_makelineagg", "postgis-aggregates", "st-make-line-aggregate"),
+        (
+            "st_makelineaggregate",
+            "postgis-aggregates",
+            "st-make-line-aggregate",
+        ),
+        (
+            "st_polygonizeagg",
+            "postgis-aggregates",
+            "st-polygonize-aggregate",
+        ),
+        (
+            "st_polygonizeaggregate",
+            "postgis-aggregates",
+            "st-polygonize-aggregate",
+        ),
+        (
+            "st_raster_union",
+            "postgis-raster-aggregates",
+            "st-rast-union-aggregate",
+        ),
+        ("st_unionagg", "postgis-aggregates", "st-union-aggregate"),
+        ("st_unionaggregate", "postgis-aggregates", "st-union-aggregate"),
     ]
 }
 
