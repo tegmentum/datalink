@@ -295,6 +295,17 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         used_aliases
             .entry(a.shape.wit_module.clone())
             .or_insert_with(|| a.shape.wit_package.clone());
+        // Gap G2 (#667): the `BboxBlob` aggregate finalize arm
+        // composes `pg_ctor::st_make_envelope(...).as_wkb()` to
+        // marshal the four-corner bbox record into a WKB POLYGON.
+        // Register the alias so the `use bindings::...` line gets
+        // emitted alongside the scalar BboxBlob handler's
+        // registration. Mirrors the scalar-side pass above.
+        if matches!(a.shape.ret, dispatch::RetShape::BboxBlob) {
+            used_aliases
+                .entry("pg_ctor".to_string())
+                .or_insert_with(|| "postgis:wasm".to_string());
+        }
     }
     for u in &udtf_entries {
         used_aliases

@@ -716,7 +716,137 @@ pub fn build_aggregate_registry(
             }
         }
     }
+
     Ok((entries, unwired))
+}
+
+/// #667 (G2): augment a `BridgePlan` with synthetic `AggregateFn`
+/// entries for SQL names that appear in the
+/// `aggregate_function_overrides` table but are missing from the
+/// interface DB's `aggregates` rows.
+///
+/// The interface DB is populated by extracting a composed shim
+/// wasm via `aggregate-function-registry::list-functions` — a
+/// chicken-and-egg loop with the regenerated datafission adapter.
+/// A new SQL aggregate (e.g. `st_extent` after P4 landed in
+/// postgis-wasm `b2534f1`) cannot enter the loop without a re-
+/// extract, which the per-target regen here does not perform.
+/// Treating the aggregate override table as a complementary seed
+/// source closes the gap: any (sql_name, wit_interface, wit_kebab)
+/// tuple whose WIT function exists is added to the primary
+/// extension's aggregate list before the per-target emit pass
+/// walks it. Downstream pieces — manifest metadata, `agg_id_for`
+/// index, registry classification, alias dispatch — then see a
+/// uniform `plan.extensions[].aggregates` shape and no longer
+/// have to be override-aware.
+///
+/// Synthetic entries carry:
+///   - `param_signatures = [[binary]]` (single streaming WKB
+///     column; extras still come from the WIT shape downstream)
+///   - `aliases = []` (synonyms get their own override rows)
+///   - `supports_grouped = true`, `supports_partial = true`,
+///     `is_order_sensitive = false`, `accepts_config = false`
+///
+/// Pre-existing override entries that ARE in the interface DB
+/// (e.g. `st_3dextent`) are unaffected — the dedupe check skips
+/// any SQL name already present in `plan.extensions[].aggregates`.
+pub fn augment_plan_with_override_aggregates(
+    plan: &mut shim_bridge_codegen_core::BridgePlan,
+    wit_deps_dir: &Path,
+) -> Result<()> {
+    if plan.extensions.is_empty() {
+        return Ok(());
+    }
+
+    // The supplied path is the wit/deps/-shaped ROOT (each shim
+    // package lives in a subdir like `postgis-wasm/`,
+    // `sfcgal-component/`, etc.). `wit_parse::parse_dir` parses
+    // exactly one directory of .wit files, so walk one level down
+    // and concatenate. Mirrors the per-target emit_lib's
+    // `pick_primary_shim_dir + parse_dir` pair but consolidates
+    // because the augment pass only needs to find aggregate-shaped
+    // WIT functions across every shim package, not pick a single
+    // primary subdir.
+    let mut wit_fns = Vec::<wit_parse::WitFunction>::new();
+    if let Ok(rd) = std::fs::read_dir(wit_deps_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let parsed = wit_parse::parse_dir(&p)?;
+            wit_fns.extend(parsed);
+        }
+    }
+    // Also try the supplied dir directly in case the caller
+    // already drilled into a single shim package.
+    let direct = wit_parse::parse_dir(wit_deps_dir).unwrap_or_default();
+    wit_fns.extend(direct);
+    let aliases = collect_package_aliases(wit_deps_dir);
+    let wit_fns = resolve_function_aliases(wit_fns, &aliases);
+
+    // Collect every SQL aggregate name already wired across every
+    // extension. Override entries do not declare which extension
+    // owns them; attach synthesised entries to the primary (first)
+    // extension since that matches the convention
+    // `build_aggregate_registry` uses for its single-pass walk.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ext in &plan.extensions {
+        for ag in &ext.aggregates {
+            seen.insert(ag.canonical_name.clone());
+            for alias in &ag.aliases {
+                seen.insert(alias.clone());
+            }
+        }
+    }
+
+    let mut synthetic = Vec::<shim_bridge_codegen_core::AggregateFn>::new();
+    for (sql_name, wit_iface, wit_kebab) in
+        crate::override_tables::aggregate_function_overrides()
+    {
+        if seen.contains(*sql_name) {
+            continue;
+        }
+        // Only synthesise when the WIT function actually exists.
+        // Overrides may be queued ahead of an upstream pin bump;
+        // skip silently in that case.
+        if !wit_fns
+            .iter()
+            .any(|wf| wf.interface == *wit_iface && wf.kebab_name == *wit_kebab)
+        {
+            continue;
+        }
+        seen.insert(sql_name.to_string());
+        synthetic.push(shim_bridge_codegen_core::AggregateFn {
+            canonical_name: sql_name.to_string(),
+            aliases: Vec::new(),
+            param_signatures: vec![vec!["binary".to_string()]],
+            supports_grouped: true,
+            supports_partial: true,
+            is_order_sensitive: false,
+            accepts_config: false,
+            config_arg_indices: Vec::new(),
+        });
+    }
+
+    if !synthetic.is_empty() {
+        eprintln!(
+            "[codegen] augment-plan: synthesised {} aggregate(s) from override table",
+            synthetic.len(),
+        );
+        for s in &synthetic {
+            eprintln!("  + {}", s.canonical_name);
+        }
+        plan.extensions[0].aggregates.extend(synthetic);
+        // Keep the aggregate list sorted by canonical_name so the
+        // emitted dispatch arms stay deterministic across regens
+        // (matches the alphabetical ordering `load_plan` produces
+        // via `ORDER BY name`).
+        plan.extensions[0]
+            .aggregates
+            .sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    }
+    Ok(())
 }
 
 /// One aggregate dispatch arm. `sql_name` is the canonical SQL

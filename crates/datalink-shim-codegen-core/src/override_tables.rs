@@ -323,6 +323,23 @@ pub fn aggregate_function_overrides() -> &'static [(&'static str, &'static str, 
         ),
         ("st_unionagg", "postgis-aggregates", "st-union-aggregate"),
         ("st_unionaggregate", "postgis-aggregates", "st-union-aggregate"),
+        // #667 (G2): native 2D `ST_Extent`. Upstream `b2534f1` of
+        // postgis-wasm added the `st-extent: func(list<borrow<geometry>>)
+        // -> bbox` WIT entry (P4 — single-pass `BBOX(...)` aggregate
+        // replacing the prior `st_collect → st_envelope` workaround).
+        // The SQL aggregate name `st_extent` is not registered by the
+        // postgis datafission adapter (the regen at ebb74f3e dropped
+        // the hand-curated `st_extent` arm before the upstream WIT
+        // landed), so it is missing from the interface DB's
+        // `aggregates` table. `build_aggregate_registry` now also
+        // synthesises override-only SQL aggregate names so the
+        // codegen no longer has to wait on a fresh extension extract
+        // to wire a new aggregate that the upstream WIT already
+        // declares. Direct name-match (`st_extent` <-> `st-extent`)
+        // would resolve via the candidate-list lookup once the SQL
+        // name is in the interface DB; the override remains the
+        // canonical seed source.
+        ("st_extent", "postgis-aggregates", "st-extent"),
     ]
 }
 

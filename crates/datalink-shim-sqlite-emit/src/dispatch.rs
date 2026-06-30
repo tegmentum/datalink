@@ -1108,6 +1108,27 @@ pub fn emit_aggregate_finalize_body(
                  {i}Ok(SqlValue::Blob(__wkb))",
             ));
         }
+        // Gap G2 (#667): bbox return — WKB POLYGON envelope blob
+        // built from the four-corner record `{min_x, min_y, max_x,
+        // max_y}`. Mirrors the scalar `RetShape::BboxBlob` arm:
+        // compose `pg_ctor::st_make_envelope(min_x, min_y, max_x,
+        // max_y).as_wkb()` so the SQL surface gets a binary
+        // geometry parseable by every downstream WKB consumer.
+        // Today's only producer is the `st_extent` aggregate
+        // (`postgis-aggregates::st-extent`), which is non-fallible
+        // (returns `bbox` directly, no `result<...>`), so no
+        // `.map_err(...)` thread. Note that the postgis adapter on
+        // the datafission target instead renders the bbox as
+        // `BOX(...)` text — sqlink chooses WKB so callers can chain
+        // `st_astext` to reach a text form, matching how
+        // `st_envelope` already shapes 2D extents.
+        RetShape::BboxBlob => {
+            s.push_str(&format!(
+                "{i}let __bb = {module}::{func}({call_args});\n\
+                 {i}let __env = pg_ctor::st_make_envelope(__bb.min_x, __bb.min_y, __bb.max_x, __bb.max_y);\n\
+                 {i}Ok(SqlValue::Blob(__env.as_wkb()))",
+            ));
+        }
         _ => {
             // Other ret shapes for aggregates aren't yet wired;
             // emit a stub error so the surface stays loadable.
