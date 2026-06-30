@@ -34,6 +34,7 @@ use datalink_shim_codegen_core::interface_db::{
     list_tuple_sig_suffix, AccKind, AggregateShape, ColumnAffinity,
     DispatchShape, JsonRetKind, ListPrimElem, ParamShape, RetShape,
     ScalarReturnKind, UdtfFieldShape, UdtfOutputRow, UdtfShape,
+    WindowReturn, WindowShape,
 };
 
 /// Emit the body of one match arm of `call_scalar`. The body
@@ -1689,4 +1690,175 @@ fn emit_udtf_param_marshal(
         }
     }
     (s, call_args)
+}
+
+// ─── Window-function dispatch (#661) ───
+//
+// `call-aggregate-window` is invoked once per output row: the host
+// hands the bridge the WHOLE partition's rows + a half-open
+// `[frame.start, frame.end)` row range and expects one scalar back
+// for the row this frame belongs to.
+//
+// The postgis cluster surface (`st-cluster-dbscan`, `-kmeans`,
+// `-intersecting`, `-within`) is whole-partition compute: one
+// upstream call labels every row in the partition. The pilot emit
+// recomputes per call (no per-handle caching) and picks the label
+// at `frame.end - 1` (the canonical "current row" position for the
+// default UNBOUNDED PRECEDING -> CURRENT ROW frame). The result is
+// correct under any frame for partition-invariant labellings; a
+// future optimisation can cache the labels Vec keyed by handle and
+// drop the cache when an empty partition arrives (the contract
+// signals end-of-partition that way).
+pub fn emit_window_arm_body(
+    shape: &WindowShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let mut s = String::new();
+
+    // Empty partition: contract signals end-of-partition / cache
+    // drop. With no cache to drop yet (pilot), just return Null.
+    s.push_str(&format!(
+        "{i}if partition.is_empty() {{\n\
+         {i}    return Ok(types::Duckvalue::Null);\n\
+         {i}}}\n",
+    ));
+
+    // Decode the partition's column-0 (WKB) into a Vec<Geometry>.
+    s.push_str(&format!(
+        "{i}let mut __geoms: Vec<Geometry> = Vec::with_capacity(partition.len());\n\
+         {i}for (__ri, __row) in partition.iter().enumerate() {{\n\
+         {i}    if __row.is_empty() {{\n\
+         {i}        return Err(types::Duckerror::Invalidargument(format!(\n\
+         {i}            \"{sql_name}: partition row {{}} is empty\", __ri\n\
+         {i}        )));\n\
+         {i}    }}\n\
+         {i}    let bytes = match &__row[0] {{\n\
+         {i}        types::Duckvalue::Blob(b) => b.as_slice(),\n\
+         {i}        types::Duckvalue::Text(t) => t.as_bytes(),\n\
+         {i}        types::Duckvalue::Null => {{\n\
+         {i}            return Err(types::Duckerror::Invalidargument(format!(\n\
+         {i}                \"{sql_name}: partition row {{}} col 0 is NULL\", __ri\n\
+         {i}            )));\n\
+         {i}        }}\n\
+         {i}        _ => {{\n\
+         {i}            return Err(types::Duckerror::Invalidargument(format!(\n\
+         {i}                \"{sql_name}: partition row {{}} col 0 must be BLOB\", __ri\n\
+         {i}            )));\n\
+         {i}        }}\n\
+         {i}    }};\n\
+         {i}    __geoms.push(Geometry::from_wkb(bytes).map_err(|e| {{\n\
+         {i}        types::Duckerror::Invalidargument(format!(\n\
+         {i}            \"{sql_name}: row {{}} WKB decode: {{}}\", __ri, postgis_err_string(e)\n\
+         {i}        ))\n\
+         {i}    }})?);\n\
+         {i}}}\n",
+    ));
+
+    // Decode extras from partition[0][1..] (SQL window constants are
+    // uniform across the partition). Only primitive extras supported.
+    let mut call_extras: Vec<String> = Vec::new();
+    for (j, p) in shape.extra_args.iter().enumerate() {
+        let arg_idx = j + 1;
+        match p {
+            ParamShape::F64 => {
+                s.push_str(&format!(
+                    "{i}let __extra{j} = dv_f64(&partition[0], {arg_idx}, \"{sql_name}\")?;\n",
+                ));
+                call_extras.push(format!("__extra{j}"));
+            }
+            ParamShape::S32 => {
+                s.push_str(&format!(
+                    "{i}let __extra{j} = dv_i64(&partition[0], {arg_idx}, \"{sql_name}\")? as i32;\n",
+                ));
+                call_extras.push(format!("__extra{j}"));
+            }
+            ParamShape::S64 => {
+                s.push_str(&format!(
+                    "{i}let __extra{j} = dv_i64(&partition[0], {arg_idx}, \"{sql_name}\")?;\n",
+                ));
+                call_extras.push(format!("__extra{j}"));
+            }
+            ParamShape::U32 => {
+                s.push_str(&format!(
+                    "{i}let __extra{j} = dv_i64(&partition[0], {arg_idx}, \"{sql_name}\")? as u32;\n",
+                ));
+                call_extras.push(format!("__extra{j}"));
+            }
+            ParamShape::U64 => {
+                s.push_str(&format!(
+                    "{i}let __extra{j} = dv_i64(&partition[0], {arg_idx}, \"{sql_name}\")? as u64;\n",
+                ));
+                call_extras.push(format!("__extra{j}"));
+            }
+            ParamShape::Bool => {
+                s.push_str(&format!(
+                    "{i}let __extra{j} = dv_bool(&partition[0], {arg_idx}, \"{sql_name}\")?;\n",
+                ));
+                call_extras.push(format!("__extra{j}"));
+            }
+            _ => {
+                return format!(
+                    "{i}return Err(types::Duckerror::Unsupported(format!(\
+                     \"{sql_name}: window extra arg #{j} shape not wired\")));",
+                );
+            }
+        }
+    }
+
+    let call_extras_lit = if call_extras.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", call_extras.join(", "))
+    };
+
+    // Upstream call. All four pilot postgis cluster functions are
+    // fallible (result<list<Y>, postgis-error>).
+    let map_err = if shape.fallible {
+        format!(".map_err(|e| types::Duckerror::Invalidargument(format!(\"{sql_name}: {{}}\", postgis_err_string(e))))?")
+    } else {
+        String::new()
+    };
+    s.push_str(&format!(
+        "{i}let __geom_refs: Vec<&Geometry> = __geoms.iter().collect();\n\
+         {i}let __labels = {module}::{func}(&__geom_refs{call_extras_lit}){map_err};\n",
+    ));
+
+    // Pick the current-row label from the frame. Default frame
+    // (UNBOUNDED PRECEDING -> CURRENT ROW) makes `frame.end - 1` the
+    // current row; for other frames the label is the same anyway
+    // (partition-invariant). Clamp to labels.len() - 1 defensively.
+    s.push_str(&format!(
+        "{i}if __labels.is_empty() {{ return Ok(types::Duckvalue::Null); }}\n\
+         {i}let __row_ix = if frame.end == 0 {{ 0usize }} else {{\n\
+         {i}    let __e = (frame.end as usize).saturating_sub(1);\n\
+         {i}    core::cmp::min(__e, __labels.len() - 1)\n\
+         {i}}};\n",
+    ));
+
+    // Marshal the per-row label to a Duckvalue per WindowReturn.
+    match &shape.returns {
+        WindowReturn::OptionU32 => {
+            s.push_str(&format!(
+                "{i}match __labels[__row_ix] {{\n\
+                 {i}    Some(__id) => Ok(types::Duckvalue::Int64(__id as i64)),\n\
+                 {i}    None => Ok(types::Duckvalue::Null),\n\
+                 {i}}}\n",
+            ));
+        }
+        WindowReturn::U32 => {
+            s.push_str(&format!(
+                "{i}Ok(types::Duckvalue::Int64(__labels[__row_ix] as i64))\n",
+            ));
+        }
+        WindowReturn::GeomBlob => {
+            s.push_str(&format!(
+                "{i}Ok(types::Duckvalue::Blob(__labels[__row_ix].as_wkb().into()))\n",
+            ));
+        }
+    }
+    s
 }

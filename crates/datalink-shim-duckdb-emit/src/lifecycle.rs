@@ -37,6 +37,7 @@ pub fn render(
     has_aggregates: bool,
     has_tables: bool,
     has_casts: bool,
+    has_windows: bool,
 ) -> String {
     let primary = plan
         .extensions
@@ -63,12 +64,17 @@ pub fn render(
     } else {
         ""
     };
+    let window_call = if has_windows {
+        "        register_windows()?;\n"
+    } else {
+        ""
+    };
     format!(
         r##"
 impl guest::Guest for {bridge_struct} {{
     fn load() -> Result<types::Loadresult, types::Duckerror> {{
         register_scalars()?;
-{aggregate_call}{table_call}{cast_call}        Ok(types::Loadresult {{
+{aggregate_call}{table_call}{cast_call}{window_call}        Ok(types::Loadresult {{
             name: "{primary}".into(),
             version: Some("{version}".into()),
             requires: Vec::new().into(),

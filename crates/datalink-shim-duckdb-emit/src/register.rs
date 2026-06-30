@@ -451,6 +451,111 @@ fn register_aggregates() -> Result<(), types::Duckerror> {
     };
 "##;
 
+// ─── Window-function registration (#661) ───
+//
+// The @4.0.0 contract has no separate window-registry resource —
+// the engine treats a window function as an aggregate plus FRAME
+// access (see aggregate-incr-dispatch.wit). The bridge registers
+// each classified window function via the same `aggregate-registry`
+// the standard aggregate path uses, slotting the returned handle
+// into `window_handle_table` so the `call_aggregate_window` arm can
+// route by handle to the per-arm dispatch body.
+//
+// Streaming arg 0 is always Blob (WKB partition rows for the
+// postgis cluster surface); extras follow with their classified
+// Logicaltype. The return Logicaltype is derived from the
+// `WindowReturn` discriminant:
+//   * OptionU32  -> Int64 (NULL for noise points)
+//   * U32        -> Int64 (cluster id)
+//   * GeomBlob   -> Blob  (per-cluster GeometryCollection WKB)
+pub fn render_windows(
+    window_entries: &[datalink_shim_codegen_core::interface_db::WindowEntry],
+) -> anyhow::Result<String> {
+    use datalink_shim_codegen_core::interface_db::WindowReturn;
+
+    let mut s = String::new();
+    s.push_str(WINDOW_REGISTER_PRELUDE);
+
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut arm_idx: usize = 0;
+    for entry in window_entries {
+        if !seen.insert(entry.sql_name.clone()) {
+            continue;
+        }
+        // Arg 0 is the streaming geometry column (WKB), Logicaltype::Blob.
+        let mut args_block = String::new();
+        args_block.push_str(
+            "            runtime::Funcarg {\n\
+             \x20               name: Some(\"arg0\".into()),\n\
+             \x20               logical: types::Logicaltype::Blob,\n\
+             \x20           },\n",
+        );
+        for (i, p) in entry.shape.extra_args.iter().enumerate() {
+            let logical = paramshape_to_logicaltype(p);
+            let i1 = i + 1;
+            args_block.push_str(&format!(
+                "            runtime::Funcarg {{\n\
+                 \x20               name: Some(\"arg{i1}\".into()),\n\
+                 \x20               logical: {logical},\n\
+                 \x20           }},\n",
+            ));
+        }
+        let ret_logical = match &entry.shape.returns {
+            WindowReturn::OptionU32 | WindowReturn::U32 => "types::Logicaltype::Int64",
+            WindowReturn::GeomBlob => "types::Logicaltype::Blob",
+        };
+        let sql_name = entry.sql_name.replace('"', "\\\"");
+        s.push_str(&format!(
+            r##"    {{
+        let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        window_handle_table()
+            .lock()
+            .expect("window handle mutex poisoned")
+            .insert(handle, {arm_idx}usize);
+        let callback = runtime::AggregateCallback::new(handle);
+        let args: Vec<runtime::Funcarg> = vec![
+{args_block}        ];
+        let opts = runtime::Funcopts {{
+            description: Some("{sql_name} (sqlink-shim-codegen window)".into()),
+            tags: vec!["{sql_name}".into(), "window".into()],
+            attributes: types::Funcflags::DETERMINISTIC | types::Funcflags::STATELESS,
+        }};
+        registry.register(
+            "{sql_name}",
+            &args,
+            &{ret_logical},
+            callback,
+            Some(&opts),
+        )?;
+    }}
+"##,
+        ));
+        arm_idx += 1;
+    }
+
+    s.push_str("    Ok(())\n}\n");
+    Ok(s)
+}
+
+const WINDOW_REGISTER_PRELUDE: &str = r##"
+fn register_windows() -> Result<(), types::Duckerror> {
+    let capability = runtime::get_capability(types::Capabilitykind::Aggregate)
+        .ok_or_else(|| {
+            types::Duckerror::Internal(
+                "host did not expose aggregate capability (window registration)".into(),
+            )
+        })?;
+    let registry = match capability {
+        runtime::Capability::Aggregate(r) => r,
+        _ => {
+            return Err(types::Duckerror::Internal(
+                "aggregate capability returned unexpected variant (window registration)".into(),
+            ));
+        }
+    };
+"##;
+
 // ─── Table function (UDTF) registration ───
 //
 // Mirrors `render` but against `Capabilitykind::Table` and the

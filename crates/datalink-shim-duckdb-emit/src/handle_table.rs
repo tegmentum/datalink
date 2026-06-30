@@ -31,6 +31,9 @@
 //!   * `table_handle_table() -> &'static Mutex<HashMap<u32, usize>>`
 //!     — `u32` table-function handle → arm index into the UDTF
 //!     dispatch match. Used by `call_table`.
+//!   * `window_handle_table() -> &'static Mutex<HashMap<u32, usize>>`
+//!     — `u32` window-function handle → arm index into the window
+//!     dispatch match. Used by `call_aggregate_window` (#661).
 //!
 //! Each family has its own arm-index space starting at 0; the
 //! handles themselves are namespaced by which table they live in.
@@ -64,6 +67,20 @@ fn aggregate_handle_table() -> &'static std::sync::Mutex<std::collections::HashM
 }
 
 fn table_handle_table() -> &'static std::sync::Mutex<std::collections::HashMap<u32, usize>> {
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, usize>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+// #661: window-function dispatch handle table. `register_windows()`
+// allocates one handle per classified WindowEntry (via the existing
+// aggregate-registry surface -- the @4.0.0 contract has no separate
+// window-registry; the engine treats window=aggregate+frame). The
+// `call_aggregate_window` arm of `aggregate_incr_dispatch::Guest`
+// reads this table to route the partition+frame to the matching
+// per-arm dispatch body.
+fn window_handle_table() -> &'static std::sync::Mutex<std::collections::HashMap<u32, usize>> {
     static T: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<u32, usize>>,
     > = std::sync::OnceLock::new();

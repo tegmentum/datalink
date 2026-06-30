@@ -71,21 +71,16 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let (udtf_entries, udtf_unwired) =
         interface_db::build_udtf_registry(plan, &shim_wit_dir, &records)?;
 
-    // #626: window-function classification — runs the same
-    // `interface_db::build_window_registry` pass datafission-emit
-    // consumes (#616 Phase 3) so the maintainer sees window
-    // coverage at codegen time. The duckdb-target emit does NOT
-    // currently produce any window dispatch: the bridge world
-    // exports `guest + callback-dispatch` only, and the
-    // `duckdb:extension@4.0.0` window method (`call-aggregate-
-    // window`) lives in the OPTIONAL `aggregate-incr-dispatch`
-    // interface which the bridge world does not export.
-    // ducklink-runtime additionally lacks a host-side
-    // `call_call_aggregate_window` dispatch wrapper. Classified
-    // entries surface here as `deferred` rather than `unwired`
-    // so the cause (substrate, not classification) is unambiguous.
-    // See `build_window_dispatch_impl` for the substrate
-    // extension path.
+    // #661: window-function classification + wiring. The bridge
+    // world unconditionally exports `aggregate-incr-dispatch` (see
+    // `DUCKDB_EXPORTS`); `build_window_dispatch_impl` emits the
+    // `aggregate_incr_dispatch::Guest` impl with all 5 trait
+    // methods. The 4 state-machine arms are stubs (Unsupported);
+    // `call_aggregate_window` dispatches by handle to per-arm
+    // bodies emitted from each classified `WindowEntry`. The
+    // host-side runtime wrapper (ducklink-runtime's
+    // `aggregate_window`) drives `call-aggregate-window` from a
+    // DuckDB window aggregate's per-output-row dispatch.
     let (window_entries, window_unwired) =
         interface_db::build_window_registry(plan, &shim_wit_dir)?;
 
@@ -129,9 +124,7 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     }
     if !window_entries.is_empty() {
         eprintln!(
-            "[duckdb-target] {} window function(s) deferred (substrate gap; \
-             bridge world does not export aggregate-incr-dispatch + \
-             ducklink-runtime lacks call_aggregate_window wrapper):",
+            "[duckdb-target] {} window function(s) wired via aggregate-incr-dispatch (#661):",
             window_entries.len(),
         );
         for e in &window_entries {
@@ -304,8 +297,11 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
 //! `build_window_registry` so the maintainer sees coverage at
 //! codegen time, but the bridge world does not yet export the
 //! optional `aggregate-incr-dispatch` interface (which carries
-//! `call-aggregate-window`); see `build_window_dispatch_impl`
-//! for the cross-component substrate-extension path.
+//! `call-aggregate-window`) is wired via #661 -- the bridge world
+//! exports `aggregate-incr-dispatch` so wit-bindgen generates the
+//! 5-method trait; `build_window_dispatch_impl` emits the impl,
+//! with `call_aggregate_window` routing per-handle to the
+//! classified `WindowEntry` arm body.
 
 #![allow(unused_imports, dead_code)]
 
@@ -464,6 +460,7 @@ use bindings::exports::duckdb::extension::guest;
         !aggregate_entries.is_empty(),
         !udtf_entries.is_empty(),
         has_casts,
+        !window_entries.is_empty(),
     ));
 
     // call_scalar dispatch: build the per-arm match
@@ -629,14 +626,15 @@ impl callback_dispatch::Guest for {bridge_struct} {{
         }}
     }}
 
-{pragma_arm}{window_arm}{cast_arm}}}
+{pragma_arm}{cast_arm}}}
+{window_arm}
 "##,
         bridge_struct = bridge_struct,
         scalar_arms = scalar_arms,
         aggregate_arms = aggregate_arms,
         table_arms = table_arms,
         pragma_arm = build_pragma_dispatch_impl(primary),
-        window_arm = build_window_dispatch_impl(primary),
+        window_arm = build_window_dispatch_impl(primary, &bridge_struct, &window_entries),
         cast_arm = if has_casts {
             // #624: call_cast forwards into call_scalar at the
             // matching arm. `register_casts()` slotted the cast
@@ -696,6 +694,16 @@ impl callback_dispatch::Guest for {bridge_struct} {{
     // matching arm.
     if has_casts {
         s.push_str(&register::render_casts(plan, &scalar_entries)?);
+    }
+
+    // register_windows() body (#661). Each classified window
+    // function lands in the aggregate-registry (the @4.0.0 contract
+    // has no window-registry resource); the returned handle slots
+    // into `window_handle_table` so the `call_aggregate_window` arm
+    // of the `aggregate_incr_dispatch::Guest` impl routes back to
+    // the per-arm dispatch body.
+    if !window_entries.is_empty() {
+        s.push_str(&register::render_windows(&window_entries)?);
     }
 
     // Export macro at file scope
@@ -908,21 +916,15 @@ fn build_pragma_dispatch_impl(primary: &str) -> String {
     )
 }
 
-/// #626: cross-component window-dispatch builder.
+/// #661: cross-component window-dispatch builder.
 ///
-/// Returns the string that gets interpolated into the
-/// `impl callback_dispatch::Guest for $Bridge { ... }` block
-/// alongside the pragma / cast arms. Currently returns an EMPTY
-/// STRING: the bridge world exports only `guest +
-/// callback-dispatch`, and the `duckdb:extension@4.0.0` window
-/// method (`call-aggregate-window`) lives in the optional
-/// `aggregate-incr-dispatch` interface which the bridge world
-/// does not export. There is no trait method to satisfy in the
-/// current export surface, so emitting an arm here would not
-/// compile — the helper exists as a documentation anchor for
-/// the next implementer, slotting next to
-/// `build_pragma_dispatch_impl` so the per-target stub set
-/// stays uniform.
+/// Returns the string emitted AFTER the `impl callback_dispatch
+/// ::Guest for $Bridge { ... }` block: a SEPARATE
+/// `impl aggregate_incr_dispatch::Guest for $Bridge { ... }` block
+/// with all 5 trait methods. The 4 state-machine arms (init /
+/// update / combine / finalize) are stubs returning Unsupported;
+/// `call_aggregate_window` dispatches by handle to per-arm bodies
+/// emitted from `dispatch::emit_window_arm_body`.
 ///
 /// The substrate is missing on three axes — each owns one
 /// upstream coordination step:
@@ -971,14 +973,150 @@ fn build_pragma_dispatch_impl(primary: &str) -> String {
 /// substrate (1) lands. The shim WIT, register pass, and
 /// host runtime wrapper land in lockstep across
 /// ducklink + datalink in a follow-up.
-fn build_window_dispatch_impl(_primary: &str) -> String {
-    // No trait method to satisfy in the current bridge world
-    // (`callback-dispatch` has no window arm; the bridge does
-    // not export `aggregate-incr-dispatch`). The helper exists
-    // as a documentation anchor; emitting a body here would
-    // produce uncompilable Rust against the current
-    // wit-bindgen output.
-    String::new()
+fn build_window_dispatch_impl(
+    primary: &str,
+    bridge_struct: &str,
+    window_entries: &[interface_db::WindowEntry],
+) -> String {
+    // #661: the bridge world now exports `aggregate-incr-dispatch`
+    // (see `DUCKDB_EXPORTS`), so wit-bindgen generates an
+    // `aggregate_incr_dispatch::Guest` trait that MUST be
+    // implemented. We emit it unconditionally so a bridge with
+    // zero classified window entries (e.g. mobilitydb) still
+    // compiles and loads.
+    //
+    // The 4 state-machine methods (init/update/combine/finalize)
+    // are stubs returning Unsupported -- the @4.0.0 postgis pilot
+    // is whole-partition compute, not state-machine. They survive
+    // as stubs so the trait surface is complete.
+    //
+    // `call_aggregate_window` is the live arm: per output row the
+    // host hands the bridge the whole partition's rows + a
+    // WindowFrame. The arm looks up the per-handle arm-index from
+    // `window_handle_table` and routes to the per-window-function
+    // body emitted by `dispatch::emit_window_arm_body`.
+
+    let mut window_arms = String::new();
+    let arm_count = build_window_arms(&mut window_arms, window_entries);
+
+    // When there are no window entries, the `partition` / `frame`
+    // bindings are unused and `_partition` / `_frame` keeps rustc
+    // quiet. The `arm_idx` lookup chain is unconditional so the
+    // trait method shape stays uniform.
+    let (partition_bind, frame_bind) = if arm_count == 0 {
+        ("_partition", "_frame")
+    } else {
+        ("partition", "frame")
+    };
+
+    format!(
+        r##"
+impl bindings::exports::duckdb::extension::aggregate_incr_dispatch::Guest for {bridge_struct} {{
+    // #661: 4 state-machine arms stubbed -- the postgis pilot is
+    // whole-partition compute (call_aggregate_window only). A
+    // future incremental aggregate registration would replace each
+    // body with a per-handle dispatch arm; the trait surface stays
+    // the same.
+    fn call_aggregate_init(
+        _handle: u32,
+    ) -> Result<u32, types::Duckerror> {{
+        Err(types::Duckerror::Unsupported(format!(
+            "{primary}: aggregate-incr init not wired (no incremental aggregates registered)"
+        )))
+    }}
+
+    fn call_aggregate_update(
+        _handle: u32,
+        _state: u32,
+        _rows: Vec<Vec<types::Duckvalue>>,
+    ) -> Result<(), types::Duckerror> {{
+        Err(types::Duckerror::Unsupported(format!(
+            "{primary}: aggregate-incr update not wired"
+        )))
+    }}
+
+    fn call_aggregate_combine(
+        _handle: u32,
+        _target: u32,
+        _source: u32,
+    ) -> Result<(), types::Duckerror> {{
+        Err(types::Duckerror::Unsupported(format!(
+            "{primary}: aggregate-incr combine not wired"
+        )))
+    }}
+
+    fn call_aggregate_finalize(
+        _handle: u32,
+        _state: u32,
+    ) -> Result<types::Duckvalue, types::Duckerror> {{
+        Err(types::Duckerror::Unsupported(format!(
+            "{primary}: aggregate-incr finalize not wired"
+        )))
+    }}
+
+    fn call_aggregate_window(
+        handle: u32,
+        {partition_bind}: Vec<Vec<types::Duckvalue>>,
+        {frame_bind}: bindings::exports::duckdb::extension::aggregate_incr_dispatch::WindowFrame,
+    ) -> Result<types::Duckvalue, types::Duckerror> {{
+        let arm_idx = window_handle_table()
+            .lock()
+            .expect("window handle mutex poisoned")
+            .get(&handle)
+            .copied()
+            .ok_or_else(|| types::Duckerror::Internal(
+                "unknown window handle".into()
+            ))?;
+        match arm_idx {{
+{window_arms}            _ => Err(types::Duckerror::Internal(format!(
+                "unknown window arm index {{}}", arm_idx
+            ))),
+        }}
+    }}
+}}
+"##,
+    )
+}
+
+/// #661: build the per-arm window-function dispatch match arms.
+/// One body per unique SQL name (canonical + alias). Mirrors
+/// `build_aggregate_arms`'s sql_name dedupe so the handle-to-arm
+/// index map produced by `register::render_windows` lines up.
+fn build_window_arms(
+    out: &mut String,
+    window_entries: &[interface_db::WindowEntry],
+) -> usize {
+    let mut arm_for: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    let mut next: usize = 0;
+    for entry in window_entries {
+        arm_for.entry(entry.sql_name.as_str()).or_insert_with(|| {
+            let i = next;
+            next += 1;
+            i
+        });
+    }
+    let mut emitted: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    for entry in window_entries {
+        let key: &str = entry.sql_name.as_str();
+        let arm_idx = match arm_for.get(key) {
+            Some(&i) => i,
+            None => continue,
+        };
+        if !emitted.insert(arm_idx) {
+            continue;
+        }
+        let body = dispatch::emit_window_arm_body(
+            &entry.shape,
+            &entry.sql_name,
+            "                ",
+        );
+        out.push_str(&format!(
+            "            {arm_idx}usize => {{\n{body}\n            }}\n",
+        ));
+    }
+    next
 }
 
 /// Build the per-arm UDTF dispatch match arms. Same dedupe

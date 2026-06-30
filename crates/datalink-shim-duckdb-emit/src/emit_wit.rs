@@ -238,7 +238,7 @@ pub const DUCKDB_IMPORTS: &[&str] = &[
 ];
 
 /// DuckDB contract exports the host expects. Every extension
-/// component declares both. `guest` is the lifecycle surface
+/// component declares these. `guest` is the lifecycle surface
 /// (load / reconfigure / shutdown); `callback-dispatch` is the
 /// seven-arm call_* surface on @4.0.0:
 ///   HOT  (columnar): call-scalar-batch-col, call-aggregate-col,
@@ -247,7 +247,18 @@ pub const DUCKDB_IMPORTS: &[&str] = &[
 /// Hot-path methods (#653) lift their colvec args to row-major up
 /// front and route through the cold-path arm bodies; pragma (#617)
 /// stays a stub until a real pragma surface lands.
-pub const DUCKDB_EXPORTS: &[&str] = &["guest", "callback-dispatch"];
+///
+/// `aggregate-incr-dispatch` is exported unconditionally so the
+/// bridge can wire the window-function path (#661). The 4
+/// state-machine methods (init/update/combine/finalize) are stubs
+/// returning Unsupported -- postgis windows are whole-partition
+/// compute, not state-machine. `call-aggregate-window` is the live
+/// arm: per output row the host hands the bridge the whole
+/// partition's rows + a WindowFrame and gets back one scalar.
+/// When no window entries classify, every arm returns Unsupported
+/// and the bridge is still load-safe.
+pub const DUCKDB_EXPORTS: &[&str] =
+    &["guest", "callback-dispatch", "aggregate-incr-dispatch"];
 
 pub(crate) fn primary_extension_name(plan: &BridgePlan) -> &str {
     plan.extensions
