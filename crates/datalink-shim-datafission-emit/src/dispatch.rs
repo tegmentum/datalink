@@ -415,6 +415,24 @@ fn render_ret_to_scalarvalue(
                 format!("Ok(types::ScalarValue::Binary({call_expr}.to_bytes().into()))")
             }
         }
+        // #707: topo-geometry result — route through `geometry()` +
+        // `as-wkb()` (the topo-geometry resource has no direct
+        // `to-bytes` method). Covers `create_topo_geom` /
+        // `topology_create_topo_geom`.
+        RetShape::TopoGeometryViaGeom => {
+            if !unwrap_chain.is_empty() {
+                format!(
+                    "{{\n\
+                     {i}    let __r = {call_expr}{unwrap_chain};\n\
+                     {i}    Ok(types::ScalarValue::Binary(__r.geometry().as_wkb().into()))\n\
+                     {i}}}"
+                )
+            } else {
+                format!(
+                    "Ok(types::ScalarValue::Binary({call_expr}.geometry().as_wkb().into()))"
+                )
+            }
+        }
         RetShape::OptionText => format!(
             "Ok(match {call_expr}{unwrap_chain} {{\n\
              {i}    Some(v) => types::ScalarValue::Utf8(v.into()),\n\
@@ -776,6 +794,7 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
         RetShape::GeomBlob
         | RetShape::RasterBlob
         | RetShape::TopologyBlob
+        | RetShape::TopoGeometryViaGeom
         | RetShape::BboxBlob
         | RetShape::FirstGeomBlob
         | RetShape::FirstRasterBlob

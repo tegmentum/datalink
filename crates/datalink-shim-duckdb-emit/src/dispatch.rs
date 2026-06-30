@@ -374,6 +374,24 @@ fn render_return_expr(
                 )
             }
         }
+        // #707: topo-geometry result — route through `geometry()` +
+        // `as-wkb()` (the topo-geometry resource has no direct
+        // `to-bytes` method). Covers `create_topo_geom` /
+        // `topology_create_topo_geom`.
+        RetShape::TopoGeometryViaGeom => {
+            if unwrap_chain.is_empty() {
+                format!(
+                    "Ok(types::Duckvalue::Blob({call_expr}.geometry().as_wkb().into()))"
+                )
+            } else {
+                format!(
+                    "{{\n\
+                     {i}    let __r = {call_expr}{unwrap_chain};\n\
+                     {i}    Ok(types::Duckvalue::Blob(__r.geometry().as_wkb().into()))\n\
+                     {i}}}"
+                )
+            }
+        }
         RetShape::OptionText => format!(
             "Ok(match {call_expr}{unwrap_chain} {{\n\
              {i}    Some(v) => types::Duckvalue::Text(v.into()),\n\

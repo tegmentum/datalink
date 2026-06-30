@@ -360,6 +360,16 @@ pub enum RetShape {
     /// Round-490: encodes a returned `Topology` resource via the
     /// resource's own `to-bytes` method.
     TopologyBlob,
+    /// `Ok(SqlValue::Blob(<expr>.geometry().as_wkb()))` —
+    /// topo-geometry result, routed through the resource's
+    /// `geometry()` accessor and the geometry resource's existing
+    /// WKB serializer. #707: the `postgis-topology-topogeom`
+    /// resource has no direct `to-bytes` method; rendering the
+    /// underlying MULTI* geometry is the canonical SQL-callable
+    /// projection (downstream callers can chain `st_astext`,
+    /// `st_npoints`, etc. against the WKB payload). Covers
+    /// `create_topo_geom` / `topology_create_topo_geom`.
+    TopoGeometryViaGeom,
     /// `Ok(SqlValue::Blob(<expr>))` — raw bytes (list<u8>).
     Blob,
     /// `Ok(match <expr> { Some(v) => SqlValue::Text(v), None => SqlValue::Null })`
@@ -2642,6 +2652,17 @@ pub fn classify_return(
         // ListGeomOwned and ListOptionU32 handled above
         // (FirstGeomBlob / FirstOptionU32Int).
         WitType::Unsupported(s) => {
+            // #707: postgis topology's `topo-geometry` resource has
+            // no direct `to-bytes` method. `parse_type` doesn't
+            // promote it to a first-class `WitType` variant (the
+            // resource only appears as a `create-topo-geom` return
+            // today), so it lands here as `Unsupported`. Route to
+            // the dedicated RetShape that calls the resource's
+            // `geometry()` accessor and serializes the resulting
+            // MULTI* geometry via the existing `as-wkb()` path.
+            if s == "topo-geometry" {
+                return Ok(RetShape::TopoGeometryViaGeom);
+            }
             // W3.3 (#543): WIT enums surface here for the same
             // reason params do — parse_type has no Enum variant.
             // Check enums before records (no overlap today; future-proof).

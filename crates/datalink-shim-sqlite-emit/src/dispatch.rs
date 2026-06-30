@@ -463,6 +463,19 @@ pub fn emit_arm_body(
                 format!("Ok(SqlValue::Blob({call_expr}.to_bytes()))")
             }
         }
+        // #707: topo-geometry result — the resource has no direct
+        // `to-bytes` method, so route through its `geometry()`
+        // accessor and the geometry resource's `as-wkb()` serializer.
+        // Covers `create_topo_geom` / `topology_create_topo_geom`.
+        RetShape::TopoGeometryViaGeom => {
+            if fallible {
+                format!(
+                    "let __r = {call_expr}{unwrap_chain};\n{i}Ok(SqlValue::Blob(__r.geometry().as_wkb()))"
+                )
+            } else {
+                format!("Ok(SqlValue::Blob({call_expr}.geometry().as_wkb()))")
+            }
+        }
         RetShape::Blob => format!("Ok(SqlValue::Blob({call_expr}{unwrap_chain}))"),
         // Round 2: option<T> returns — Some(v) → SqlValue::T(v), None → Null.
         RetShape::OptionText => format!(

@@ -251,6 +251,7 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
         RetShape::GeomBlob
         | RetShape::RasterBlob
         | RetShape::TopologyBlob
+        | RetShape::TopoGeometryViaGeom
         | RetShape::BboxBlob
         | RetShape::FirstGeomBlob
         | RetShape::FirstRasterBlob
