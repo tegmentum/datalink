@@ -100,8 +100,13 @@ pub fn emit_arm_body(
                 call_args.push(format!("arg{idx}"));
             }
             ParamShape::Geom => {
+                // #671: route geometry-arg decode through `arg_geom`
+                // so a TEXT arg (WKT) is accepted alongside the
+                // canonical BLOB (WKB). The fallback is symmetric
+                // across scalar and UDTF dispatch — see the
+                // emit_lib::POSTGIS_HELPERS_BODY definition.
                 s.push_str(&format!(
-                    "{i}let arg{idx} = from_wkb(arg_blob(&args, {idx}, \"{sql_name}\")?, \"{sql_name}\")?;\n"
+                    "{i}let arg{idx} = arg_geom(&args, {idx}, \"{sql_name}\")?;\n"
                 ));
                 call_args.push(format!("&arg{idx}"));
             }

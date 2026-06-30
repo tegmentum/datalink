@@ -318,6 +318,33 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             .or_insert_with(|| w.shape.wit_package.clone());
     }
 
+    // #671: when POSTGIS_HELPERS_BODY is emitted (shim declares a
+    // geometry resource + postgis-error variant), the `arg_geom`
+    // helper falls back to `pg_ctor::st_geom_from_text` when the
+    // dispatched arg arrives as TEXT rather than BLOB. That lets
+    // `CREATE VIRTUAL TABLE t USING st_dump('MULTIPOINT(...)')`
+    // (UDTF vtab form) work without an explicit st_geomfromtext
+    // wrapper, matching the eponymous form. Register the alias here
+    // so the `use bindings::...::postgis_constructors as pg_ctor;`
+    // line is emitted even when no entry would have pulled it in
+    // via BboxBlob.
+    {
+        let shim_pkg = shim_packages
+            .iter()
+            .find(|p| emit_wit::package_belongs_to_primary(&p.ns_name, primary));
+        let has_geometry = shim_pkg
+            .map(|p| p.resources.iter().any(|r| r.kebab_name == "geometry"))
+            .unwrap_or(false);
+        let has_postgis_error = shim_pkg
+            .map(|p| p.variants.iter().any(|v| v.kebab_name == "postgis-error"))
+            .unwrap_or(false);
+        if has_geometry && has_postgis_error {
+            used_aliases
+                .entry("pg_ctor".to_string())
+                .or_insert_with(|| "postgis:wasm".to_string());
+        }
+    }
+
     let mut s = String::new();
     s.push_str(HEADER);
     s.push_str(&format!(
@@ -1650,8 +1677,12 @@ fn emit_udtf_filter_body(entry: &UdtfEntry, arm_indent: &str) -> String {
     for (idx, p) in entry.shape.params.iter().enumerate() {
         match p {
             ParamShape::Geom => {
+                // #671: accept TEXT (WKT) alongside BLOB (WKB) so
+                // `CREATE VIRTUAL TABLE t USING st_dump('MULTIPOINT(...)')`
+                // works without requiring the eponymous form's
+                // explicit st_geomfromtext wrapper.
                 s.push_str(&format!(
-                    "{i}let arg{idx} = from_wkb(arg_blob(&args, {idx}, \"{name}\")?, \"{name}\")?;\n",
+                    "{i}let arg{idx} = arg_geom(&args, {idx}, \"{name}\")?;\n",
                     name = entry.sql_name,
                 ));
                 call_args.push(format!("&arg{idx}"));
@@ -2789,6 +2820,31 @@ fn from_wkb(bytes: &[u8], name: &str) -> Result<Geometry, String> {
 
 fn geog_from_wkb(bytes: &[u8], name: &str) -> Result<Geography, String> {
     Geography::from_wkb(bytes).map_err(|e| format!("{name}: {}", postgis_err_string(e)))
+}
+
+/// #671: Decode a geometry arg from either BLOB (WKB) or TEXT
+/// (WKT). When the arg arrives as TEXT — e.g.
+/// `CREATE VIRTUAL TABLE t USING st_dump('MULTIPOINT(...)')` where
+/// SQLite has no chance to apply scalar coercion before the vtab
+/// xCreate args reach dispatch — the helper first tries the
+/// upstream `st-geom-from-text` constructor. If that also fails
+/// (e.g. the TEXT is actually WKB-as-bytes for parity with the
+/// hand-written bridge), the original WKB path is tried as a
+/// last resort so the surface stays backwards-compatible.
+fn arg_geom(args: &[SqlValue], idx: usize, name: &str) -> Result<Geometry, String> {
+    match args.get(idx) {
+        Some(SqlValue::Blob(b)) => from_wkb(b.as_slice(), name),
+        Some(SqlValue::Text(s)) => {
+            match pg_ctor::st_geom_from_text(s.as_str()) {
+                Ok(g) => Ok(g),
+                Err(wkt_err) => match Geometry::from_wkb(s.as_bytes()) {
+                    Ok(g) => Ok(g),
+                    Err(_) => Err(format!("{name}: {}", postgis_err_string(wkt_err))),
+                },
+            }
+        }
+        _ => Err(format!("{name}: arg {idx} must be BLOB (WKB) or TEXT (WKT)")),
+    }
 }
 
 /// Format a `postgis-error` variant back to a string the SQL
