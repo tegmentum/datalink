@@ -705,6 +705,13 @@ fn render_ret_to_scalarvalue(
              {i}    Ok(types::ScalarValue::Utf8(__json))\n\
              {i}}}"
         ),
+        // #690: `result<_, E>` (unit OK) — discard the `()` value
+        // and yield SQL NULL. `unwrap_chain` carries the
+        // `.map_err(...)?` clause for fallible calls and is empty
+        // otherwise, so the single shape covers both paths.
+        RetShape::Unit => format!(
+            "let _ = {call_expr}{unwrap_chain};\n{i}Ok(types::ScalarValue::Null)"
+        ),
     }
 }
 
@@ -796,6 +803,10 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
         | RetShape::FirstWitValueRecord { .. } => {
             "types::LogicalType::Binary".to_string()
         }
+        // #690: `result<_, E>` mutator returns surface as SQL NULL;
+        // pick the widest neutral logical type so the advertised
+        // surface stays compatible with NULL marshalling.
+        RetShape::Unit => "types::LogicalType::Binary".to_string(),
     }
 }
 

@@ -305,6 +305,10 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
             let n = kebab_name.replace('"', "\\\"");
             format!("types::Logicaltype::Complex(\"{n}\".into())")
         }
+        // #690: `result<_, E>` mutator returns surface as SQL NULL;
+        // pick a neutral declared type so the planner sees a
+        // working surface (the runtime always returns Null).
+        RetShape::Unit => "types::Logicaltype::Blob".to_string(),
     }
 }
 

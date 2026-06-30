@@ -394,6 +394,17 @@ pub fn emit_arm_body(
     };
 
     let return_expr = match &shape.ret {
+        // #690: `result<_, E>` (unit OK) — discard the `()` value
+        // and yield SQL NULL. Covers topology mutators
+        // (`remove-iso-node`, `change-edge-geom`, `move-iso-node`,
+        // `remove-iso-edge`, `remove-face`) and any other shim
+        // surface that uses `result<_, E>` for "succeeded with no
+        // value" semantics. `unwrap_chain` carries the
+        // `.map_err(...)?` clause for fallible calls and is empty
+        // otherwise, so the single shape covers both paths.
+        RetShape::Unit => format!(
+            "let _ = {call_expr}{unwrap_chain};\n{i}Ok(SqlValue::Null)"
+        ),
         RetShape::Text => format!("Ok(SqlValue::Text({call_expr}{unwrap_chain}))"),
         RetShape::Real => format!("Ok(SqlValue::Real({call_expr}{unwrap_chain}))"),
         RetShape::Int => format!(

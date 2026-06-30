@@ -662,6 +662,13 @@ fn render_return_expr(
              {i}    Ok(types::Duckvalue::Text(__json))\n\
              {i}}}"
         ),
+        // #690: `result<_, E>` (unit OK) — discard the `()` value
+        // and yield SQL NULL. `unwrap_chain` carries the
+        // `.map_err(...)?` clause for fallible calls and is empty
+        // otherwise, so the single shape covers both paths.
+        RetShape::Unit => format!(
+            "let _ = {call_expr}{unwrap_chain};\n{i}Ok(types::Duckvalue::Null)"
+        ),
     }
 }
 

@@ -540,6 +540,11 @@ pub enum RetShape {
     /// for symmetry so a future shim that picks from a mixed-type
     /// tuple doesn't need another return-shape variant.
     TuplePick { index: usize, elem: ListPrimElem },
+    /// #690: unit OK type in a `result<_, E>` return (mutator
+    /// surface — `remove-iso-node`, `change-edge-geom`, etc.).
+    /// The call expression returns `()`, so the dispatch arm
+    /// discards the value and yields `SqlValue::Null`.
+    Unit,
 }
 
 /// W3.4 (#550) + W2 Phase 2 mop-up (#555) + W3.5 (#551): inner
@@ -1007,11 +1012,7 @@ pub fn augment_plan_with_upstream_wit_scalars(
         if f.resource.is_some() && !f.is_constructor {
             continue;
         }
-        let sql_name = wit_parse::kebab_to_snake(&f.kebab_name);
-        if seen.contains(&sql_name) {
-            continue;
-        }
-        seen.insert(sql_name.clone());
+        let bare = wit_parse::kebab_to_snake(&f.kebab_name);
         // Arity-correct placeholder signature. Only `scalar_num_args`
         // reads `param_signatures` on the synthesised path; the
         // dispatch matcher re-classifies the real shapes against the
@@ -1019,14 +1020,52 @@ pub fn augment_plan_with_upstream_wit_scalars(
         let arity = f.params.len();
         let param_sig: Vec<String> =
             std::iter::repeat("binary".to_string()).take(arity).collect();
-        synthetic.push(shim_bridge_codegen_core::ScalarFn {
-            canonical_name: sql_name,
+        let make_row = |name: String| shim_bridge_codegen_core::ScalarFn {
+            canonical_name: name,
             aliases: Vec::new(),
-            param_signatures: vec![param_sig],
+            param_signatures: vec![param_sig.clone()],
             return_type: "binary".to_string(),
             is_deterministic: true,
             propagates_null: true,
-        });
+        };
+        if !seen.contains(&bare) {
+            seen.insert(bare.clone());
+            synthetic.push(make_row(bare.clone()));
+        }
+        // #690: when a free function in a `<ns>-<resource>-*` family
+        // interface takes `borrow<resource>` as its first parameter,
+        // the established SQL convention (per the OLD hand-written
+        // bridge `list_functions()`) prefixes it with `<resource>_`.
+        // Example: `add-node` in `postgis-topology-edit` takes
+        // `borrow<topology>` and surfaces as `topology_add_node`,
+        // matching siblings like `topology_add_iso_node`,
+        // `topology_mod_edge_heal`, etc.
+        //
+        // Skip when the kebab already starts with `<resource>-`
+        // (e.g. `topology-summary` kebabs straight to
+        // `topology_summary`) or with `st-` (PostGIS-style names
+        // already follow the `st_<verb>` convention and don't take
+        // a resource prefix). The dispatcher's
+        // `find_resource_family_free_fn` resolves the prefixed name
+        // against the unprefixed WIT kebab in any `<ns>-<resource>-*`
+        // interface.
+        if let Some(resource_kebab) = resource_family_prefix_for(f) {
+            let bare_kebab = f.kebab_name.as_str();
+            let resource_kebab_dash = format!("{}-", resource_kebab);
+            let already_prefixed = bare_kebab.starts_with(&resource_kebab_dash);
+            let st_prefixed = bare_kebab.starts_with("st-");
+            if !already_prefixed && !st_prefixed {
+                let prefixed = format!(
+                    "{}_{}",
+                    resource_kebab.replace('-', "_"),
+                    bare,
+                );
+                if !seen.contains(&prefixed) {
+                    seen.insert(prefixed.clone());
+                    synthetic.push(make_row(prefixed));
+                }
+            }
+        }
     }
 
     if !synthetic.is_empty() {
@@ -1048,6 +1087,38 @@ pub fn augment_plan_with_upstream_wit_scalars(
             .sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
     }
     Ok(())
+}
+
+/// #690: return the resource kebab name (`topology`, `raster`) when
+/// `f` is a free function in a `<ns>-<resource>-*` family interface
+/// AND its first parameter is `borrow<resource>`. This is the
+/// signature shape that the OLD hand-written `list_functions()`
+/// implementations advertised under a `<resource>_<func>` SQL alias
+/// (e.g. `topology_add_iso_node`, `topology_mod_edge_heal`).
+///
+/// Synthesising the prefixed name keeps the dispatcher's
+/// `find_resource_family_free_fn` resolver as the routing path
+/// (SQL `topology_add_node` → WIT `add-node` in `postgis-topology-*`).
+/// Without the prefix the surface would only expose the bare
+/// kebab-snake form (`add_node`), breaking the established
+/// `topology_*` naming convention.
+///
+/// Returns `None` for:
+///   - Functions inside a `resource NAME { ... }` block — those
+///     are routed via `index_resource_methods`, not this path.
+///   - Functions whose first parameter is not `borrow<resource>`.
+///   - Constructors (their `<resource>` surface name is
+///     `create-<resource>` per #556 W3.1).
+fn resource_family_prefix_for(f: &wit_parse::WitFunction) -> Option<&'static str> {
+    if f.resource.is_some() || f.is_constructor {
+        return None;
+    }
+    let first = f.params.first()?;
+    match first.ty {
+        wit_parse::WitType::Topology { borrowed: true } => Some("topology"),
+        wit_parse::WitType::Raster { borrowed: true } => Some("raster"),
+        _ => None,
+    }
 }
 
 /// One aggregate dispatch arm. `sql_name` is the canonical SQL
@@ -2207,6 +2278,17 @@ pub fn classify_return(
     records: &[RecordType],
     enums: &[EnumWithPackage],
 ) -> Result<RetShape, String> {
+    // #690: `result<_, E>` (unit OK) — parsed as
+    // `WitType::Unsupported("_")` by `wit_parse::parse_type`. Map to
+    // `RetShape::Unit` BEFORE the generic `Unsupported(_)` arm so
+    // mutator-style functions (topology `remove-iso-node`,
+    // `change-edge-geom`, gdal `set-projection`, etc.) get a working
+    // dispatch arm that returns `SqlValue::Null` on success.
+    if let WitType::Unsupported(s) = &r.inner {
+        if s == "_" {
+            return Ok(RetShape::Unit);
+        }
+    }
     Ok(match &r.inner {
         WitType::Geometry { .. } => RetShape::GeomBlob,
         WitType::Geography { .. } => RetShape::GeomBlob,
