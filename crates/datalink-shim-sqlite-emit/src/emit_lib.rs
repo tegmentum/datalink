@@ -397,7 +397,7 @@ use bindings::exports::sqlite::extension::metadata::{{
 }};
 use bindings::exports::sqlite::extension::scalar_function::Guest as ScalarFunctionGuest;
 use bindings::exports::sqlite::extension::vtab::{{
-    ConstraintUsage, Guest as VtabGuest, IndexInfo, IndexPlan, VtabRow,
+    ConstraintOp, ConstraintUsage, Guest as VtabGuest, IndexInfo, IndexPlan, VtabRow,
 }};
 use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
 
@@ -1556,13 +1556,28 @@ fn emit_vtab_impl(
         // #671: stash any CREATE-time module args so the cursor's
         // filter() body can fall back to them when xFilter argv is
         // empty (non-eponymous CREATE VIRTUAL TABLE form). SQLite
-        // hands these in as Vec<String>; we wrap each as
-        // SqlValue::Text so the existing dispatch arms (which
-        // accept TEXT via `arg_geom` and friends) decode them
-        // uniformly with the constraint-driven path.
+        // hands these in as Vec<String> verbatim from the source —
+        // including any surrounding quoting from the SQL literal —
+        // so strip a matching outer pair of single OR double quotes
+        // before wrapping as SqlValue::Text. Without this strip
+        // PostGIS's WKT parser sees `'MULTIPOINT(...)'` (with the
+        // literal quotes) and rejects it as a bad geometry type.
         UDTF_INSTANCE_ARGS.with(|m| {{
-            let as_vals: Vec<SqlValue> =
-                args.iter().map(|s| SqlValue::Text(s.clone())).collect();
+            let as_vals: Vec<SqlValue> = args
+                .iter()
+                .map(|raw| {{
+                    let s = raw.as_str();
+                    let stripped = if s.len() >= 2
+                        && ((s.starts_with('\'') && s.ends_with('\''))
+                            || (s.starts_with('"') && s.ends_with('"')))
+                    {{
+                        &s[1..s.len() - 1]
+                    }} else {{
+                        s
+                    }};
+                    SqlValue::Text(stripped.to_string())
+                }})
+                .collect();
             m.borrow_mut().insert(instance_id, as_vals);
         }});
         match vtab_id {{
@@ -1598,7 +1613,15 @@ fn emit_vtab_impl(
         let mut next_argv_idx: i32 = 1;
         let constraint_usage = info.constraints.iter()
             .map(|c| {{
-                if c.usable {{
+                // #671: SQLite surfaces LIMIT / OFFSET as pseudo-
+                // constraints (iColumn = -1, op = LIMIT/OFFSET). The
+                // dispatch arms expect filter's argv to match the
+                // WIT signature's param positions one-for-one, so
+                // claiming a LIMIT slot would push the user's
+                // geometry arg out of position 0. Skip those.
+                let is_limit_offset =
+                    matches!(c.op, ConstraintOp::Limit | ConstraintOp::Offset);
+                if c.usable && !is_limit_offset {{
                     let idx = next_argv_idx;
                     next_argv_idx += 1;
                     ConstraintUsage {{ argv_index: idx, omit: true }}
