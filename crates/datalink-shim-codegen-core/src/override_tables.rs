@@ -61,6 +61,52 @@ pub fn operator_function_overrides() -> &'static [(&'static str, &'static str, &
         // override is preregistered so it fires automatically once
         // the shim advertises the corresponding SQL functions.
         ("tgeogpoint_from_ewkt",  "tgeogpoint-ops",  "tgeogpoint-instant-from-ewkt"),
+        // #678 — postgis SQL surface aliases whose canonical
+        // upstream WIT kebab shares no stem after snake/kebab
+        // normalisation. Each row routes a bare-SQL alias to the
+        // already-implemented WIT entry. Splits into three families:
+        //
+        //   - Constructor aliases. `st_box2dfromgeohash` /
+        //     `st_box2d_from_geohash` are the postgis-spelled
+        //     names of the existing `st-box-from-geohash` (bbox
+        //     decoder). `st_geometryfromtext` /
+        //     `st_geometry_from_text` are spellings of the OGC
+        //     `ST_GeometryFromText` that already lives under
+        //     `st-geom-from-text`. `st_makebox` is the shorthand
+        //     spelling postgis exposes for the 2D `st-make-box2d`
+        //     entry (the numbered `st_makebox2d` / `st_make_box2d`
+        //     siblings resolve via the no-hyphen lookup directly).
+        //
+        //   - Accessor aliases. `st_numinteriorring` (singular)
+        //     is the historical postgis spelling of
+        //     `st-num-interior-rings`. The three raster shorthand
+        //     forms (`st_rastheight` / `st_rastwidth` /
+        //     `st_rastnumbands`) map to the existing
+        //     `postgis-raster-accessors` overloads (`st-height`,
+        //     `st-width`, `st-num-bands`).
+        //
+        //   - Processing aliases. `st_constrainedelaunaytriangles`
+        //     is the bare-form spelling of the upstream
+        //     `st-constrained-delaunay-triangles` sfcgal entry.
+        ("st_box2d_from_geohash",          "postgis-constructors",     "st-box-from-geohash"),
+        ("st_box2dfromgeohash",            "postgis-constructors",     "st-box-from-geohash"),
+        ("st_geometry_from_text",          "postgis-constructors",     "st-geom-from-text"),
+        ("st_geometryfromtext",            "postgis-constructors",     "st-geom-from-text"),
+        ("st_makebox",                     "postgis-constructors",     "st-make-box2d"),
+        ("st_numinteriorring",             "postgis-accessors",        "st-num-interior-rings"),
+        ("st_constrainedelaunaytriangles", "postgis-processing",       "st-constrained-delaunay-triangles"),
+        ("st_rastheight",                  "postgis-raster-accessors", "st-height"),
+        ("st_rastwidth",                   "postgis-raster-accessors", "st-width"),
+        ("st_rastnumbands",                "postgis-raster-accessors", "st-num-bands"),
+        // #678 — SFSQL standard aliases. `ST_WKBToSQL(bytea)` is
+        // the SFSQL spelling of `ST_GeomFromWKB(bytea)`;
+        // `ST_WKTToSQL(text)` is the SFSQL spelling of
+        // `ST_GeomFromText(text)`. PostGIS exposes both names
+        // for spec conformance, so the interface DB lists each as
+        // its own scalar row. Route each at the corresponding
+        // existing `postgis-constructors` entry.
+        ("st_wkbtosql",                    "postgis-constructors",     "st-geom-from-wkb"),
+        ("st_wkttosql",                    "postgis-constructors",     "st-geom-from-text"),
     ]
 }
 
@@ -112,6 +158,26 @@ pub fn tuple_pick_overrides() -> &'static [(
         ),
         (
             "st_worldtorastercoordrow",
+            "postgis-raster-pixels",
+            "st-world-to-raster-coord",
+            1,
+        ),
+        // #678 — underscore-spelled siblings of the two collapsed
+        // forms above. PostGIS publishes both spellings
+        // (`ST_WorldToRasterCoordCol` and the snake_case alias
+        // `st_world_to_raster_coord_col`); the interface DB carries
+        // each as its own row, so the existing collapsed-form
+        // tuple-pick routes don't bridge them and the codegen
+        // emits a name-match warning. Same `tuple<s32, s32>`
+        // underlying function — only the SQL alias changes.
+        (
+            "st_world_to_raster_coord_col",
+            "postgis-raster-pixels",
+            "st-world-to-raster-coord",
+            0,
+        ),
+        (
+            "st_world_to_raster_coord_row",
             "postgis-raster-pixels",
             "st-world-to-raster-coord",
             1,

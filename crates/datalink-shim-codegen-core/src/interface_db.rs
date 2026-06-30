@@ -2645,6 +2645,35 @@ pub fn build_full(
                 });
                 continue;
             };
+            // #678: scalar-vs-aggregate dual-registration skip.
+            //
+            // Some shims register the same SQL name in BOTH the
+            // `scalars` and `aggregates` tables (postgres exposes
+            // aggregates through the same calling convention as
+            // scalars, so the interface extractor catches both
+            // sides). Today's surface: postgis
+            // `st_rast_union_aggregate` and the geometry-side
+            // `st_union_aggregate` / `st_polygonize_aggregate`
+            // family.
+            //
+            // The aggregate path wires them correctly via the
+            // `build_aggregate_registry` pipeline; the scalar
+            // path here finds the same WIT function by name but
+            // can't classify `list<borrow<geometry>>` /
+            // `list<borrow<raster>>` as a scalar param shape and
+            // would otherwise emit a stray "param type not in
+            // dispatcher alphabet (aggregate-only)" warning.
+            //
+            // Drop the scalar arm silently when the matched WIT
+            // function's first param is one of the aggregate-only
+            // list-borrow shapes. The aggregate dispatch arm
+            // remains the source of truth for the SQL name.
+            if matches!(
+                f.params.first().map(|p| &p.ty),
+                Some(WitType::ListGeomBorrow) | Some(WitType::ListRasterBorrow)
+            ) {
+                continue;
+            }
             match classify_shape(f, records, &enums) {
                 Ok(mut shape) => {
                     // #564 tuple-pick: rewrite the classified return
