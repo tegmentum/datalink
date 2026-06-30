@@ -146,7 +146,7 @@ pub fn tuple_pick_override_for<'a>(
 /// name match. Each routed entry feeds the standard
 /// `classify_aggregate_shape` pipeline downstream, so the override
 /// only fixes the WIT-function lookup — return-shape classification
-/// (e.g. `bbox3d` → `Bbox3dText`) is still computed from the WIT
+/// (e.g. `bbox3d` → `Bbox3dWkbLineZ`) is still computed from the WIT
 /// signature.
 ///
 /// Today's surface:

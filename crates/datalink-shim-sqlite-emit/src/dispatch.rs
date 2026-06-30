@@ -532,19 +532,32 @@ pub fn emit_arm_body(
              {i}    )))\n\
              {i}}}"
         ),
-        // Round (#608): bbox3d return — PostGIS-conventional text
-        // representation `BOX3D(xmin ymin zmin,xmax ymax zmax)`.
-        // The bbox3d record's wit-bindgen Rust shape is
-        // `{ min_x, min_y, min_z, max_x, max_y, max_z }` (six f64).
-        // No external interface alias required.
-        RetShape::Bbox3dText => format!(
+        // Gap G3 (#668): bbox3d return — ISO-WKB `LINESTRING Z`
+        // blob whose two vertices are the bbox's min and max
+        // corners `(xmin, ymin, zmin) -> (xmax, ymax, zmax)`. The
+        // diagonal preserves all six coordinates and is parseable
+        // by downstream `st_astext` (and other scalar consumers
+        // that decode WKB on entry). Bytes are composed inline
+        // because no upstream WIT constructor builds a 3D-envelope
+        // geometry today (parallels `BboxBlob` which uses
+        // `pg_ctor::st_make_envelope`). The bbox3d record's
+        // wit-bindgen Rust shape is `{ min_x, min_y, min_z,
+        // max_x, max_y, max_z }` (six f64).
+        RetShape::Bbox3dWkbLineZ => format!(
             "{{\n\
              {i}    let __bb = {call_expr}{unwrap_chain};\n\
-             {i}    Ok(SqlValue::Text(format!(\n\
-             {i}        \"BOX3D({{}} {{}} {{}},{{}} {{}} {{}})\",\n\
-             {i}        __bb.min_x, __bb.min_y, __bb.min_z,\n\
-             {i}        __bb.max_x, __bb.max_y, __bb.max_z,\n\
-             {i}    )))\n\
+             {i}    let mut __wkb: Vec<u8> = Vec::with_capacity(57);\n\
+             {i}    // ISO-WKB header: little-endian, type 1002 (LINESTRING Z), 2 points.\n\
+             {i}    __wkb.push(0x01u8);\n\
+             {i}    __wkb.extend_from_slice(&1002u32.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&2u32.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.min_x.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.min_y.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.min_z.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.max_x.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.max_y.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.max_z.to_le_bytes());\n\
+             {i}    Ok(SqlValue::Blob(__wkb))\n\
              {i}}}"
         ),
         // Phase E: record-typed return — wrap as WitValue. Helper
@@ -1068,19 +1081,31 @@ pub fn emit_aggregate_finalize_body(
                  {i}}}",
             ));
         }
-        // Round (#608): bbox3d return — PostGIS-conventional text
-        // representation. Today's only producer is the
+        // Gap G3 (#668): bbox3d return — ISO-WKB `LINESTRING Z`
+        // blob whose two vertices are the bbox's min and max
+        // corners `(xmin, ymin, zmin) -> (xmax, ymax, zmax)`. The
+        // diagonal preserves all six coordinates and lets the
+        // downstream `st_astext` (and other scalar consumers that
+        // decode WKB on entry) parse the aggregate result as a
+        // standard WKB geometry. Today's only producer is the
         // `st_3dextent` aggregate (`postgis-aggregates::st-extent-threed`),
         // which is non-fallible (returns `bbox3d` directly, no
         // `result<...>`), so no `.map_err(...)` thread.
-        RetShape::Bbox3dText => {
+        RetShape::Bbox3dWkbLineZ => {
             s.push_str(&format!(
                 "{i}let __bb = {module}::{func}({call_args});\n\
-                 {i}Ok(SqlValue::Text(format!(\n\
-                 {i}    \"BOX3D({{}} {{}} {{}},{{}} {{}} {{}})\",\n\
-                 {i}    __bb.min_x, __bb.min_y, __bb.min_z,\n\
-                 {i}    __bb.max_x, __bb.max_y, __bb.max_z,\n\
-                 {i})))",
+                 {i}let mut __wkb: Vec<u8> = Vec::with_capacity(57);\n\
+                 {i}// ISO-WKB header: little-endian, type 1002 (LINESTRING Z), 2 points.\n\
+                 {i}__wkb.push(0x01u8);\n\
+                 {i}__wkb.extend_from_slice(&1002u32.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&2u32.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.min_x.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.min_y.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.min_z.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.max_x.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.max_y.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.max_z.to_le_bytes());\n\
+                 {i}Ok(SqlValue::Blob(__wkb))",
             ));
         }
         _ => {

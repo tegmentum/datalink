@@ -521,18 +521,28 @@ fn render_ret_to_scalarvalue(
              {i}    )))\n\
              {i}}}"
         ),
-        // Round (#608): bbox3d return — PostGIS-conventional text
-        // representation `BOX3D(xmin ymin zmin,xmax ymax zmax)`.
-        // The bbox3d record's wit-bindgen Rust shape is
-        // `{ min_x, min_y, min_z, max_x, max_y, max_z }` (six f64).
-        RetShape::Bbox3dText => format!(
+        // Gap G3 (#668): bbox3d return — ISO-WKB `LINESTRING Z`
+        // blob whose two vertices are the bbox's min and max
+        // corners `(xmin, ymin, zmin) -> (xmax, ymax, zmax)`. The
+        // diagonal preserves all six coordinates and is parseable
+        // by downstream WKB consumers. The bbox3d record's
+        // wit-bindgen Rust shape is `{ min_x, min_y, min_z,
+        // max_x, max_y, max_z }` (six f64).
+        RetShape::Bbox3dWkbLineZ => format!(
             "{{\n\
              {i}    let __bb = {call_expr}{unwrap_chain};\n\
-             {i}    Ok(types::ScalarValue::Utf8(format!(\n\
-             {i}        \"BOX3D({{}} {{}} {{}},{{}} {{}} {{}})\",\n\
-             {i}        __bb.min_x, __bb.min_y, __bb.min_z,\n\
-             {i}        __bb.max_x, __bb.max_y, __bb.max_z,\n\
-             {i}    )))\n\
+             {i}    let mut __wkb: Vec<u8> = Vec::with_capacity(57);\n\
+             {i}    // ISO-WKB header: little-endian, type 1002 (LINESTRING Z), 2 points.\n\
+             {i}    __wkb.push(0x01u8);\n\
+             {i}    __wkb.extend_from_slice(&1002u32.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&2u32.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.min_x.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.min_y.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.min_z.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.max_x.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.max_y.to_le_bytes());\n\
+             {i}    __wkb.extend_from_slice(&__bb.max_z.to_le_bytes());\n\
+             {i}    Ok(types::ScalarValue::Binary(__wkb.into()))\n\
              {i}}}"
         ),
         RetShape::Enum {
@@ -723,8 +733,9 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
         | RetShape::FirstRasterBlob
         | RetShape::FirstTopologyBlob => "types::LogicalType::Binary".to_string(),
         RetShape::IsValidDetailText => "types::LogicalType::Utf8".to_string(),
-        // Round (#608): bbox3d returns surface as `BOX3D(...)` text.
-        RetShape::Bbox3dText => "types::LogicalType::Utf8".to_string(),
+        // Gap G3 (#668): bbox3d returns surface as an ISO-WKB
+        // `LINESTRING Z` blob (min-corner -> max-corner diagonal).
+        RetShape::Bbox3dWkbLineZ => "types::LogicalType::Binary".to_string(),
         RetShape::OptionText => "types::LogicalType::Utf8".to_string(),
         RetShape::OptionReal => "types::LogicalType::Float64".to_string(),
         RetShape::OptionInt | RetShape::FirstOptionU32Int | RetShape::FirstInt => {
@@ -1035,16 +1046,24 @@ pub fn emit_aggregate_finalize_body(
                  {i}}}",
             ));
         }
-        // Round (#608): bbox3d return as PostGIS-conventional text.
-        // Non-fallible upstream (`st-extent-threed -> bbox3d`).
-        RetShape::Bbox3dText => {
+        // Gap G3 (#668): bbox3d return as ISO-WKB `LINESTRING Z`
+        // blob (min-corner -> max-corner diagonal). Non-fallible
+        // upstream (`st-extent-threed -> bbox3d`).
+        RetShape::Bbox3dWkbLineZ => {
             s.push_str(&format!(
                 "{i}let __bb = {module}::{func}({call_args});\n\
-                 {i}Ok(ftypes::ScalarValue::Utf8(format!(\n\
-                 {i}    \"BOX3D({{}} {{}} {{}},{{}} {{}} {{}})\",\n\
-                 {i}    __bb.min_x, __bb.min_y, __bb.min_z,\n\
-                 {i}    __bb.max_x, __bb.max_y, __bb.max_z,\n\
-                 {i})))",
+                 {i}let mut __wkb: Vec<u8> = Vec::with_capacity(57);\n\
+                 {i}// ISO-WKB header: little-endian, type 1002 (LINESTRING Z), 2 points.\n\
+                 {i}__wkb.push(0x01u8);\n\
+                 {i}__wkb.extend_from_slice(&1002u32.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&2u32.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.min_x.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.min_y.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.min_z.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.max_x.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.max_y.to_le_bytes());\n\
+                 {i}__wkb.extend_from_slice(&__bb.max_z.to_le_bytes());\n\
+                 {i}Ok(ftypes::ScalarValue::Binary(__wkb.into()))",
             ));
         }
         _ => {

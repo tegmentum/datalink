@@ -382,15 +382,20 @@ pub enum RetShape {
     /// `text` return type is honoured. Round 3.
     IsValidDetailText,
     /// `bbox3d` record (6 f64s: min-x, min-y, min-z, max-x, max-y,
-    /// max-z). Round (#608). Rendered as the PostGIS-conventional
-    /// text representation `BOX3D(xmin ymin zmin,xmax ymax zmax)`
-    /// so the interface DB's `text` return type is honoured. Today's
+    /// max-z). Round (#608); reshaped for Gap G3 (#668). Rendered
+    /// as an ISO-WKB `LINESTRING Z` blob whose two vertices are
+    /// the bbox's min and max corners
+    /// `(xmin, ymin, zmin) -> (xmax, ymax, zmax)`. The diagonal
+    /// representation preserves all six coordinates and lets the
+    /// downstream `st_astext` (and other scalar consumers) parse
+    /// the aggregate's result as a standard WKB geometry. Today's
     /// only producer is `postgis-aggregates::st-extent-threed`
     /// (the `st_3dextent` SQL aggregate). Parallels `BboxBlob` for
-    /// the 2D shape but uses text rather than WKB envelope because
-    /// no upstream WIT constructor builds a 3D bounding box geometry
-    /// today.
-    Bbox3dText,
+    /// the 2D shape (which emits an ISO-WKB `POLYGON` envelope via
+    /// `pg_ctor::st_make_envelope`); the 3D form is composed
+    /// inline because no upstream WIT constructor builds a 3D
+    /// envelope today.
+    Bbox3dWkbLineZ,
     /// Phase E: record-typed return. The bridge encodes the
     /// UPSTREAM record via a ciborium round-trip into the LOCAL
     /// serde-ops record (same canon-CBOR bytes — round-trip works
@@ -1121,9 +1126,10 @@ pub fn affinity_for(ty: &WitType) -> ColumnAffinity {
         WitType::Geometry { .. } | WitType::Geography { .. } => ColumnAffinity::Blob,
         WitType::Raster { .. } | WitType::Topology { .. } => ColumnAffinity::Blob,
         WitType::Bbox => ColumnAffinity::Blob,
-        // Round (#608): bbox3d renders as `BOX3D(...)` text via
-        // `RetShape::Bbox3dText`, so its column affinity is Text.
-        WitType::Bbox3d => ColumnAffinity::Text,
+        // Gap G3 (#668): bbox3d renders as an ISO-WKB
+        // `LINESTRING Z` blob via `RetShape::Bbox3dWkbLineZ`, so
+        // its column affinity matches the 2D `Bbox` form (Blob).
+        WitType::Bbox3d => ColumnAffinity::Blob,
         WitType::ListGeomBorrow | WitType::ListGeomOwned => ColumnAffinity::Blob,
         WitType::ListRasterBorrow => ColumnAffinity::Blob,
         WitType::ListOptionU32 => ColumnAffinity::Text, // JSON-encoded
@@ -2082,11 +2088,16 @@ pub fn classify_return(
         // ymax)` constructor. Covers `st-make-box2d` and
         // `st-box-from-geohash`.
         WitType::Bbox => RetShape::BboxBlob,
-        // Round (#608): bbox3d returns (today: `st-extent-threed`)
-        // are rendered as `BOX3D(...)` text rather than a 3D-envelope
-        // WKB. Parallels `Bbox => BboxBlob` but uses text since no
-        // 3D-envelope constructor exists in the postgis-wasm WIT.
-        WitType::Bbox3d => RetShape::Bbox3dText,
+        // Gap G3 (#668): bbox3d returns (today: `st-extent-threed`)
+        // are rendered as an ISO-WKB `LINESTRING Z` blob whose two
+        // vertices are the min and max corners of the bounding box.
+        // The diagonal preserves all six coordinates; downstream
+        // `st_astext` and other scalar consumers parse it as a
+        // standard WKB geometry. Parallels `Bbox => BboxBlob`
+        // (which uses `pg_ctor::st_make_envelope`); the 3D form is
+        // composed inline because no 3D-envelope constructor exists
+        // in the postgis-wasm WIT today.
+        WitType::Bbox3d => RetShape::Bbox3dWkbLineZ,
         // Round 3: the specific tuple shape that
         // `st-is-valid-detail` returns — `tuple<bool,
         // option<string>, option<geometry>>` — is rendered as a
