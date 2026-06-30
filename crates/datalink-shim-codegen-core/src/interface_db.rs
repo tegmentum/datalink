@@ -877,6 +877,179 @@ pub fn augment_plan_with_override_aggregates(
     Ok(())
 }
 
+/// #680: complement to `augment_plan_with_override_aggregates` for the
+/// SCALAR surface. Closes the codegen substrate gap that prevented
+/// upstream postgis-wasm WIT additions from surfacing as SQL functions.
+///
+/// ## The gap
+///
+/// The codegen reads its scalar list from the extracted interface DB,
+/// which is populated by calling the postgis-datafission-bridge's
+/// `list_functions()` impl. That impl is HARDCODED at bridge-regen
+/// time — once a new SQL function is added upstream in postgis-wasm
+/// (e.g. the Tier 1 SFCGAL, topology, face-split ops added in #681
+/// and #682), the existing bridge crate's frozen `vec![]` doesn't
+/// know about it, so the next interface-DB extraction silently drops
+/// it on the floor. Codegen then iterates `ext.scalars` without ever
+/// walking the upstream WIT for late additions, and the regenerated
+/// bridge still doesn't include the new function.
+///
+/// ## The fix
+///
+/// Mirror the override-aggregate augment pattern but seed from the
+/// upstream WIT directly. For every WIT function the parser sees,
+/// compute a snake-case SQL name (`st-alpha-shape` → `st_alpha_shape`)
+/// and synthesise a `ScalarFn` row when that name isn't already on
+/// the plan (regardless of which surface — scalars, aggregates, table
+/// functions, window functions — owns it today). Resource methods are
+/// skipped: their SQL surface is `<resource>_<method>` and the
+/// dispatch matcher resolves them through `index_resource_methods`
+/// when the interface DB actually carries the row — synthesising
+/// them here would produce free-function-shaped SQL names that don't
+/// match the resource-method dispatch convention.
+///
+/// ## Synthesised shape
+///
+/// Each synthetic row carries:
+///   - `param_signatures = [[binary; arity]]` — only the arity is
+///     consumed downstream (by `scalar_num_args` in the SQLite emit's
+///     metadata pass); the `"binary"` placeholders never reach the
+///     actual call-marshalling pipeline because the dispatch matcher
+///     re-classifies the param shapes against the WIT signature.
+///   - `return_type = "binary"` — same reason; not threaded into emit.
+///   - `is_deterministic = true`, `propagates_null = true` — the
+///     common case for PostGIS scalars; mismatches would surface as
+///     incorrect SQL-function flags on the SQLite registration, not
+///     wrong call behaviour.
+///   - `aliases = []` — synonyms get their own interface-DB rows on
+///     the next regen once the bridge advertises them.
+///
+/// ## Why this layers on top of the override path
+///
+/// `augment_plan_with_override_aggregates` requires a hand-curated
+/// (sql_name, wit_interface, wit_kebab) tuple per op. That works for
+/// the aggregate surface (small, slow-growth) but the scalar surface
+/// regularly absorbs 30+ ops per upstream release. Auto-synthesis
+/// removes the manual maintenance step entirely: any new WIT function
+/// surfaces immediately on the next codegen run.
+pub fn augment_plan_with_upstream_wit_scalars(
+    plan: &mut shim_bridge_codegen_core::BridgePlan,
+    wit_deps_dir: &Path,
+) -> Result<()> {
+    if plan.extensions.is_empty() {
+        return Ok(());
+    }
+
+    // Same two-pass walk as `augment_plan_with_override_aggregates`:
+    // the supplied path may be a `wit/deps/`-shaped root containing
+    // per-package subdirs OR an already-drilled-in single package
+    // dir; walk both shapes so the call site doesn't have to choose.
+    let mut wit_fns = Vec::<wit_parse::WitFunction>::new();
+    if let Ok(rd) = std::fs::read_dir(wit_deps_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let parsed = wit_parse::parse_dir(&p)?;
+            wit_fns.extend(parsed);
+        }
+    }
+    let direct = wit_parse::parse_dir(wit_deps_dir).unwrap_or_default();
+    wit_fns.extend(direct);
+    let aliases = collect_package_aliases(wit_deps_dir);
+    let wit_fns = resolve_function_aliases(wit_fns, &aliases);
+
+    // Collect every SQL name already wired across every extension
+    // and every function category. A new WIT function whose
+    // kebab→snake name collides with an existing aggregate /
+    // table fn / window fn is left alone — the existing entry's
+    // dispatch path is correct, and synthesising a duplicate scalar
+    // row would only confuse the SQLite emit's metadata enumeration.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ext in &plan.extensions {
+        for sc in &ext.scalars {
+            seen.insert(sc.canonical_name.clone());
+            for a in &sc.aliases {
+                seen.insert(a.clone());
+            }
+        }
+        for ag in &ext.aggregates {
+            seen.insert(ag.canonical_name.clone());
+            for a in &ag.aliases {
+                seen.insert(a.clone());
+            }
+        }
+        for tf in &ext.table_functions {
+            seen.insert(tf.canonical_name.clone());
+            for a in &tf.aliases {
+                seen.insert(a.clone());
+            }
+        }
+        for w in &ext.window_functions {
+            seen.insert(w.canonical_name.clone());
+            for a in &w.aliases {
+                seen.insert(a.clone());
+            }
+        }
+    }
+
+    let mut synthetic = Vec::<shim_bridge_codegen_core::ScalarFn>::new();
+    for f in &wit_fns {
+        // Resource methods don't sit on the free-function-shaped SQL
+        // surface — they're called as `<resource>_<method>` and the
+        // dispatch path resolves them through `index_resource_methods`
+        // only when the interface DB has the row. Synthesising
+        // bare-method names here would publish them as standalone
+        // SQL scalars, which isn't the upstream contract. Constructors
+        // (kebab `create-<resource>`) ARE free-function-shaped (e.g.
+        // `st_createtopology`) so they pass through.
+        if f.resource.is_some() && !f.is_constructor {
+            continue;
+        }
+        let sql_name = wit_parse::kebab_to_snake(&f.kebab_name);
+        if seen.contains(&sql_name) {
+            continue;
+        }
+        seen.insert(sql_name.clone());
+        // Arity-correct placeholder signature. Only `scalar_num_args`
+        // reads `param_signatures` on the synthesised path; the
+        // dispatch matcher re-classifies the real shapes against the
+        // WIT signature when it walks `ext.scalars`.
+        let arity = f.params.len();
+        let param_sig: Vec<String> =
+            std::iter::repeat("binary".to_string()).take(arity).collect();
+        synthetic.push(shim_bridge_codegen_core::ScalarFn {
+            canonical_name: sql_name,
+            aliases: Vec::new(),
+            param_signatures: vec![param_sig],
+            return_type: "binary".to_string(),
+            is_deterministic: true,
+            propagates_null: true,
+        });
+    }
+
+    if !synthetic.is_empty() {
+        eprintln!(
+            "[codegen] augment-plan: synthesised {} scalar(s) from upstream WIT",
+            synthetic.len(),
+        );
+        for s in &synthetic {
+            eprintln!("  + {}", s.canonical_name);
+        }
+        plan.extensions[0].scalars.extend(synthetic);
+        // Keep the scalar list deterministically ordered — the SQLite
+        // emit's metadata pass assigns sequential ids walking
+        // `ext.scalars` in order, so changing the order would churn
+        // the generated function ids across regens. Match the
+        // alphabetical ordering `load_plan` produces via `ORDER BY name`.
+        plan.extensions[0]
+            .scalars
+            .sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    }
+    Ok(())
+}
+
 /// One aggregate dispatch arm. `sql_name` is the canonical SQL
 /// name; `aliases` lists any extra names the SQL surface exposes
 /// for the same upstream WIT function. Phase 1A (formerly each
