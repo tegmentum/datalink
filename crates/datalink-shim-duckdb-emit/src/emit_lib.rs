@@ -71,6 +71,24 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let (udtf_entries, udtf_unwired) =
         interface_db::build_udtf_registry(plan, &shim_wit_dir, &records)?;
 
+    // #626: window-function classification — runs the same
+    // `interface_db::build_window_registry` pass datafission-emit
+    // consumes (#616 Phase 3) so the maintainer sees window
+    // coverage at codegen time. The duckdb-target emit does NOT
+    // currently produce any window dispatch: the bridge world
+    // exports `guest + callback-dispatch` only, and the
+    // `duckdb:extension@4.0.0` window method (`call-aggregate-
+    // window`) lives in the OPTIONAL `aggregate-incr-dispatch`
+    // interface which the bridge world does not export.
+    // ducklink-runtime additionally lacks a host-side
+    // `call_call_aggregate_window` dispatch wrapper. Classified
+    // entries surface here as `deferred` rather than `unwired`
+    // so the cause (substrate, not classification) is unambiguous.
+    // See `build_window_dispatch_impl` for the substrate
+    // extension path.
+    let (window_entries, window_unwired) =
+        interface_db::build_window_registry(plan, &shim_wit_dir)?;
+
     // Report on what fell through so the maintainer sees coverage
     // at codegen time.
     let total_unwired = scalar_unwired.len();
@@ -98,6 +116,26 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         );
         for u in &udtf_unwired {
             eprintln!("  - {}: {}", u.sql_name, u.reason);
+        }
+    }
+    if !window_unwired.is_empty() {
+        eprintln!(
+            "[duckdb-target] {} window function(s) not wired:",
+            window_unwired.len(),
+        );
+        for u in &window_unwired {
+            eprintln!("  - {}: {}", u.sql_name, u.reason);
+        }
+    }
+    if !window_entries.is_empty() {
+        eprintln!(
+            "[duckdb-target] {} window function(s) deferred (substrate gap; \
+             bridge world does not export aggregate-incr-dispatch + \
+             ducklink-runtime lacks call_aggregate_window wrapper):",
+            window_entries.len(),
+        );
+        for e in &window_entries {
+            eprintln!("  - {}", e.sql_name);
         }
     }
 
@@ -262,6 +300,12 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
 //! row-major bodies. The call-pragma arm (#617 stub, refactored
 //! in #625 into `build_pragma_dispatch_impl`) returns
 //! `Duckerror::Unsupported` until a real pragma surface lands.
+//! Window functions (#626) are classified by
+//! `build_window_registry` so the maintainer sees coverage at
+//! codegen time, but the bridge world does not yet export the
+//! optional `aggregate-incr-dispatch` interface (which carries
+//! `call-aggregate-window`); see `build_window_dispatch_impl`
+//! for the cross-component substrate-extension path.
 
 #![allow(unused_imports, dead_code)]
 
@@ -585,13 +629,14 @@ impl callback_dispatch::Guest for {bridge_struct} {{
         }}
     }}
 
-{pragma_arm}{cast_arm}}}
+{pragma_arm}{window_arm}{cast_arm}}}
 "##,
         bridge_struct = bridge_struct,
         scalar_arms = scalar_arms,
         aggregate_arms = aggregate_arms,
         table_arms = table_arms,
         pragma_arm = build_pragma_dispatch_impl(primary),
+        window_arm = build_window_dispatch_impl(primary),
         cast_arm = if has_casts {
             // #624: call_cast forwards into call_scalar at the
             // matching arm. `register_casts()` slotted the cast
@@ -861,6 +906,79 @@ fn build_pragma_dispatch_impl(primary: &str) -> String {
 ",
         primary = primary,
     )
+}
+
+/// #626: cross-component window-dispatch builder.
+///
+/// Returns the string that gets interpolated into the
+/// `impl callback_dispatch::Guest for $Bridge { ... }` block
+/// alongside the pragma / cast arms. Currently returns an EMPTY
+/// STRING: the bridge world exports only `guest +
+/// callback-dispatch`, and the `duckdb:extension@4.0.0` window
+/// method (`call-aggregate-window`) lives in the optional
+/// `aggregate-incr-dispatch` interface which the bridge world
+/// does not export. There is no trait method to satisfy in the
+/// current export surface, so emitting an arm here would not
+/// compile — the helper exists as a documentation anchor for
+/// the next implementer, slotting next to
+/// `build_pragma_dispatch_impl` so the per-target stub set
+/// stays uniform.
+///
+/// The substrate is missing on three axes — each owns one
+/// upstream coordination step:
+///
+///  1. **Bridge world surface** (`emit_wit::DUCKDB_EXPORTS` +
+///     `world bridge` in the rendered `wit/world.wit`): the
+///     export list must grow `aggregate-incr-dispatch` (or the
+///     bridge must switch to the `duckdb-extension-aggregate-
+///     incr` superset world). Without that, wit-bindgen does
+///     not emit the `aggregate_incr_dispatch::Guest` trait
+///     and there is no `fn call_aggregate_window` to fill in.
+///  2. **ducklink-runtime dispatch wrapper**
+///     (`crates/ducklink-runtime/src/extension.rs`): the
+///     host-side currently has `call_call_aggregate_init /
+///     update / combine / finalize / col` wrappers around the
+///     extension's `aggregate-incr-dispatch` export, but no
+///     `call_call_aggregate_window` wrapper. The runtime needs
+///     a method that lifts a `Vec<Vec<Duckvalue>>` partition +
+///     `WindowFrame { start, end }` to the wit-bindgen guest
+///     trait and lowers the per-row result back to
+///     `Duckvalue`. Mirrors the existing aggregate-incr
+///     wrappers' shape.
+///  3. **Emit body + register pass**: once (1) is in place,
+///     this helper grows the same shape as
+///     `build_aggregate_arms` (a `window_handle_table` lookup
+///     into per-arm bodies that decode the partition rows +
+///     extra args, call the upstream WIT function, and slice
+///     the partition's `list<Y>` return down to the frame
+///     range). `register::render_windows` registers each
+///     window function against `runtime.window-registry`
+///     (or whichever registration surface the bridge world's
+///     additive imports settle on) and slots the handle into
+///     `window_handle_table`. The classified `window_entries`
+///     produced by `interface_db::build_window_registry`
+///     already carry the per-row `WindowReturn` discriminant
+///     (`OptionU32` / `U32` / `GeomBlob`) so the per-arm
+///     decode follows the existing scalar/aggregate emit
+///     recipes.
+///
+/// Mirrors the honest-stub pattern of #617 (pragma trait
+/// method exists, body returns Unsupported), #620
+/// (system-catalog), #621 (datafission index-plugin) and
+/// #625 (pragma helper extraction). The difference here is
+/// that the trait method does NOT exist in the current world
+/// — so the helper produces no generated text until the
+/// substrate (1) lands. The shim WIT, register pass, and
+/// host runtime wrapper land in lockstep across
+/// ducklink + datalink in a follow-up.
+fn build_window_dispatch_impl(_primary: &str) -> String {
+    // No trait method to satisfy in the current bridge world
+    // (`callback-dispatch` has no window arm; the bridge does
+    // not export `aggregate-incr-dispatch`). The helper exists
+    // as a documentation anchor; emitting a body here would
+    // produce uncompilable Rust against the current
+    // wit-bindgen output.
+    String::new()
 }
 
 /// Build the per-arm UDTF dispatch match arms. Same dedupe
