@@ -25,9 +25,10 @@ use anyhow::Result;
 
 use crate::name_match::{
     aggregate_name_candidates, candidates_sorted, collect_package_aliases,
-    collect_package_enums, find_resource_family_free_fn, find_resource_method,
-    find_same_interface_free_fn, find_wit_fn, index_resource_interfaces,
-    index_resource_methods, index_wit_fns, index_wit_fns_nohyphen,
+    collect_package_enums, find_resource_concat_match, find_resource_family_free_fn,
+    find_resource_method, find_same_interface_free_fn, find_wit_fn,
+    index_resource_interfaces, index_resource_methods, index_resource_methods_concat,
+    index_wit_fns, index_wit_fns_nohyphen,
     resolve_function_aliases, sql_name_candidates, table_fn_name_candidates,
     AGGREGATE_NAME_SUFFIXES, EnumWithPackage,
 };
@@ -2506,6 +2507,10 @@ pub fn build_full(
     // `st_topologyfrombytes` → `postgis-topology-types::from-bytes`
     // via the `topology_from_bytes` alias).
     let resource_iface_index = index_resource_interfaces(&wit_fns);
+    // #673: concatenated-form resource method index (no-hyphen
+    // `<resource><method>` key) for SQL aliases like
+    // `st_topologynodecount` that omit the separator entirely.
+    let method_concat_index = index_resource_methods_concat(&wit_fns);
 
     let mut entries: Vec<(DispatchEntry, bool)> = Vec::new();
     let mut unwired: Vec<UnwiredScalar> = Vec::new();
@@ -2533,6 +2538,13 @@ pub fn build_full(
             //    swapped form (`validate_topology` for SQL
             //    `topology_validate`) and the joined form
             //    (`create_topology` for SQL `topology_create`).
+            // 7) #673 concatenated-form match: catches SQL names
+            //    with no separator anywhere (`st_topologynodecount`)
+            //    by peeling a resource's no-hyphen kebab off the
+            //    front and matching the remainder against either
+            //    that resource's methods or sibling-interface
+            //    free fns in the resource's `<ns>-<resource>-*`
+            //    family.
             let tuple_pick = tuple_pick_override_for(&sc.canonical_name, &wit_fns);
             let matched: Option<&WitFunction> = if let Some((f, _)) = tuple_pick {
                 Some(f)
@@ -2548,10 +2560,17 @@ pub fn build_full(
                 &resource_iface_index,
             ) {
                 Some(f)
+            } else if let Some(f) = find_resource_family_free_fn(
+                &candidates,
+                &wit_index,
+                &resource_iface_index,
+            ) {
+                Some(f)
             } else {
-                find_resource_family_free_fn(
+                find_resource_concat_match(
                     &candidates,
-                    &wit_index,
+                    &method_concat_index,
+                    &wit_nohyphen,
                     &resource_iface_index,
                 )
             };
@@ -2668,6 +2687,14 @@ pub fn build_full(
                     find_resource_family_free_fn(
                         &candidates,
                         &wit_index,
+                        &resource_iface_index,
+                    )
+                })
+                .or_else(|| {
+                    find_resource_concat_match(
+                        &candidates,
+                        &method_concat_index,
+                        &wit_nohyphen,
                         &resource_iface_index,
                     )
                 });

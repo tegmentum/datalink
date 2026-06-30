@@ -473,6 +473,100 @@ pub fn find_same_interface_free_fn<'a>(
     None
 }
 
+/// #673: no-hyphen resource-method index for concatenated SQL
+/// names. Keyed by `<resource_nohyphen><method_nohyphen>` so a
+/// SQL scalar like `st_topologynodecount` (no separator at all)
+/// resolves directly after stripping `st_`.
+///
+/// The interface DB ships a handful of postgis topology aliases
+/// in this concatenated form (`st_topologyedgecount`,
+/// `st_topologyfacecount`, `st_topologyname`,
+/// `st_topologyprecision`, `st_topologysrid`,
+/// `st_topologytobytes`, `st_topologynodecount`). Their
+/// underscored siblings (`st_topology_node_count`) resolve via
+/// `index_resource_methods`; this index covers the gap where
+/// the SQL surface omits the separator entirely.
+pub fn index_resource_methods_concat<'a>(
+    fns: &'a [WitFunction],
+) -> HashMap<String, &'a WitFunction> {
+    let mut idx = HashMap::new();
+    for f in fns {
+        let Some(ref rkebab) = f.resource else {
+            continue;
+        };
+        if f.is_constructor {
+            continue;
+        }
+        let key = format!(
+            "{}{}",
+            rkebab.replace('-', ""),
+            f.kebab_name.replace('-', ""),
+        );
+        idx.insert(key, f);
+    }
+    idx
+}
+
+/// #673: concatenated-form resource match. Catches SQL names that
+/// glue `<resource><verb>` with NO separator at all
+/// (`st_topologynodecount`, `st_topologyfrombytes`), which the
+/// earlier `find_resource_method` / `find_same_interface_free_fn`
+/// / `find_resource_family_free_fn` passes can't split because
+/// they look for an underscore between the two halves.
+///
+/// Walk per candidate (after `st_` strip):
+///   1. Direct lookup in the concat method index
+///      (`topologynodecount` → topology::node-count).
+///   2. For each known resource, peel its no-hyphen kebab off the
+///      front and look the remainder up in the no-hyphen free-fn
+///      index, gated to interfaces in the resource's
+///      `<ns>-<resource>-*` family. Covers free fns colocated
+///      with the resource type (`st_topologyfrombytes` →
+///      `postgis-topology-types::from-bytes`).
+///
+/// Candidates that already contain an underscore (after `st_`
+/// strip) are skipped — those have a separator to split on and
+/// resolve through the prior passes.
+pub fn find_resource_concat_match<'a>(
+    candidates: &[String],
+    method_concat_idx: &HashMap<String, &'a WitFunction>,
+    nohyphen_idx: &HashMap<String, Vec<&'a WitFunction>>,
+    resource_iface_idx: &HashMap<String, String>,
+) -> Option<&'a WitFunction> {
+    for cand in candidates {
+        let raw = cand.strip_prefix("st_").unwrap_or(cand);
+        if raw.contains('_') {
+            continue;
+        }
+        // 1) Direct resource-method concat key.
+        if let Some(f) = method_concat_idx.get(raw) {
+            return Some(*f);
+        }
+        // 2) Resource-prefix peel + free-fn family lookup.
+        for (resource_kebab, declaring_iface) in resource_iface_idx {
+            let resource_nh = resource_kebab.replace('-', "");
+            let Some(remainder) = raw.strip_prefix(&resource_nh) else {
+                continue;
+            };
+            if remainder.is_empty() {
+                continue;
+            }
+            let Some(last_dash) = declaring_iface.rfind('-') else {
+                continue;
+            };
+            let family_prefix = &declaring_iface[..=last_dash];
+            if let Some(matches) = nohyphen_idx.get(remainder) {
+                for f in matches {
+                    if f.interface.starts_with(family_prefix) {
+                        return Some(*f);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Round (#672): broader sibling of `find_same_interface_free_fn`.
 ///
 /// `find_same_interface_free_fn` only matches a free function in
