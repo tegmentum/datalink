@@ -952,11 +952,26 @@ fn sqlvalues_eq(a: &[SqlValue], b: &[SqlValue]) -> bool {{
 thread_local! {{
     static UDTF_STATE: RefCell<HashMap<u64, UdtfCursor>> =
         RefCell::new(HashMap::new());
+    // #671: CREATE-time module args for non-eponymous vtab instances.
+    // SQLite passes user-supplied args at `CREATE VIRTUAL TABLE ...
+    // USING <udtf>(...)` time as Vec<String>; they don't reach
+    // xFilter through the normal constraint-driven argv path
+    // (no SELECT-side WHERE clause references the HIDDEN columns).
+    // We stash them here keyed by instance_id at create/connect
+    // time, copy them onto the cursor at open() (which sees both
+    // instance_id and cursor_id), and the filter() body falls back
+    // to the cursor copy when its own args are empty.
+    static UDTF_INSTANCE_ARGS: RefCell<HashMap<u64, Vec<SqlValue>>> =
+        RefCell::new(HashMap::new());
 }}
 
 struct UdtfCursor {{
     rows: Vec<Vec<SqlValue>>,
     idx: usize,
+    // #671: snapshot of the CREATE-time args for this instance,
+    // taken in open() so filter() can find them without needing
+    // its own instance_id parameter.
+    create_args: Vec<SqlValue>,
 }}
 
 struct {bridge_struct};
@@ -1533,19 +1548,37 @@ fn emit_vtab_impl(
     }}
     fn connect(
         vtab_id: u64,
-        _instance_id: u64,
+        instance_id: u64,
         _db_name: String,
         _table_name: String,
-        _args: Vec<String>,
+        args: Vec<String>,
     ) -> Result<String, String> {{
+        // #671: stash any CREATE-time module args so the cursor's
+        // filter() body can fall back to them when xFilter argv is
+        // empty (non-eponymous CREATE VIRTUAL TABLE form). SQLite
+        // hands these in as Vec<String>; we wrap each as
+        // SqlValue::Text so the existing dispatch arms (which
+        // accept TEXT via `arg_geom` and friends) decode them
+        // uniformly with the constraint-driven path.
+        UDTF_INSTANCE_ARGS.with(|m| {{
+            let as_vals: Vec<SqlValue> =
+                args.iter().map(|s| SqlValue::Text(s.clone())).collect();
+            m.borrow_mut().insert(instance_id, as_vals);
+        }});
         match vtab_id {{
 {connect_arms}            _ => Err(stubbed("vtab connect", vtab_id)),
         }}
     }}
-    fn destroy(_vtab_id: u64, _instance_id: u64) -> Result<(), String> {{
+    fn destroy(_vtab_id: u64, instance_id: u64) -> Result<(), String> {{
+        UDTF_INSTANCE_ARGS.with(|m| {{
+            m.borrow_mut().remove(&instance_id);
+        }});
         Ok(())
     }}
-    fn disconnect(_vtab_id: u64, _instance_id: u64) -> Result<(), String> {{
+    fn disconnect(_vtab_id: u64, instance_id: u64) -> Result<(), String> {{
+        UDTF_INSTANCE_ARGS.with(|m| {{
+            m.borrow_mut().remove(&instance_id);
+        }});
         Ok(())
     }}
     fn best_index(
@@ -1583,9 +1616,18 @@ fn emit_vtab_impl(
             orderby_consumed: false,
         }})
     }}
-    fn open(_vtab_id: u64, _instance_id: u64, cursor_id: u64) -> Result<(), String> {{
+    fn open(_vtab_id: u64, instance_id: u64, cursor_id: u64) -> Result<(), String> {{
+        // #671: snapshot the instance's CREATE-time args onto the
+        // cursor so filter() — which doesn't see instance_id — can
+        // surface them when xFilter argv is empty.
+        let create_args = UDTF_INSTANCE_ARGS.with(|m| {{
+            m.borrow().get(&instance_id).cloned().unwrap_or_default()
+        }});
         UDTF_STATE.with(|m| {{
-            m.borrow_mut().insert(cursor_id, UdtfCursor {{ rows: Vec::new(), idx: 0 }});
+            m.borrow_mut().insert(
+                cursor_id,
+                UdtfCursor {{ rows: Vec::new(), idx: 0, create_args }},
+            );
         }});
         Ok(())
     }}
@@ -1602,6 +1644,23 @@ fn emit_vtab_impl(
         _idx_str: Option<String>,
         args: Vec<SqlValue>,
     ) -> Result<(), String> {{
+        // #671: non-eponymous `CREATE VIRTUAL TABLE t USING f(...)`
+        // form: SQLite passes the module args to xCreate/xConnect
+        // (we stashed them under instance_id and again on the
+        // cursor at open()), but xFilter argv stays empty unless
+        // the SELECT side references the HIDDEN columns directly.
+        // Fall back to the cursor's create_args here so the
+        // dispatch arms see the user-supplied values.
+        let args = if args.is_empty() {{
+            UDTF_STATE.with(|m| {{
+                m.borrow()
+                    .get(&cursor_id)
+                    .map(|c| c.create_args.clone())
+                    .unwrap_or_default()
+            }})
+        }} else {{
+            args
+        }};
         match vtab_id {{
 {filter_arms}            _ => Err(stubbed("vtab filter", vtab_id)),
         }}
