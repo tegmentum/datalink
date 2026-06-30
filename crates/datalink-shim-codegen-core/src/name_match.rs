@@ -758,28 +758,48 @@ fn try_dim_lookup<'a>(
     if verb.is_empty() {
         return None;
     }
-    // 1. Snake form.
+    // The index keys retain the `st_` / `st` prefix from the
+    // WIT kebab (`kebab_to_snake("st-closest-point-threed")` →
+    // `st_closest_point_threed`; the no-hyphen variant drops the
+    // dashes entirely → `stclosestpointthreed`). Probe both
+    // prefixed and bare forms so this helper works whether the
+    // SQL surface already carried `st_` or not.
     let snake_key = format!("{}_{}", verb, wit_dim);
-    if let Some(f) = snake_idx.get(&snake_key) {
-        return Some(*f);
-    }
-    // 2. No-hyphen form.
     let nh_key = format!("{}{}", verb.replace('_', ""), wit_dim);
-    if let Some(fs) = nohyphen_idx.get(&nh_key) {
-        if let Some(f) = pick_tiebreak(cand, fs) {
-            return Some(f);
+    let snake_key_st = format!("st_{}", snake_key);
+    let nh_key_st = format!("st{}", nh_key);
+
+    for k in [&snake_key_st, &snake_key] {
+        if let Some(f) = snake_idx.get(k) {
+            return Some(*f);
         }
     }
-    // 3. 2D-as-default fallback. Only fires when the SQL dim
+    for k in [&nh_key_st, &nh_key] {
+        if let Some(fs) = nohyphen_idx.get(k) {
+            if let Some(f) = pick_tiebreak(cand, fs) {
+                return Some(f);
+            }
+        }
+    }
+    // 2D-as-default fallback. Only fires when the SQL dim
     // translates to `twod` AND neither dim-tagged lookup hit.
+    // PostGIS treats `ST_Perimeter2D` as a deprecated alias of
+    // `ST_Perimeter`; the WIT only declares the bare form for
+    // that family.
     if wit_dim == "twod" {
+        let bare = format!("st_{}", verb);
+        let bare_nh = format!("st{}", verb.replace('_', ""));
+        if let Some(f) = snake_idx.get(&bare) {
+            return Some(*f);
+        }
         if let Some(f) = snake_idx.get(verb) {
             return Some(*f);
         }
-        let bare_nh = verb.replace('_', "");
-        if let Some(fs) = nohyphen_idx.get(&bare_nh) {
-            if let Some(f) = pick_tiebreak(cand, fs) {
-                return Some(f);
+        for k in [&bare_nh, &verb.replace('_', "")] {
+            if let Some(fs) = nohyphen_idx.get(k) {
+                if let Some(f) = pick_tiebreak(cand, fs) {
+                    return Some(f);
+                }
             }
         }
     }
