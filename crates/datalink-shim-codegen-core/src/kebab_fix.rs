@@ -1,4 +1,4 @@
-//! WIT identifier kebab-fix for digit-starting segments (#655, #756).
+//! WIT identifier kebab-fix for digit-starting segments (#655, #756, #761).
 //!
 //! ## Why this exists
 //!
@@ -7,20 +7,23 @@
 //! shim WIT packages (notably `sfcgal:component`'s geometry interface)
 //! ship identifiers whose segments are digit-starting tokens like
 //! `-2d` / `-3d` (e.g. `is-3d`, `translate-2d`, `intersects-3d`,
-//! `cg-3d-alpha-wrapping`, `rotate-3d-around-center`). These names
-//! are accepted by `wasmtime` and `wac plug` but rejected by strict
-//! `wit-bindgen` (0.37+) and `jco` — and the bridge crates we emit
-//! consume `wit-bindgen` at build time, so a freshly regen'd bridge
-//! fails to compile against the unmodified upstream WIT.
+//! `cg-3d-alpha-wrapping`, `rotate-3d-around-center`) or bare single
+//! digits like `-2` (from CGAL's C++ template naming — e.g.
+//! `approx-convex-partition-2`, `y-monotone-partition-2`, mirroring
+//! `Constrained_Delaunay_triangulation_2`). These names are accepted
+//! by `wasmtime` and `wac plug` but rejected by strict `wit-bindgen`
+//! (0.37+) and `jco` — and the bridge crates we emit consume
+//! `wit-bindgen` at build time, so a freshly regen'd bridge fails
+//! to compile against the unmodified upstream WIT.
 //!
 //! Datafission already has a wasm-level fix for the SAME identifiers
 //! baked into the composed artifact (`scripts/fix-postgis-kebab.sh`,
 //! invoked via the `postgis-composed-pin.txt` workflow). This module
 //! is the WIT-source-text twin: when the codegen copies upstream
 //! WIT into the bridge's `wit/deps/`, it rewrites `-2d` / `-3d` /
-//! `-4d` identifier segments to `-twod` / `-threed` / `-fourd` so
-//! the emitted text matches the kebab-fixed component's extern
-//! names.
+//! `-4d` and bare `-2` / `-3` / `-4` identifier segments to word
+//! forms so the emitted text matches the kebab-fixed component's
+//! extern names.
 //!
 //! ## Translation rules
 //!
@@ -28,20 +31,39 @@
 //!   * `2d` → `twod`
 //!   * `3d` → `threed`
 //!   * `4d` → `fourd`
+//!   * `2`  → `two`     (#761)
+//!   * `3`  → `three`   (#761)
+//!   * `4`  → `four`    (#761)
 //!
-//! Position is irrelevant — trailing (`is-3d`, `translate-2d`),
-//! mid-position (`cg-3d-alpha-wrapping`, `union-3d-aggregate`,
-//! `rotate-3d-around-center`), and multiple occurrences are all
-//! rewritten.
+//! Position is irrelevant — trailing (`is-3d`, `translate-2d`,
+//! `approx-convex-partition-2`), mid-position (`cg-3d-alpha-wrapping`,
+//! `union-3d-aggregate`, `rotate-3d-around-center`), and multiple
+//! occurrences are all rewritten.
 //!
 //! Anchoring:
-//!   * Only exact `Nd` segments are rewritten — `coordinate2d` (no
-//!     hyphen) is a single non-matching segment, so it's left intact.
-//!     `3dm` / `3dz` (extra chars after `Nd`) also don't match.
+//!   * Only exact `Nd` / bare-`N` segments are rewritten. Multi-digit
+//!     segments like `epsg-4326` or `srid-3857` are NOT rewritten
+//!     here — they should be renamed upstream (e.g. `srid-webmercator`)
+//!     because there's no unambiguous word form for arbitrary integers.
+//!     `coordinate2d` (no hyphen) is a single non-matching segment,
+//!     so it's left intact. `3dm` / `3dz` (extra chars after `Nd`)
+//!     also don't match.
 //!   * The identifier must contain at least one segment with a
 //!     lowercase letter, so pure-digit sequences (unlikely in WIT
 //!     but possible in commit SHAs like `a48ab3d` — which is a single
 //!     non-hyphenated segment anyway) aren't touched.
+//!
+//! ## Audit surface (as of #761)
+//!
+//! Sweep of top-level WIT in `postgis-wasm/`, `mobilitydb-wasm/`, and
+//! `sfcgal-wasm/` shows:
+//!   * `-2d` / `-3d` / `-4d`: many, all handled since #655/#756.
+//!   * bare trailing `-2`: 5 (partition-2 family in sfcgal geometry),
+//!     handled by this pass (#761).
+//!   * bare trailing `-3` / `-4`: none observed; handled prophylactically.
+//!   * Digit-starting head segments (e.g. `2d-foo`): none observed.
+//!   * Multi-digit tails (SRID codes, magic numbers): none observed
+//!     in shim-facing WIT; would be flagged as upstream rename work.
 //!
 //! ## Invocation
 //!
@@ -51,6 +73,7 @@
 //! copy a `.wit` source file into the bridge's `wit/deps/`.
 
 /// Apply the `-2d` / `-3d` / `-4d` → `-twod` / `-threed` / `-fourd`
+/// and bare `-2` / `-3` / `-4` → `-two` / `-three` / `-four`
 /// kebab-fix across an entire WIT source file. Handles both trailing
 /// and mid-position digit segments. Leaves all other identifiers and
 /// non-identifier characters (including comments, whitespace,
@@ -79,9 +102,10 @@ fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-'
 }
 
-/// Translate any hyphen-separated `Nd` segment (2d/3d/4d) inside a
-/// kebab identifier to its word form. Non-matching segments and
-/// identifiers without a hyphen pass through unchanged.
+/// Translate any hyphen-separated `Nd` segment (2d/3d/4d) or bare
+/// digit segment (2/3/4) inside a kebab identifier to its word form.
+/// Non-matching segments and identifiers without a hyphen pass
+/// through unchanged.
 fn rewrite_nd(ident: &str) -> String {
     // Without a hyphen there are no segments to translate — a bare
     // `3d` token has no leading `-` to signal a kebab segment, and
@@ -113,6 +137,22 @@ fn rewrite_nd(ident: &str) -> String {
             }
             "4d" => {
                 translated.push("fourd".to_string());
+                changed = true;
+            }
+            // #761: bare single-digit segments from CGAL template names
+            // (e.g. `partition-2`, `y-monotone-partition-2`). Only 2/3/4
+            // are handled — multi-digit segments (SRID codes, magic
+            // numbers) are left alone and should be renamed upstream.
+            "2" => {
+                translated.push("two".to_string());
+                changed = true;
+            }
+            "3" => {
+                translated.push("three".to_string());
+                changed = true;
+            }
+            "4" => {
+                translated.push("four".to_string());
                 changed = true;
             }
             other => translated.push(other.to_string()),
@@ -247,5 +287,86 @@ mod tests {
     fn no_change_when_no_match() {
         let src = "interface geometry {\n    foo: func() -> bool;\n}\n";
         assert_eq!(kebab_fix_wit(src), src);
+    }
+
+    // ============================================
+    // #761: trailing bare-digit segment tests
+    // ============================================
+
+    #[test]
+    fn rewrites_trailing_bare_2() {
+        // #761: `approx-convex-partition-2` from CGAL C++ template
+        // `Constrained_Delaunay_triangulation_2`.
+        let src = "approx-convex-partition-2: func(geom: geometry-handle) -> geometry-result;";
+        let want = "approx-convex-partition-two: func(geom: geometry-handle) -> geometry-result;";
+        assert_eq!(kebab_fix_wit(src), want);
+    }
+
+    #[test]
+    fn rewrites_trailing_bare_2_full_family() {
+        // #761: full partition-2 family from sfcgal-wasm/wit/geometry.wit.
+        let src = "approx-convex-partition-2 greene-approx-convex-partition-2 \
+                   optimal-convex-partition-2 y-monotone-partition-2";
+        let want = "approx-convex-partition-two greene-approx-convex-partition-two \
+                   optimal-convex-partition-two y-monotone-partition-two";
+        assert_eq!(kebab_fix_wit(src), want);
+    }
+
+    #[test]
+    fn rewrites_trailing_bare_3_prophylactic() {
+        // No observed identifier today, but symmetric with `2`.
+        let src = "foo-3: func() -> bool;";
+        let want = "foo-three: func() -> bool;";
+        assert_eq!(kebab_fix_wit(src), want);
+    }
+
+    #[test]
+    fn rewrites_trailing_bare_4_prophylactic() {
+        // No observed identifier today, but symmetric with `2`.
+        let src = "foo-4: func() -> bool;";
+        let want = "foo-four: func() -> bool;";
+        assert_eq!(kebab_fix_wit(src), want);
+    }
+
+    #[test]
+    fn rewrites_mid_position_bare_digit() {
+        // Contrived but supported by the segment-split rule.
+        let src = "foo-2-bar";
+        let want = "foo-two-bar";
+        assert_eq!(kebab_fix_wit(src), want);
+    }
+
+    #[test]
+    fn leaves_multi_digit_trailing_intact() {
+        // Multi-digit tokens (SRID codes, magic numbers, EPSG identifiers)
+        // are NOT rewritten — there's no unambiguous word form for `4326`,
+        // and they should be renamed upstream to e.g. `srid-webmercator`.
+        // wit-bindgen will still reject these, but the fix is upstream, not
+        // here.
+        let src = "epsg-4326 srid-3857 mercator-42";
+        assert_eq!(kebab_fix_wit(src), src);
+    }
+
+    #[test]
+    fn leaves_bare_digit_with_no_hyphen_intact() {
+        // Standalone `2` in prose isn't a kebab segment.
+        let src = "// 2 dimensions supported\n";
+        assert_eq!(kebab_fix_wit(src), src);
+    }
+
+    #[test]
+    fn leaves_pure_digit_kebab_intact() {
+        // `1-2-3` is all digits — no lowercase-letter segment, so the
+        // guard bails out.
+        let src = "// see section 1-2-3\n";
+        assert_eq!(kebab_fix_wit(src), src);
+    }
+
+    #[test]
+    fn combines_bare_digit_and_nd_in_one_identifier() {
+        // Hypothetical mixed case: `foo-2d-bar-2` — both segments rewritten.
+        let src = "foo-2d-bar-2";
+        let want = "foo-twod-bar-two";
+        assert_eq!(kebab_fix_wit(src), want);
     }
 }
