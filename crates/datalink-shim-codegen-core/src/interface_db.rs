@@ -512,6 +512,16 @@ pub enum RetShape {
         kebab_name: String,
         cases: Vec<String>,
     },
+    /// #716: `option<enum>` return. Some(variant) → Integer with the
+    /// discriminant index; None → SQL NULL. Mirrors `Enum` on the
+    /// Some side and `OptionInt` for the null projection. Today's
+    /// surface: mobilitydb `tfloat-detect-trend -> option<trend-direction>`.
+    OptionEnum {
+        wit_module: String,
+        wit_package: String,
+        kebab_name: String,
+        cases: Vec<String>,
+    },
     /// W3.4 (#550) + W2 Phase 2 mop-up (#555) + W3.5 (#551):
     /// nested compound return marshaled as JSON TEXT. SQL callers
     /// consume via `json_each(...)` / SQLite's JSON1 ops.
@@ -629,6 +639,41 @@ pub enum JsonRetKind {
     /// these constructors and previously deferred because no scalar
     /// arm existed.
     OptionListPrimRecord(String),
+    /// #716: `option<list<X>>` for primitive X — Some(vec) →
+    /// `serde_json::to_string` on the inner `Vec<X>`; None → SQL NULL.
+    /// Today's surface (mobilitydb): the four `*-set-from-text`
+    /// constructors — `date-set-from-text -> option<list<s32>>`,
+    /// `int-set-from-text -> option<list<s64>>`,
+    /// `float-set-from-text -> option<list<f64>>`,
+    /// `text-set-from-text -> option<list<string>>`,
+    /// `tstz-set-from-text -> option<list<s64>>`.
+    OptionListPrim(ListPrimElem),
+    /// #716: `option<list<tuple<X1, X2, ...>>>` for primitive Xi —
+    /// Some(vec) → `serde_json::to_string` on the inner
+    /// `Vec<(X1, X2, ...)>` (serde renders Rust tuples as JSON
+    /// arrays); None → SQL NULL. Today's surface (mobilitydb):
+    /// `parse-geojson-linestring -> option<list<tuple<f64, f64>>>`.
+    OptionListTuplePrim(Vec<ListPrimElem>),
+    /// #716: `option<tuple<E1, E2, ...>>` where each Ei is a
+    /// primitive OR `option<primitive>`. Extends `OptionTuplePrim`
+    /// (which requires every element to be a bare primitive) so
+    /// signatures like `option<tuple<f64, f64, option<u32>>>` from
+    /// `parse-wkb-point` can wire. Serde renders `Option<X>` fields
+    /// as JSON `null` on the None side, matching SQL callers'
+    /// existing `json_extract` handling for missing values.
+    OptionTuplePrimOrOptPrim(Vec<TupleElemKind>),
+}
+
+/// #716: element kind for tuple returns that mix bare primitives
+/// with `option<primitive>` fields. Emits as one of the standard
+/// serde-rendered forms — `Some(x)` / `None` for the optional
+/// arm, direct value for the bare arm — inside the parent
+/// `Vec<(...)>` or `(...)` tuple. Used by
+/// `JsonRetKind::OptionTuplePrimOrOptPrim`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TupleElemKind {
+    Prim(ListPrimElem),
+    OptionPrim(ListPrimElem),
 }
 
 /// Diagnostic: a scalar the codegen wanted to wire but couldn't.
@@ -2194,6 +2239,24 @@ fn find_record<'a>(
         .or_else(|| records.iter().find(|r| r.kebab_name == kebab))
 }
 
+/// #716: same-kebab enum disambiguation — mirror of `find_record`.
+/// `trend-direction` is declared in BOTH `pattern-ops` and
+/// `statistics-ops` in the mobilitydb WIT (identical case list, but
+/// wit-bindgen emits two distinct Rust types). Fall through to the
+/// caller's interface first so `statistics_ops::TrendDirection` matches
+/// a `statistics-ops` function's return; otherwise fall back to any
+/// matching kebab.
+fn find_enum<'a>(
+    enums: &'a [EnumWithPackage],
+    kebab: &str,
+    caller_interface: &str,
+) -> Option<&'a EnumWithPackage> {
+    enums
+        .iter()
+        .find(|e| e.decl.kebab_name == kebab && e.decl.interface == caller_interface)
+        .or_else(|| enums.iter().find(|e| e.decl.kebab_name == kebab))
+}
+
 pub fn classify_param(
     t: &WitType,
     records: &[RecordType],
@@ -2344,7 +2407,7 @@ pub fn classify_param(
             // `pixel-type`) falls through. Check the enum registry
             // BEFORE records so an enum-named-the-same-as-a-record
             // (none in practice today) would still take this branch.
-            if let Some(en) = enums.iter().find(|e| &e.decl.kebab_name == s) {
+            if let Some(en) = find_enum(enums, s, caller_interface) {
                 let wit_module =
                     wit_parse::interface_to_rust_alias(&en.decl.interface).ok_or_else(|| {
                         format!(
@@ -2449,6 +2512,28 @@ pub fn classify_return(
                         });
                     }
                 }
+                // #716: option<tuple<...>> where some elements are
+                // `option<primitive>` (bare primitives + optional
+                // primitives mixed). serde renders Rust `Option<X>`
+                // fields as JSON `null` on the None side, so this
+                // reuses the same "encode via serde_json" template
+                // as `OptionTuplePrim`. Covers mobilitydb
+                // `parse-wkb-point -> option<tuple<f64, f64, option<u32>>>`.
+                let mixed: Option<Vec<TupleElemKind>> = elems
+                    .iter()
+                    .map(|e| match e {
+                        WitType::Option(inner) => list_prim_elem(inner)
+                            .map(TupleElemKind::OptionPrim),
+                        other => list_prim_elem(other).map(TupleElemKind::Prim),
+                    })
+                    .collect();
+                if let Some(mixed) = mixed {
+                    if !mixed.is_empty() {
+                        return Ok(RetShape::JsonText {
+                            kind: JsonRetKind::OptionTuplePrimOrOptPrim(mixed),
+                        });
+                    }
+                }
                 let parts: Vec<String> = elems.iter().map(type_label_dbg).collect();
                 return Err(format!(
                     "return type not in dispatcher alphabet: option<tuple<{}>> (tuple shape not yet wired)",
@@ -2465,6 +2550,29 @@ pub fn classify_return(
             // SQL callers can't unpack via simple JSON1 ops without
             // matching the nested shape).
             WitType::List(inner_list) => {
+                // #716: option<list<primitive>> — Vec<X> serialized via
+                // serde. Covers the mobilitydb `*-set-from-text`
+                // constructors (`date-set-from-text -> option<list<s32>>`,
+                // etc.).
+                if let Some(elem) = list_prim_elem(inner_list) {
+                    return Ok(RetShape::JsonText {
+                        kind: JsonRetKind::OptionListPrim(elem),
+                    });
+                }
+                // #716: option<list<tuple<primitive...>>> — Vec<(X1,X2,...)>
+                // serialized via serde. Covers mobilitydb
+                // `parse-geojson-linestring -> option<list<tuple<f64, f64>>>`.
+                if let WitType::Tuple(elems) = inner_list.as_ref() {
+                    let prims: Option<Vec<ListPrimElem>> =
+                        elems.iter().map(list_prim_elem).collect();
+                    if let Some(prims) = prims {
+                        if !prims.is_empty() {
+                            return Ok(RetShape::JsonText {
+                                kind: JsonRetKind::OptionListTuplePrim(prims),
+                            });
+                        }
+                    }
+                }
                 if let WitType::Unsupported(rec_kebab) = inner_list.as_ref() {
                     if let Some(rec) =
                         find_record(records, rec_kebab, caller_interface)
@@ -2488,6 +2596,26 @@ pub fn classify_return(
             // `OptionWitValueRecord` — Some(rec)→wit-value,
             // None→Null.
             WitType::Unsupported(s) => {
+                // #716: option<enum> — Some(variant) → integer
+                // discriminant; None → SQL NULL. Check enums BEFORE
+                // records because the enum registry supersedes the
+                // record registry when both would match (no overlap
+                // in the mobilitydb surface today; future-proof).
+                if let Some(en) = find_enum(enums, s, caller_interface) {
+                    let wit_module =
+                        wit_parse::interface_to_rust_alias(&en.decl.interface).ok_or_else(|| {
+                            format!(
+                                "enum '{}' lives in interface '{}' with no Rust-binding alias",
+                                s, en.decl.interface,
+                            )
+                        })?;
+                    return Ok(RetShape::OptionEnum {
+                        wit_module,
+                        wit_package: en.package.clone(),
+                        kebab_name: en.decl.kebab_name.clone(),
+                        cases: en.decl.cases.clone(),
+                    });
+                }
                 if let Some(rec) = find_record(records, s, caller_interface) {
                     let type_id_hex: String =
                         rec.type_id.iter().map(|b| format!("{:02x}", b)).collect();
@@ -2713,7 +2841,7 @@ pub fn classify_return(
             // W3.3 (#543): WIT enums surface here for the same
             // reason params do — parse_type has no Enum variant.
             // Check enums before records (no overlap today; future-proof).
-            if let Some(en) = enums.iter().find(|e| &e.decl.kebab_name == s) {
+            if let Some(en) = find_enum(enums, s, caller_interface) {
                 let wit_module =
                     wit_parse::interface_to_rust_alias(&en.decl.interface).ok_or_else(|| {
                         format!(

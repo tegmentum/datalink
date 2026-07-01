@@ -570,6 +570,33 @@ fn render_return_expr(
                  {i}}}"
             )
         }
+        // #716: option<enum> — Some → integer discriminant; None → Null.
+        RetShape::OptionEnum {
+            wit_module,
+            kebab_name,
+            cases,
+            ..
+        } => {
+            let type_pascal = kebab_to_pascal(kebab_name);
+            let mut arms = String::new();
+            for (n, case) in cases.iter().enumerate() {
+                let case_pascal = kebab_to_pascal(case);
+                arms.push_str(&format!(
+                    "{i}            {wit_module}::{type_pascal}::{case_pascal} => {n},\n"
+                ));
+            }
+            format!(
+                "{{\n\
+                 {i}    match {call_expr}{unwrap_chain} {{\n\
+                 {i}        Some(__v) => {{\n\
+                 {i}            let __disc: i64 = match __v {{\n{arms}{i}            }};\n\
+                 {i}            Ok(types::Duckvalue::Int64(__disc))\n\
+                 {i}        }}\n\
+                 {i}        None => Ok(types::Duckvalue::Null),\n\
+                 {i}    }}\n\
+                 {i}}}"
+            )
+        }
         RetShape::JsonText { kind } => match kind {
             JsonRetKind::ListListPrim(_)
             | JsonRetKind::ListTuplePrim(_)
@@ -597,7 +624,15 @@ fn render_return_expr(
             // — Some(vec) → JSON array of objects via serde; None →
             // DuckDB NULL. Today's surface: mobilitydb
             // `<date|float|int|tstz>-spanset-from-text`.
-            JsonRetKind::OptionListPrimRecord(_) => format!(
+            //
+            // #716: same template covers `OptionListPrim` (`Vec<X>`),
+            // `OptionListTuplePrim` (`Vec<(X1,X2,...)>`), and
+            // `OptionTuplePrimOrOptPrim` (tuple with `Option<X>` fields
+            // — serde renders `None` as JSON `null`).
+            JsonRetKind::OptionListPrimRecord(_)
+            | JsonRetKind::OptionListPrim(_)
+            | JsonRetKind::OptionListTuplePrim(_)
+            | JsonRetKind::OptionTuplePrimOrOptPrim(_) => format!(
                 "{{\n\
                  {i}    match {call_expr}{unwrap_chain} {{\n\
                  {i}        Some(__v) => {{\n\

@@ -614,6 +614,33 @@ fn render_ret_to_scalarvalue(
                  {i}}}"
             )
         }
+        // #716: option<enum> — Some → integer discriminant; None → Null.
+        RetShape::OptionEnum {
+            wit_module,
+            kebab_name,
+            cases,
+            ..
+        } => {
+            let type_pascal = kebab_to_pascal(kebab_name);
+            let mut arms = String::new();
+            for (n, case) in cases.iter().enumerate() {
+                let case_pascal = kebab_to_pascal(case);
+                arms.push_str(&format!(
+                    "{i}            {wit_module}::{type_pascal}::{case_pascal} => {n},\n"
+                ));
+            }
+            format!(
+                "{{\n\
+                 {i}    match {call_expr}{unwrap_chain} {{\n\
+                 {i}        Some(__v) => {{\n\
+                 {i}            let __disc: i64 = match __v {{\n{arms}{i}            }};\n\
+                 {i}            Ok(types::ScalarValue::Int64(__disc))\n\
+                 {i}        }}\n\
+                 {i}        None => Ok(types::ScalarValue::Null),\n\
+                 {i}    }}\n\
+                 {i}}}"
+            )
+        }
         RetShape::JsonText { kind } => match kind {
             JsonRetKind::ListListPrim(_)
             | JsonRetKind::ListTuplePrim(_)
@@ -643,7 +670,15 @@ fn render_ret_to_scalarvalue(
             // — Some(vec) → JSON array of objects via serde; None →
             // Datafission NULL. Today's surface: mobilitydb
             // `<date|float|int|tstz>-spanset-from-text`.
-            JsonRetKind::OptionListPrimRecord(_) => format!(
+            //
+            // #716: same template covers `OptionListPrim` (`Vec<X>`),
+            // `OptionListTuplePrim` (`Vec<(X1,X2,...)>`), and
+            // `OptionTuplePrimOrOptPrim` (tuple with `Option<X>` fields
+            // — serde renders `None` as JSON `null`).
+            JsonRetKind::OptionListPrimRecord(_)
+            | JsonRetKind::OptionListPrim(_)
+            | JsonRetKind::OptionListTuplePrim(_)
+            | JsonRetKind::OptionTuplePrimOrOptPrim(_) => format!(
                 "{{\n\
                  {i}    match {call_expr}{unwrap_chain} {{\n\
                  {i}        Some(__v) => {{\n\
@@ -815,7 +850,7 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
         | RetShape::OptionTopologyBlob => "types::LogicalType::Binary".to_string(),
         RetShape::FirstReal => "types::LogicalType::Float64".to_string(),
         RetShape::FirstText => "types::LogicalType::Utf8".to_string(),
-        RetShape::Enum { .. } => "types::LogicalType::Int64".to_string(),
+        RetShape::Enum { .. } | RetShape::OptionEnum { .. } => "types::LogicalType::Int64".to_string(),
         RetShape::JsonText { .. } => "types::LogicalType::Utf8".to_string(),
         // #677: `list<bool>` / `list<list<u8>>` batch returns
         // rendered as JSON text (symmetric with the param-side

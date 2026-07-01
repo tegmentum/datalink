@@ -211,6 +211,11 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
                 wit_module,
                 wit_package,
                 ..
+            }
+            | interface_db::RetShape::OptionEnum {
+                wit_module,
+                wit_package,
+                ..
             } => {
                 used_aliases
                     .entry(wit_module.clone())

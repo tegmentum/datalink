@@ -273,7 +273,9 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
         RetShape::FirstReal => "types::Logicaltype::Float64".to_string(),
         RetShape::FirstText => "types::Logicaltype::Text".to_string(),
         // Enum return marshals to the case-index integer.
-        RetShape::Enum { .. } => "types::Logicaltype::Int64".to_string(),
+        // #716: option<enum> mirrors on the Int64 side; the None arm
+        // is handled by the emit dispatch, not the type mapping.
+        RetShape::Enum { .. } | RetShape::OptionEnum { .. } => "types::Logicaltype::Int64".to_string(),
         // JsonText: nested compound returns rendered as JSON
         // string for SQL `json_each` consumption.
         RetShape::JsonText { .. } => "types::Logicaltype::Text".to_string(),

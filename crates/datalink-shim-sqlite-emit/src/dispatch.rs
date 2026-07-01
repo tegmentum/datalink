@@ -729,6 +729,35 @@ pub fn emit_arm_body(
                  {i}}}"
             )
         }
+        // #716: option<enum> — Some(variant) → integer discriminant;
+        // None → SQL NULL. Same case-list match as bare Enum on the
+        // Some side.
+        RetShape::OptionEnum {
+            wit_module,
+            kebab_name,
+            cases,
+            ..
+        } => {
+            let type_pascal = kebab_to_pascal(kebab_name);
+            let mut arms = String::new();
+            for (n, case) in cases.iter().enumerate() {
+                let case_pascal = kebab_to_pascal(case);
+                arms.push_str(&format!(
+                    "{i}            {wit_module}::{type_pascal}::{case_pascal} => {n},\n"
+                ));
+            }
+            format!(
+                "{{\n\
+                 {i}    match {call_expr}{unwrap_chain} {{\n\
+                 {i}        Some(__v) => {{\n\
+                 {i}            let __disc: i64 = match __v {{\n{arms}{i}            }};\n\
+                 {i}            Ok(SqlValue::Integer(__disc))\n\
+                 {i}        }}\n\
+                 {i}        None => Ok(SqlValue::Null),\n\
+                 {i}    }}\n\
+                 {i}}}"
+            )
+        }
         // W3.4 (#550) + W2 Phase 2 mop-up (#555): nested compound
         // return serialised to JSON TEXT. SQL callers unpack via
         // SQLite's `json_each(...)` / JSON1 ops.
@@ -776,7 +805,17 @@ pub fn emit_arm_body(
             // (`wit-bindgen`'s `additional_derives` supplies the
             // `Serialize` impl); None → SQL NULL. Today's surface:
             // mobilitydb `<date|float|int|tstz>-spanset-from-text`.
-            JsonRetKind::OptionListPrimRecord(_) => format!(
+            //
+            // #716: same emit template covers `OptionListPrim`
+            // (`Vec<X>`), `OptionListTuplePrim` (`Vec<(X1,X2,...)>`)
+            // and `OptionTuplePrimOrOptPrim` (`(X1, X2, Option<X3>)`
+            // etc.) — the inner value always serializes via
+            // `serde_json::to_string`, and the only difference is the
+            // upstream Rust shape that serde renders.
+            JsonRetKind::OptionListPrimRecord(_)
+            | JsonRetKind::OptionListPrim(_)
+            | JsonRetKind::OptionListTuplePrim(_)
+            | JsonRetKind::OptionTuplePrimOrOptPrim(_) => format!(
                 "{{\n\
                  {i}    match {call_expr}{unwrap_chain} {{\n\
                  {i}        Some(__v) => {{\n\
