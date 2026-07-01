@@ -2126,11 +2126,12 @@ pub fn classify_udtf_shape(
         };
         param_names.push(name);
     }
-    // #753: normalize the return type-tree so a `record geography`
-    // (mdb tgeography surface) routes through the record path
-    // instead of the postgis resource path — see `classify_param` /
+    // #753 / #754: normalize the return type-tree so a `record
+    // geography` (mdb tgeography surface) or `record geometry` (mdb
+    // tgeometry surface) routes through the record path instead of
+    // the postgis resource path — see `classify_param` /
     // `classify_return` for the parallel treatment on scalar shapes.
-    let ret_normalized = normalize_geog_record(&f.ret.inner, records, &f.interface);
+    let ret_normalized = normalize_ambiguous_records(&f.ret.inner, records, &f.interface);
     let output_row = classify_udtf_output_row(&ret_normalized, records, aliases);
     Ok(UdtfShape {
         wit_module: alias,
@@ -2311,45 +2312,97 @@ fn find_record<'a>(
         .or_else(|| records.iter().find(|r| r.kebab_name == kebab))
 }
 
-/// #753: `geography` collision — postgis declares `resource geography`
-/// (routed via `WitType::Geography` → resource-style dispatch:
-/// `.as_wkb()` for return, `geog_from_wkb` for param). mobilitydb-wasm
-/// (#739) declares `record geography { srid, kind, point, wkb }` in
-/// `tgeography-ops`, so the same bare kebab must instead marshal via
-/// the wit-value record path (`ret_to_witvalue_geography` /
-/// `parse_wit_value_geography`) — the record has no `as_wkb()` method
-/// and the postgis-only `geog_from_wkb` helper isn't emitted for the
-/// mdb bridge.
+/// #753 / #754: resource-vs-record kebab collisions.
 ///
-/// `wit_parse::parse_type` eagerly promotes the bare kebab `"geography"`
-/// to `WitType::Geography { .. }` without registry access, so both
-/// shim styles arrive here as the same variant. Normalize the type
-/// tree: when the caller_interface's record registry defines a
-/// `geography` record, rewrite `WitType::Geography` down to
-/// `WitType::Unsupported("geography")` so the downstream Unsupported
-/// arms route it through `find_record` → WitValueRecord (same
-/// treatment as every other record-typed param/return).
+/// `wit_parse::parse_type` eagerly promotes a handful of bare kebabs
+/// (`"geometry"`, `"geography"`, ...) to postgis-style *resource*
+/// variants (`WitType::Geometry`, `WitType::Geography`) without
+/// consulting the record registry. That's the right call for
+/// postgis-* bridges — the resource form routes through the
+/// `.as_wkb()` / `geom_from_wkb` / `geog_from_wkb` dispatch shape.
 ///
-/// The walk covers `Option<Geography>`, `List<Geography>`, and
-/// `Tuple<..., Geography, ...>` so every context that classifies
-/// through a nested geography sees the record path uniformly.
-fn normalize_geog_record(t: &WitType, records: &[RecordType], caller_interface: &str) -> WitType {
-    if find_record(records, "geography", caller_interface).is_none() {
+/// mobilitydb-wasm shims collide on the same bare kebabs:
+///   - #753 (mdb #739): `record geography { srid, kind, point, wkb }`
+///     in `tgeography-ops` — WKB-carrying record.
+///   - #754 (mdb #740): `record geometry { srid, kind, point, coords,
+///     rings }` in `tgeometry-ops` — STRUCTURAL record (no `wkb` field;
+///     point / coords / rings carry the shape).
+///
+/// The record has no `.as_wkb()` method and the postgis-only
+/// `geom_from_wkb` / `geog_from_wkb` helpers aren't emitted for the
+/// mdb bridge — so classifying via the resource path leaves the
+/// codegen with dangling method + function references.
+///
+/// Fix: when the caller_interface's record registry defines a same-
+/// kebab record, rewrite the resource variant down to
+/// `WitType::Unsupported(kebab)` so the downstream Unsupported arms
+/// route through `find_record` → WitValueRecord (same treatment as
+/// every other record-typed param/return). The per-record codec
+/// helpers (`arg_witvalue_<snake>` / `ret_to_witvalue_<snake>`) are
+/// ciborium-based and structure-agnostic, so they cover both the
+/// wkb-carrying (#753) and structural (#754) field layouts without
+/// per-record hand-emitted code.
+///
+/// The `list<geometry>` return shape has its own eager promotion
+/// (`WitType::ListGeomOwned`) — rewrite it to
+/// `List<Unsupported("geometry")>` so `RetShape::FirstWitValueRecord`
+/// picks it up (mobilitydb-wasm `tgeometry-values` return).
+///
+/// The walk covers `Option<T>`, `List<T>`, `Result<Ok, Err>` and
+/// `Tuple<..., T, ...>` so every nested context sees the record path
+/// uniformly. Postgis stays on the resource path — `find_record`
+/// returns `None` when no matching record exists, so the walk is a
+/// no-op for postgis-sqlink-bridge / postgis-duckdb-bridge /
+/// postgis-datafission regen.
+///
+/// Same-name collisions on other postgis resources (`raster`,
+/// `topology`) aren't triggered by any mdb WIT today; they'd fall
+/// through the existing branch unchanged. To extend, add another
+/// `WitType::Raster { .. } if has_raster => ..` arm.
+fn normalize_ambiguous_records(
+    t: &WitType,
+    records: &[RecordType],
+    caller_interface: &str,
+) -> WitType {
+    let has_geog = find_record(records, "geography", caller_interface).is_some();
+    let has_geom = find_record(records, "geometry", caller_interface).is_some();
+    if !has_geog && !has_geom {
         return t.clone();
     }
-    fn walk(t: &WitType) -> WitType {
+    fn walk(t: &WitType, has_geog: bool, has_geom: bool) -> WitType {
         match t {
-            WitType::Geography { .. } => WitType::Unsupported("geography".to_string()),
-            WitType::Option(inner) => WitType::Option(Box::new(walk(inner))),
-            WitType::List(inner) => WitType::List(Box::new(walk(inner))),
-            WitType::Result(ok, err) => {
-                WitType::Result(Box::new(walk(ok)), Box::new(walk(err)))
+            WitType::Geography { .. } if has_geog => {
+                WitType::Unsupported("geography".to_string())
             }
-            WitType::Tuple(elems) => WitType::Tuple(elems.iter().map(walk).collect()),
+            WitType::Geometry { .. } if has_geom => {
+                WitType::Unsupported("geometry".to_string())
+            }
+            // `list<geometry>` is eagerly promoted to `ListGeomOwned`
+            // by `wit_parse::parse_type`; unfold it here so
+            // `RetShape::FirstWitValueRecord` / `ParamShape::ListRecord`
+            // routing catches it via the standard `List<Unsupported>`
+            // classification path.
+            WitType::ListGeomOwned if has_geom => WitType::List(Box::new(
+                WitType::Unsupported("geometry".to_string()),
+            )),
+            WitType::ListGeomBorrow if has_geom => WitType::List(Box::new(
+                WitType::Unsupported("geometry".to_string()),
+            )),
+            WitType::Option(inner) => {
+                WitType::Option(Box::new(walk(inner, has_geog, has_geom)))
+            }
+            WitType::List(inner) => WitType::List(Box::new(walk(inner, has_geog, has_geom))),
+            WitType::Result(ok, err) => WitType::Result(
+                Box::new(walk(ok, has_geog, has_geom)),
+                Box::new(walk(err, has_geog, has_geom)),
+            ),
+            WitType::Tuple(elems) => WitType::Tuple(
+                elems.iter().map(|e| walk(e, has_geog, has_geom)).collect(),
+            ),
             other => other.clone(),
         }
     }
-    walk(t)
+    walk(t, has_geog, has_geom)
 }
 
 /// #716: same-kebab enum disambiguation — mirror of `find_record`.
@@ -2376,11 +2429,12 @@ pub fn classify_param(
     enums: &[EnumWithPackage],
     caller_interface: &str,
 ) -> Result<ParamShape, String> {
-    // #753: rewrite `geography` from resource-form (`WitType::Geography`)
-    // to record-form (`WitType::Unsupported("geography")`) when the
-    // caller's package declares a `record geography`. See
-    // `normalize_geog_record` for the disambiguation rationale.
-    let normalized = normalize_geog_record(t, records, caller_interface);
+    // #753 / #754: rewrite same-kebab collisions from resource-form
+    // (`WitType::Geography` / `WitType::Geometry`) to record-form
+    // (`WitType::Unsupported(kebab)`) when the caller's package
+    // declares a same-name record. See `normalize_ambiguous_records`
+    // for the disambiguation rationale.
+    let normalized = normalize_ambiguous_records(t, records, caller_interface);
     let t = &normalized;
     Ok(match t {
         WitType::Geometry { .. } => ParamShape::Geom,
@@ -2606,12 +2660,13 @@ pub fn classify_return(
     enums: &[EnumWithPackage],
     caller_interface: &str,
 ) -> Result<RetShape, String> {
-    // #753: rewrite `geography` from resource-form to record-form when
-    // the caller's package declares a `record geography`. See
-    // `normalize_geog_record` for rationale. Applied to `r.inner`
-    // before every downstream match so bare / `option<>` / `list<>`
-    // wrappers all see the record-path routing.
-    let inner_normalized = normalize_geog_record(&r.inner, records, caller_interface);
+    // #753 / #754: rewrite same-kebab collisions (`geography`,
+    // `geometry`) from resource-form to record-form when the caller's
+    // package declares a same-name record. See
+    // `normalize_ambiguous_records` for rationale. Applied to
+    // `r.inner` before every downstream match so bare / `option<>` /
+    // `list<>` wrappers all see the record-path routing.
+    let inner_normalized = normalize_ambiguous_records(&r.inner, records, caller_interface);
     // #690: `result<_, E>` (unit OK) — parsed as
     // `WitType::Unsupported("_")` by `wit_parse::parse_type`. Map to
     // `RetShape::Unit` BEFORE the generic `Unsupported(_)` arm so
@@ -3842,7 +3897,7 @@ mod geog_record_tests {
     //! `record geography` (mobilitydb tgeography surface), classifiers
     //! must route bare / optional geography through the wit-value
     //! record path rather than the postgis resource path. Without
-    //! `normalize_geog_record`, `wit_parse::parse_type` eagerly
+    //! `normalize_ambiguous_records`, `wit_parse::parse_type` eagerly
     //! promotes the kebab to `WitType::Geography` and the classifier
     //! emits `.as_wkb()` + `geog_from_wkb(...)` — both undefined for
     //! the mdb record shape.
@@ -3935,5 +3990,157 @@ mod geog_record_tests {
         };
         let shape = classify_return(&r, &records, &enums, "postgis-scalars").unwrap();
         assert!(matches!(shape, RetShape::GeomBlob), "expected GeomBlob, got {shape:?}");
+    }
+}
+
+#[cfg(test)]
+mod geom_record_tests {
+    //! #754 regression coverage: mirror of `geog_record_tests` for the
+    //! `geometry` kebab collision — postgis `resource geometry`
+    //! (routed via `WitType::Geometry` → `.as_wkb()` /
+    //! `geom_from_wkb`) vs. mobilitydb-wasm `record geometry { srid,
+    //! kind, point, coords, rings }` in `tgeometry-ops` (mdb #740).
+    //!
+    //! The mdb record uses STRUCTURAL encoding (point / coords /
+    //! rings — no `wkb` field), so the postgis resource-shape
+    //! dispatch has neither the method nor the helper needed to
+    //! marshal it. Without `normalize_ambiguous_records`,
+    //! `wit_parse::parse_type` eagerly promotes the bare kebab to
+    //! `WitType::Geometry` and the classifier emits `.as_wkb()` +
+    //! `geom_from_wkb(...)`.
+    //!
+    //! Bonus coverage: `list<geometry>` (parsed as
+    //! `WitType::ListGeomOwned`) must also normalize when the record
+    //! is present — mobilitydb `tgeometry-values` returns
+    //! `list<geometry>` and needs `RetShape::FirstWitValueRecord`
+    //! rather than the postgis `FirstGeomBlob`.
+    use super::*;
+    use crate::record_registry::RecordType;
+    use crate::wit_parse::{WitRet, WitType};
+
+    fn make_geom_record() -> RecordType {
+        RecordType {
+            package: "mobilitydb:temporal".to_string(),
+            package_version: "0.1.0".to_string(),
+            interface: "tgeometry-ops".to_string(),
+            kebab_name: "geometry".to_string(),
+            fields: vec![
+                ("srid".to_string(), "s32".to_string()),
+                ("kind".to_string(), "geometry-kind".to_string()),
+                ("point".to_string(), "option<geom-point>".to_string()),
+                ("coords".to_string(), "list<geom-point>".to_string()),
+                ("rings".to_string(), "list<list<geom-point>>".to_string()),
+            ],
+            type_id: [0u8; 32],
+            symbolic_name: "mobilitydb:temporal@0.1.0/tgeometry-ops/geometry".to_string(),
+            is_copy: false,
+            direct: true,
+            kebab_collides_in_pkg: false,
+        }
+    }
+
+    #[test]
+    fn param_geometry_with_record_routes_to_witvalue() {
+        let records = vec![make_geom_record()];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let t = WitType::Geometry { borrowed: false };
+        let shape = classify_param(&t, &records, &enums, "tgeometry-ops").unwrap();
+        assert!(
+            matches!(shape, ParamShape::WitValueRecord { .. }),
+            "expected WitValueRecord, got {shape:?}",
+        );
+    }
+
+    #[test]
+    fn param_geometry_without_record_stays_resource() {
+        let records: Vec<RecordType> = vec![];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let t = WitType::Geometry { borrowed: false };
+        let shape = classify_param(&t, &records, &enums, "postgis-scalars").unwrap();
+        assert!(matches!(shape, ParamShape::Geom), "expected Geom, got {shape:?}");
+    }
+
+    #[test]
+    fn return_geometry_with_record_routes_to_witvalue() {
+        let records = vec![make_geom_record()];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let r = WitRet {
+            inner: WitType::Geometry { borrowed: false },
+            fallible: false,
+            error_ty: None,
+        };
+        let shape = classify_return(&r, &records, &enums, "tgeometry-ops").unwrap();
+        assert!(
+            matches!(shape, RetShape::WitValueRecord { .. }),
+            "expected WitValueRecord, got {shape:?}",
+        );
+    }
+
+    #[test]
+    fn return_option_geometry_with_record_routes_to_witvalue() {
+        let records = vec![make_geom_record()];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let r = WitRet {
+            inner: WitType::Option(Box::new(WitType::Geometry { borrowed: false })),
+            fallible: false,
+            error_ty: None,
+        };
+        let shape = classify_return(&r, &records, &enums, "tgeometry-ops").unwrap();
+        assert!(
+            matches!(shape, RetShape::OptionWitValueRecord { .. }),
+            "expected OptionWitValueRecord, got {shape:?}",
+        );
+    }
+
+    #[test]
+    fn return_list_geometry_with_record_routes_to_witvalue() {
+        // #754: `tgeometry-values -> list<geometry>` — parsed as
+        // `WitType::ListGeomOwned` by `wit_parse::parse_type`. Must
+        // normalize to `List<Unsupported("geometry")>` so
+        // `RetShape::FirstWitValueRecord` picks it up.
+        let records = vec![make_geom_record()];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let r = WitRet {
+            inner: WitType::ListGeomOwned,
+            fallible: false,
+            error_ty: None,
+        };
+        let shape = classify_return(&r, &records, &enums, "tgeometry-ops").unwrap();
+        assert!(
+            matches!(shape, RetShape::FirstWitValueRecord { .. }),
+            "expected FirstWitValueRecord, got {shape:?}",
+        );
+    }
+
+    #[test]
+    fn return_geometry_without_record_stays_resource() {
+        let records: Vec<RecordType> = vec![];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let r = WitRet {
+            inner: WitType::Geometry { borrowed: false },
+            fallible: false,
+            error_ty: None,
+        };
+        let shape = classify_return(&r, &records, &enums, "postgis-scalars").unwrap();
+        assert!(matches!(shape, RetShape::GeomBlob), "expected GeomBlob, got {shape:?}");
+    }
+
+    #[test]
+    fn return_list_geometry_without_record_stays_resource() {
+        // No record registered → normalization is a no-op and the
+        // postgis-style `FirstGeomBlob` shape drives dispatch (as in
+        // `postgis-sqlink-bridge`).
+        let records: Vec<RecordType> = vec![];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let r = WitRet {
+            inner: WitType::ListGeomOwned,
+            fallible: false,
+            error_ty: None,
+        };
+        let shape = classify_return(&r, &records, &enums, "postgis-scalars").unwrap();
+        assert!(
+            matches!(shape, RetShape::FirstGeomBlob),
+            "expected FirstGeomBlob, got {shape:?}",
+        );
     }
 }
