@@ -2018,7 +2018,11 @@ fn render_wit_value_helpers(records: &[RecordType]) -> String {
          // round-trips UPSTREAM → JSON → Complex carrier.\n",
     );
     for r in records {
-        let snake = r.snake_name();
+        // #710: `helper_snake` disambiguates when two records in the
+        // same package share a kebab (mobilitydb's `stbox3d` lives in
+        // both `stbox-ops` and `stbox3d-ops` with different field
+        // orders). Non-colliding kebabs fall back to `snake_name()`.
+        let snake = r.helper_snake();
         let pascal = pascal_case(&r.kebab_name);
         let upstream_iface_snake = sanitize_module(&r.interface);
         let (pkg_ns, pkg_name) = split_pkg(&r.package);

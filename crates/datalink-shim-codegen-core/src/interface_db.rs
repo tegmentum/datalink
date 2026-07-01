@@ -165,6 +165,13 @@ pub enum ParamShape {
         /// True when wit-bindgen passes the upstream record by
         /// value (record is Copy). False → pass by `&`.
         upstream_by_value: bool,
+        /// #710: `arg_witvalue_*` / `parse_json_list_record_*` /
+        /// `ret_to_witvalue_*` suffix. Same as `kebab_name.replace('-','_')`
+        /// unless the same kebab collides across interfaces in one
+        /// package (mobilitydb's `stbox3d`), in which case the
+        /// interface's snake form is prepended so the two variants
+        /// get distinct wrapper functions.
+        helper_snake: String,
     },
     /// W3.3 (#543): WIT `enum` param marshaled from `SqlValue::Integer`.
     /// SQL integer N maps to the Nth enum case in declaration order.
@@ -211,6 +218,8 @@ pub enum ParamShape {
         wit_interface: String,
         wit_package: String,
         wit_package_version: String,
+        /// #710: helper-function suffix — see `WitValueRecord::helper_snake`.
+        helper_snake: String,
     },
     /// #674: `list<list<u8>>` param — batched WKB blobs surfaced
     /// by postgis's `st_*_batch` family. SQL passes the value as
@@ -449,6 +458,8 @@ pub enum RetShape {
         /// Hex-formatted 32-byte sha256 over the canonical record
         /// shape — the host's match key for typed-value-binding.
         type_id_hex: String,
+        /// #710: helper-function suffix — see `ParamShape::WitValueRecord::helper_snake`.
+        helper_snake: String,
     },
     /// Phase F (#522): `option<bool>` return. Some(true)/Some(false)
     /// → SqlValue::Integer; None → SqlValue::Null.
@@ -463,6 +474,8 @@ pub enum RetShape {
         wit_package_version: String,
         symbolic_name: String,
         type_id_hex: String,
+        /// #710: helper-function suffix — see `ParamShape::WitValueRecord::helper_snake`.
+        helper_snake: String,
     },
     /// Phase F (#522): `list<record>` return projected to the
     /// scalar's first element. `sql-value` has no native list
@@ -477,6 +490,8 @@ pub enum RetShape {
         wit_package_version: String,
         symbolic_name: String,
         type_id_hex: String,
+        /// #710: helper-function suffix — see `ParamShape::WitValueRecord::helper_snake`.
+        helper_snake: String,
     },
     /// Phase F (#522): `list<s64>` / `list<u32>` / `list<s32>` /
     /// `list<u64>` projected to the first integer in scalar
@@ -1347,6 +1362,8 @@ pub struct RecordSpec {
     pub wit_package_version: String,
     pub symbolic_name: String,
     pub type_id_hex: String,
+    /// #710: helper-function suffix — see `ParamShape::WitValueRecord::helper_snake`.
+    pub helper_snake: String,
 }
 
 /// Same as `build_registry` for UDTFs (table_functions).
@@ -1673,7 +1690,7 @@ pub fn classify_shape(
 
     // Classify each parameter.
     for (i, p) in f.params.iter().enumerate() {
-        let ps = classify_param(&p.ty, records, enums).map_err(|why| {
+        let ps = classify_param(&p.ty, records, enums, &f.interface).map_err(|why| {
             format!(
                 "param #{i} ({:?}: {:?}) not wired: {why}",
                 p.name, p.ty
@@ -1682,7 +1699,7 @@ pub fn classify_shape(
         params.push(ps);
     }
 
-    let ret = classify_return(&f.ret, records, enums)?;
+    let ret = classify_return(&f.ret, records, enums, &f.interface)?;
 
     Ok(DispatchShape {
         wit_module: alias,
@@ -1755,7 +1772,7 @@ pub fn classify_aggregate_shape(
     let input_spec: Option<RecordSpec> = match first {
         WitType::List(inner) => match inner.as_ref() {
             WitType::Unsupported(name) => {
-                if let Some(rec) = records.iter().find(|r| &r.kebab_name == name) {
+                if let Some(rec) = find_record(records, name, &f.interface) {
                     let type_id_hex: String =
                         rec.type_id.iter().map(|b| format!("{:02x}", b)).collect();
                     Some(RecordSpec {
@@ -1765,6 +1782,7 @@ pub fn classify_aggregate_shape(
                         wit_package_version: rec.package_version.clone(),
                         symbolic_name: rec.symbolic_name.clone(),
                         type_id_hex,
+                        helper_snake: rec.helper_snake(),
                     })
                 } else {
                     return Err(format!(
@@ -1797,12 +1815,12 @@ pub fn classify_aggregate_shape(
     // Subsequent params (st-cluster-within takes f64 distance, etc.)
     let mut extra = Vec::new();
     for (i, p) in f.params.iter().enumerate().skip(1) {
-        extra.push(classify_param(&p.ty, records, enums).map_err(|why| {
+        extra.push(classify_param(&p.ty, records, enums, &f.interface).map_err(|why| {
             format!("aggregate extra param #{i}: {why}")
         })?);
     }
 
-    let ret = classify_return(&f.ret, records, enums)?;
+    let ret = classify_return(&f.ret, records, enums, &f.interface)?;
 
     // #607 Phase 0 + #612 (OQ1): when the first param is a
     // `list<record>` (Record accumulator path), resolve the output
@@ -1837,7 +1855,7 @@ pub fn classify_aggregate_shape(
             if let Some(out_kebab) = output_kebab {
                 let output = if out_kebab == input.kebab_name.as_str() {
                     input.clone()
-                } else if let Some(rec) = records.iter().find(|r| r.kebab_name == out_kebab) {
+                } else if let Some(rec) = find_record(records, out_kebab, &f.interface) {
                     let type_id_hex: String =
                         rec.type_id.iter().map(|b| format!("{:02x}", b)).collect();
                     RecordSpec {
@@ -1847,6 +1865,7 @@ pub fn classify_aggregate_shape(
                         wit_package_version: rec.package_version.clone(),
                         symbolic_name: rec.symbolic_name.clone(),
                         type_id_hex,
+                        helper_snake: rec.helper_snake(),
                     }
                 } else {
                     return Err(format!(
@@ -1982,7 +2001,7 @@ pub fn classify_udtf_shape(
     let mut params = Vec::with_capacity(f.params.len());
     let mut param_names = Vec::with_capacity(f.params.len());
     for (i, p) in f.params.iter().enumerate() {
-        params.push(classify_param(&p.ty, records, enums).map_err(|why| {
+        params.push(classify_param(&p.ty, records, enums, &f.interface).map_err(|why| {
             format!("UDTF param #{i}: {why}")
         })?);
         // Fall back to `arg{N}` if the WIT didn't carry a name
@@ -2153,10 +2172,33 @@ pub fn classify_list_inner_row(
 ///           symbolic_name: "<symbolic>".into(),
 ///       }))
 ///   }
+/// #710: look up a record by kebab, preferring the one declared in
+/// the caller's own interface. Two shims (mobilitydb-temporal today,
+/// potentially others) declare records with the same kebab in two
+/// different interfaces (`stbox3d` lives in both `stbox-ops` and
+/// `stbox3d-ops`, with different field orders). Each function
+/// references the record from its own interface's scope, so the
+/// classifier must prefer the local-to-caller record over any
+/// cross-interface one that happens to share the kebab.
+///
+/// Fallback order: same-interface, then any interface. When there's
+/// no collision, this reduces to the pre-#710 `iter().find` lookup.
+fn find_record<'a>(
+    records: &'a [RecordType],
+    kebab: &str,
+    caller_interface: &str,
+) -> Option<&'a RecordType> {
+    records
+        .iter()
+        .find(|r| r.kebab_name == kebab && r.interface == caller_interface)
+        .or_else(|| records.iter().find(|r| r.kebab_name == kebab))
+}
+
 pub fn classify_param(
     t: &WitType,
     records: &[RecordType],
     enums: &[EnumWithPackage],
+    caller_interface: &str,
 ) -> Result<ParamShape, String> {
     Ok(match t {
         WitType::Geometry { .. } => ParamShape::Geom,
@@ -2260,12 +2302,13 @@ pub fn classify_param(
             // derives via the bindgen invocation's
             // additional_derives).
             if let WitType::Unsupported(name) = inner.as_ref() {
-                if let Some(rec) = records.iter().find(|r| &r.kebab_name == name) {
+                if let Some(rec) = find_record(records, name, caller_interface) {
                     return Ok(ParamShape::ListRecord {
                         kebab_name: rec.kebab_name.clone(),
                         wit_interface: rec.interface.clone(),
                         wit_package: rec.package.clone(),
                         wit_package_version: rec.package_version.clone(),
+                        helper_snake: rec.helper_snake(),
                     });
                 }
             }
@@ -2324,13 +2367,14 @@ pub fn classify_param(
             // ends are structurally identical so the round-trip is
             // a strict re-encode/re-decode against the same byte
             // shape.
-            if let Some(rec) = records.iter().find(|r| &r.kebab_name == s) {
+            if let Some(rec) = find_record(records, s, caller_interface) {
                 return Ok(ParamShape::WitValueRecord {
                     kebab_name: rec.kebab_name.clone(),
                     wit_interface: rec.interface.clone(),
                     wit_package: rec.package.clone(),
                     wit_package_version: rec.package_version.clone(),
                     upstream_by_value: rec.is_copy,
+                    helper_snake: rec.helper_snake(),
                 });
             }
             return Err(format!("param type not in dispatcher alphabet: {s}"));
@@ -2342,6 +2386,7 @@ pub fn classify_return(
     r: &WitRet,
     records: &[RecordType],
     enums: &[EnumWithPackage],
+    caller_interface: &str,
 ) -> Result<RetShape, String> {
     // #690: `result<_, E>` (unit OK) — parsed as
     // `WitType::Unsupported("_")` by `wit_parse::parse_type`. Map to
@@ -2422,7 +2467,7 @@ pub fn classify_return(
             WitType::List(inner_list) => {
                 if let WitType::Unsupported(rec_kebab) = inner_list.as_ref() {
                     if let Some(rec) =
-                        records.iter().find(|r| &r.kebab_name == rec_kebab)
+                        find_record(records, rec_kebab, caller_interface)
                     {
                         if record_fields_all_primitive(rec) {
                             return Ok(RetShape::JsonText {
@@ -2443,7 +2488,7 @@ pub fn classify_return(
             // `OptionWitValueRecord` — Some(rec)→wit-value,
             // None→Null.
             WitType::Unsupported(s) => {
-                if let Some(rec) = records.iter().find(|r| &r.kebab_name == s) {
+                if let Some(rec) = find_record(records, s, caller_interface) {
                     let type_id_hex: String =
                         rec.type_id.iter().map(|b| format!("{:02x}", b)).collect();
                     return Ok(RetShape::OptionWitValueRecord {
@@ -2453,6 +2498,7 @@ pub fn classify_return(
                         wit_package_version: rec.package_version.clone(),
                         symbolic_name: rec.symbolic_name.clone(),
                         type_id_hex,
+                        helper_snake: rec.helper_snake(),
                     });
                 }
                 return Err(format!(
@@ -2474,7 +2520,7 @@ pub fn classify_return(
         // on the table-function path.
         WitType::List(inner) => match inner.as_ref() {
             WitType::Unsupported(s) => {
-                if let Some(rec) = records.iter().find(|r| &r.kebab_name == s) {
+                if let Some(rec) = find_record(records, s, caller_interface) {
                     let type_id_hex: String =
                         rec.type_id.iter().map(|b| format!("{:02x}", b)).collect();
                     return Ok(RetShape::FirstWitValueRecord {
@@ -2484,6 +2530,7 @@ pub fn classify_return(
                         wit_package_version: rec.package_version.clone(),
                         symbolic_name: rec.symbolic_name.clone(),
                         type_id_hex,
+                        helper_snake: rec.helper_snake(),
                     });
                 }
                 return Err(format!(
@@ -2682,7 +2729,7 @@ pub fn classify_return(
                 });
             }
             // Phase E: record-typed return — wrap as wit-value.
-            if let Some(rec) = records.iter().find(|r| &r.kebab_name == s) {
+            if let Some(rec) = find_record(records, s, caller_interface) {
                 let type_id_hex: String = rec
                     .type_id
                     .iter()
@@ -2695,6 +2742,7 @@ pub fn classify_return(
                     wit_package_version: rec.package_version.clone(),
                     symbolic_name: rec.symbolic_name.clone(),
                     type_id_hex,
+                    helper_snake: rec.helper_snake(),
                 });
             }
             return Err(format!("return type not in dispatcher alphabet: {s}"));

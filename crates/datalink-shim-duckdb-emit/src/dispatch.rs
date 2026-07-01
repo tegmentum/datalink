@@ -195,8 +195,8 @@ pub fn emit_scalar_arm_body(
                 ));
                 call_args.push(format!("arg{idx}"));
             }
-            ParamShape::ListRecord { kebab_name, .. } => {
-                let snake = kebab_name.replace('-', "_");
+            ParamShape::ListRecord { helper_snake, .. } => {
+                let snake = helper_snake;
                 s.push_str(&format!(
                     "{i}let arg{idx} = parse_json_list_record_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
                 ));
@@ -255,11 +255,11 @@ pub fn emit_scalar_arm_body(
                 call_args.push(format!("&arg{idx}"));
             }
             ParamShape::WitValueRecord {
-                kebab_name,
+                helper_snake,
                 upstream_by_value,
                 ..
             } => {
-                let snake = kebab_name.replace('-', "_");
+                let snake = helper_snake;
                 s.push_str(&format!(
                     "{i}let arg{idx} = arg_witvalue_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
                 ));
@@ -652,15 +652,15 @@ fn render_return_expr(
                  {i}}}"
             )
         }
-        RetShape::WitValueRecord { kebab_name, .. } => {
-            let snake = kebab_name.replace('-', "_");
+        RetShape::WitValueRecord { helper_snake, .. } => {
+            let snake = helper_snake;
             // ret_to_witvalue_<snake> already returns
             // `Result<Duckvalue, Duckerror>`, so emit it bare (no
             // outer `Ok(...)` wrap).
             format!("ret_to_witvalue_{snake}({call_expr}{unwrap_chain})")
         }
-        RetShape::OptionWitValueRecord { kebab_name, .. } => {
-            let snake = kebab_name.replace('-', "_");
+        RetShape::OptionWitValueRecord { helper_snake, .. } => {
+            let snake = helper_snake;
             format!(
                 "match {call_expr}{unwrap_chain} {{\n\
                  {i}    Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
@@ -668,8 +668,8 @@ fn render_return_expr(
                  {i}}}"
             )
         }
-        RetShape::FirstWitValueRecord { kebab_name, .. } => {
-            let snake = kebab_name.replace('-', "_");
+        RetShape::FirstWitValueRecord { helper_snake, .. } => {
+            let snake = helper_snake;
             format!(
                 "{{\n\
                  {i}    let __r = {call_expr}{unwrap_chain};\n\
@@ -1098,8 +1098,8 @@ fn emit_aggregate_arm_body_record(
     let AccKind::Record { input, output } = &shape.accumulator_kind else {
         unreachable!("invariant: caller checks AccKind::Record");
     };
-    let in_snake = input.kebab_name.replace('-', "_");
-    let out_snake = output.kebab_name.replace('-', "_");
+    let in_snake = input.helper_snake.clone();
+    let out_snake = output.helper_snake.clone();
 
     let mut s = String::new();
 
@@ -1158,7 +1158,7 @@ fn emit_aggregate_arm_body_record_to_scalar(
         unreachable!("invariant: caller checks AccKind::RecordToScalar");
     };
     let optional = *optional;
-    let in_snake = input.kebab_name.replace('-', "_");
+    let in_snake = input.helper_snake.clone();
 
     let mut s = String::new();
 
@@ -1339,7 +1339,7 @@ fn emit_aggregate_arm_body_record_to_tuple(
         unreachable!("invariant: caller checks AccKind::RecordToTuple");
     };
     let optional = *optional;
-    let in_snake = input.kebab_name.replace('-', "_");
+    let in_snake = input.helper_snake.clone();
 
     let mut s = String::new();
 
@@ -1736,8 +1736,8 @@ fn emit_udtf_param_marshal(
             ParamShape::OptionNone => {
                 call_args.push("None".to_string());
             }
-            ParamShape::WitValueRecord { kebab_name, .. } => {
-                let snake = kebab_name.replace('-', "_");
+            ParamShape::WitValueRecord { helper_snake, .. } => {
+                let snake = helper_snake;
                 s.push_str(&format!(
                     "{i}let arg{idx} = arg_witvalue_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
                 ));

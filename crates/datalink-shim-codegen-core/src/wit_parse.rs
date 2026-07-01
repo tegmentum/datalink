@@ -1678,6 +1678,19 @@ pub fn snake_to_underscored(s: &str) -> String {
 /// used inside the emitted `lib.rs`. Hand-curated postgis-bridge
 /// aliases take precedence; everything else falls back to the
 /// kebab → snake_case conversion (Phase D).
+///
+/// #710: reserved-name interfaces (`types`, `runtime`, `catalog`,
+/// `column-types`, `callback-dispatch`, `guest`) collide with the
+/// DuckDB-extension imports emitted at the top of every bridge
+/// (`use bindings::duckdb::extension::{types, runtime, catalog,
+/// column_types};` + the two `exports::...::{callback_dispatch,
+/// guest}` re-exports). A shim WIT that happens to name one of
+/// those interfaces (e.g. mobilitydb-temporal has `interface
+/// types`) would produce an E0252 duplicate-import if we let the
+/// algorithmic fallback stamp the same identifier. Prefix the
+/// alias with `shim_` to disambiguate; the emitter still writes
+/// `use bindings::<pkg>::<iface> as shim_<iface>;`, which
+/// `alias_to_wit_module_ident` reverses.
 pub fn interface_to_rust_alias(interface: &str) -> Option<String> {
     if let Some(&s) = POSTGIS_INTERFACE_ALIASES
         .iter()
@@ -1692,13 +1705,22 @@ pub fn interface_to_rust_alias(interface: &str) -> Option<String> {
     if !is_kebab_ident(interface) {
         return None;
     }
-    Some(interface.replace('-', "_"))
+    let snake = interface.replace('-', "_");
+    if is_reserved_bridge_module(&snake) {
+        return Some(format!("shim_{snake}"));
+    }
+    Some(snake)
 }
 
 /// Inverse of `interface_to_rust_alias`. Hand-curated postgis-bridge
 /// aliases reverse-map to the corresponding postgis_* module ident;
 /// everything else assumes the alias IS the module ident (the
 /// algorithmic fallback above is its own inverse). Phase D.
+///
+/// #710: `shim_<name>` aliases produced for reserved-name
+/// interfaces reverse back to the raw interface ident so the
+/// generated `use bindings::<pkg>::<iface> as shim_<iface>;` line
+/// still names the real wit-bindgen module.
 pub fn alias_to_wit_module_ident(alias: &str) -> Option<String> {
     if let Some(&s) = POSTGIS_ALIAS_TO_MODULE
         .iter()
@@ -1707,12 +1729,28 @@ pub fn alias_to_wit_module_ident(alias: &str) -> Option<String> {
     {
         return Some(s.to_string());
     }
+    if let Some(stripped) = alias.strip_prefix("shim_") {
+        if is_reserved_bridge_module(stripped) {
+            return Some(stripped.to_string());
+        }
+    }
     // Algorithmic fallback: the alias IS the module ident (both
     // are snake_case).
     if !is_snake_ident(alias) {
         return None;
     }
     Some(alias.to_string())
+}
+
+/// #710: interface names whose snake-case form collides with a
+/// module the DuckDB bridge prelude unconditionally imports. Any
+/// shim WIT that reuses one of these names must be aliased so the
+/// generated `use bindings::...` line doesn't shadow the prelude.
+fn is_reserved_bridge_module(snake: &str) -> bool {
+    matches!(
+        snake,
+        "types" | "runtime" | "catalog" | "column_types" | "callback_dispatch" | "guest"
+    )
 }
 
 fn is_snake_ident(s: &str) -> bool {

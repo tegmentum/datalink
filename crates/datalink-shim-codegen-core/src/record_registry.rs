@@ -62,6 +62,14 @@ pub struct RecordType {
     /// the LOCAL doesn't clone cross-package types and the WIT
     /// would fail to typecheck.
     pub direct: bool,
+    /// #710: true when at least one OTHER record in the same
+    /// package shares this record's kebab_name (e.g. mobilitydb
+    /// declares `record stbox3d` in both `stbox-ops` and
+    /// `stbox3d-ops`). Downstream helper naming (`arg_witvalue_*`
+    /// / `ret_to_witvalue_*` / `parse_json_list_record_*`) prepends
+    /// the snake-case interface name so the two variants get
+    /// distinct wrapper functions. See `helper_snake()`.
+    pub kebab_collides_in_pkg: bool,
 }
 
 impl RecordType {
@@ -83,6 +91,26 @@ impl RecordType {
     /// names emitted into the bridge.
     pub fn snake_name(&self) -> String {
         self.kebab_name.replace('-', "_")
+    }
+
+    /// #710: helper-function suffix. Same as `snake_name()` when the
+    /// record's kebab is unique within its package; when the kebab
+    /// collides (e.g. mobilitydb's `stbox3d` defined in two
+    /// interfaces with different field orders), the interface's
+    /// snake form is prepended so each variant gets its own
+    /// `arg_witvalue_*` / `ret_to_witvalue_*` / codec helper.
+    /// Uses a single `_` separator (rustc's snake_case lint rejects
+    /// `__`) — the shape `<iface_snake>_<kebab_snake>` is
+    /// unambiguous because interface names never contain underscores
+    /// (WIT is kebab-case only).
+    pub fn helper_snake(&self) -> String {
+        let kebab = self.kebab_name.replace('-', "_");
+        if self.kebab_collides_in_pkg {
+            let iface = self.interface.replace('-', "_");
+            format!("{iface}_{kebab}")
+        } else {
+            kebab
+        }
     }
 
     /// Encoder import name as it appears in
@@ -127,8 +155,17 @@ impl RecordType {
 /// short-circuit.
 pub fn build(shim_packages: &[WitPackage], primary: &str) -> Vec<RecordType> {
     let mut out: Vec<RecordType> = Vec::new();
-    let mut seen_per_pkg: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-        std::collections::BTreeMap::new();
+    // #710: dedupe on `(interface, kebab)` rather than just `kebab`,
+    // so a shim that declares the same kebab record in two interfaces
+    // (mobilitydb-temporal defines `record stbox3d` in both
+    // `stbox-ops` and `stbox3d-ops` with different field order)
+    // preserves both variants. Same-interface duplicates still fold
+    // to one — wit-bindgen would refuse to emit two Rust types with
+    // the same name in one module anyway.
+    let mut seen_per_pkg: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<(String, String)>,
+    > = std::collections::BTreeMap::new();
     for pkg in shim_packages {
         if pkg.ns_name == "sqlite:extension" {
             continue;
@@ -137,7 +174,7 @@ pub fn build(shim_packages: &[WitPackage], primary: &str) -> Vec<RecordType> {
             .entry(pkg.ns_name.clone())
             .or_default();
         for r in &pkg.records {
-            if !seen.insert(r.kebab_name.clone()) {
+            if !seen.insert((r.interface.clone(), r.kebab_name.clone())) {
                 continue;
             }
             let symbolic = RecordType::symbolic_name_for(
@@ -168,7 +205,30 @@ pub fn build(shim_packages: &[WitPackage], primary: &str) -> Vec<RecordType> {
                 // (the bridge doesn't own their codecs), so we
                 // skip them outright.
                 direct: false,
+                // Computed below once the registry is fully populated
+                // (needs a per-package count of records with the
+                // same kebab).
+                kebab_collides_in_pkg: false,
             });
+        }
+    }
+    // #710: mark records whose kebab appears more than once in the
+    // same package so `helper_snake()` disambiguates their emitted
+    // helper names. Postgis: no collisions today so this is a no-op.
+    // mobilitydb: `stbox3d` collides across `stbox-ops` and
+    // `stbox3d-ops`.
+    let mut kebab_counts: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    for r in &out {
+        *kebab_counts
+            .entry((r.package.clone(), r.kebab_name.clone()))
+            .or_insert(0) += 1;
+    }
+    for r in &mut out {
+        if let Some(&n) = kebab_counts.get(&(r.package.clone(), r.kebab_name.clone())) {
+            if n > 1 {
+                r.kebab_collides_in_pkg = true;
+            }
         }
     }
     // Fix-point Copy analysis. A record is Copy iff every field's
