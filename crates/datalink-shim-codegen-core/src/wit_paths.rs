@@ -233,6 +233,20 @@ pub fn upstream_pkg_sources(primary: &str) -> Result<Vec<(&'static str, PathBuf)
 /// any subdirectories. Used when synthesizing the upstream deps tree
 /// — e.g. `~/git/postgis-wasm/wit/` has a nested `deps/` subdir we
 /// don't want to flatten into the bridge's `wit/deps/<pkg>/`.
+///
+/// #766: applies `kebab_fix_wit` to every copied `.wit` file so the
+/// synthesized tree ALREADY carries the fixed identifier forms
+/// (`cg-threed-alpha-wrapping` rather than `cg-3d-alpha-wrapping`).
+/// The per-target `emit_wit::copy_tree` then copies the fixed text
+/// verbatim into the bridge's `wit/deps/`, AND — the mop-up point
+/// #766 exists to close — `wit_parse::parse_dir` reads the fixed
+/// kebab into every `WitFunction.kebab_name`. Downstream
+/// `classify_shape`/`classify_aggregate_shape`/`classify_udtf_shape`/
+/// `classify_window_shape` sites derive `wit_func` via
+/// `kebab_to_snake(&f.kebab_name)`, so they now emit
+/// `cg_threed_alpha_wrapping` (matching the wit-bindgen-generated
+/// Rust binding on the fixed WIT) instead of `cg_3d_alpha_wrapping`
+/// (which resolves to nothing after the WIT-text rewrite lands).
 pub fn copy_top_level_wit_files(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         return Err(anyhow!("source {} is not a directory", src.display()));
@@ -248,12 +262,128 @@ pub fn copy_top_level_wit_files(src: &Path, dst: &Path) -> Result<()> {
             continue;
         }
         let to = dst.join(entry.file_name());
-        fs::copy(&from, &to)
-            .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
+        // #766: read + kebab_fix + write instead of raw `fs::copy` so
+        // the synthesized tree holds fixed identifiers before
+        // `parse_dir` populates `WitFunction.kebab_name`. See the
+        // fn-level doc-comment for why the mop-up is needed here.
+        let text = fs::read_to_string(&from)
+            .with_context(|| format!("read {}", from.display()))?;
+        let fixed = crate::kebab_fix::kebab_fix_wit(&text);
+        fs::write(&to, fixed)
+            .with_context(|| format!("write kebab-fixed {}", to.display()))?;
     }
     Ok(())
 }
 
 fn home_path(rel: &str) -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rel))
+}
+
+#[cfg(test)]
+mod tests {
+    //! #766 regression coverage: `copy_top_level_wit_files` must
+    //! apply `kebab_fix_wit` to `.wit` sources so the synthesized
+    //! upstream deps tree carries the fixed identifier forms.
+    //! Without the mop-up, `wit_parse::parse_dir` populates
+    //! `WitFunction.kebab_name` from the RAW upstream text
+    //! (`cg-3d-alpha-wrapping`), and dispatch-emit derives Rust
+    //! call names via `kebab_to_snake` producing
+    //! `cg_3d_alpha_wrapping` — which then fails to resolve
+    //! against the kebab-fixed WIT the bridge compiles against
+    //! (which advertises `cg_threed_alpha_wrapping`).
+
+    use super::*;
+    use crate::wit_parse;
+
+    /// Build a small WIT tree with a mid-position `-3d-` identifier
+    /// (real upstream pattern from sfcgal-wasm), synthesize it via
+    /// `copy_top_level_wit_files`, parse the synthesized tree, and
+    /// confirm `WitFunction.kebab_name` carries the fixed
+    /// (`cg-threed-alpha-wrapping`) form.
+    #[test]
+    fn copy_top_level_wit_files_applies_kebab_fix() {
+        let tmp = std::env::temp_dir()
+            .join("sqlink-codegen-test-wit-paths-kebab-fix");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        // Minimal WIT package with one interface + one function whose
+        // kebab has `-3d-` mid-position. The parser needs a package
+        // decl + an interface block to yield a WitFunction.
+        let wit = "\
+package example:pkg@0.1.0;
+
+interface example-iface {
+    cg-3d-alpha-wrapping: func(wkb: list<u8>) -> list<u8>;
+}
+";
+        fs::write(src.join("iface.wit"), wit).unwrap();
+        copy_top_level_wit_files(&src, &dst).expect("copy_top_level_wit_files");
+
+        // Source text arrived kebab-fixed at the destination.
+        let fixed = fs::read_to_string(dst.join("iface.wit")).unwrap();
+        assert!(
+            fixed.contains("cg-threed-alpha-wrapping"),
+            "expected fixed identifier in synthesized text; got:\n{fixed}",
+        );
+        assert!(
+            !fixed.contains("cg-3d-alpha-wrapping"),
+            "raw upstream identifier should have been rewritten; got:\n{fixed}",
+        );
+
+        // The parser sees the fixed kebab. This is what makes the
+        // downstream `kebab_to_snake` emit `cg_threed_alpha_wrapping`
+        // in dispatch code, matching the wit-bindgen binding.
+        let fns = wit_parse::parse_dir(&dst).expect("parse_dir");
+        assert!(
+            fns.iter().any(|f| f.kebab_name == "cg-threed-alpha-wrapping"),
+            "expected `cg-threed-alpha-wrapping` in parsed fns, got: {:?}",
+            fns.iter().map(|f| &f.kebab_name).collect::<Vec<_>>(),
+        );
+        assert!(
+            !fns.iter().any(|f| f.kebab_name == "cg-3d-alpha-wrapping"),
+            "raw upstream kebab should not appear after fix",
+        );
+
+        // And the snake form the dispatch-emit sites derive at
+        // 1763 / 1864 / 2112 / 3706 in interface_db.rs — the actual
+        // #766 mop-up target.
+        let snake: Vec<String> = fns
+            .iter()
+            .map(|f| wit_parse::kebab_to_snake(&f.kebab_name))
+            .collect();
+        assert!(
+            snake.iter().any(|s| s == "cg_threed_alpha_wrapping"),
+            "expected fixed snake form; got: {snake:?}",
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A `.wit` file with no `-Nd` / bare-digit segments passes through
+    /// byte-for-byte (kebab_fix is a no-op on unchanged input).
+    #[test]
+    fn copy_top_level_wit_files_no_op_when_nothing_matches() {
+        let tmp = std::env::temp_dir()
+            .join("sqlink-codegen-test-wit-paths-noop");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        let wit = "\
+package example:pkg@0.1.0;
+
+interface example-iface {
+    plain-func: func(wkb: list<u8>) -> list<u8>;
+}
+";
+        fs::write(src.join("iface.wit"), wit).unwrap();
+        copy_top_level_wit_files(&src, &dst).unwrap();
+        let out = fs::read_to_string(dst.join("iface.wit")).unwrap();
+        assert_eq!(out, wit, "no-op kebab_fix must preserve source byte-for-byte");
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

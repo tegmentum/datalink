@@ -1180,6 +1180,8 @@ pub fn augment_plan_with_upstream_wit_scalars(
     }
 
     let mut synthetic = Vec::<shim_bridge_codegen_core::ScalarFn>::new();
+    let mut synthetic_aggregates = Vec::<shim_bridge_codegen_core::AggregateFn>::new();
+    let mut synthetic_windows = Vec::<shim_bridge_codegen_core::WindowFn>::new();
     for f in &wit_fns {
         // Resource methods don't sit on the free-function-shaped SQL
         // surface — they're called as `<resource>_<method>` and the
@@ -1208,9 +1210,52 @@ pub fn augment_plan_with_upstream_wit_scalars(
             is_deterministic: true,
             propagates_null: true,
         };
+        // #768: shape-classifier for the WIT-scalar auto-synthesis.
+        // Before this fix every unseen WIT function was published as a
+        // `ScalarFn`, so upstream aggregate / window entries that were
+        // absent from the interface DB's `aggregates` / `window_functions`
+        // tables (any recent postgis-wasm addition ahead of an interface
+        // re-extract) leaked into the SQLite manifest under
+        // `ScalarFunctionSpec`. The postgis category audit (#767) surfaced
+        // ~9 such fns:
+        //   - `-aggregate` / `-agg` suffix or a primary aggregate
+        //     interface (`postgis-aggregates`, `postgis-raster-aggregates`,
+        //     `temporal-aggregate-ops`) → route to `plan.aggregates`
+        //   - `-win` suffix or window-shape signature
+        //     (list<borrow<geometry>> → list<option<u32>|u32|geometry>)
+        //     → route to `plan.window_functions`
+        //   - anything else → keep on `scalars` (existing behaviour)
+        //
+        // Detection is intentionally cheap and conservative — false
+        // positives would down-route a real scalar into the aggregate
+        // path where `classify_aggregate_shape` would then unwire it
+        // with an informative reason (surfaced in the codegen log),
+        // rather than silently mis-emitting a wrong spec.
+        let category = classify_wit_fn_category(f);
         if !seen.contains(&bare) {
             seen.insert(bare.clone());
-            synthetic.push(make_row(bare.clone()));
+            match category {
+                WitFnCategory::Scalar => synthetic.push(make_row(bare.clone())),
+                WitFnCategory::Aggregate => {
+                    synthetic_aggregates.push(shim_bridge_codegen_core::AggregateFn {
+                        canonical_name: bare.clone(),
+                        aliases: Vec::new(),
+                        param_signatures: vec![param_sig.clone()],
+                        supports_grouped: true,
+                        supports_partial: true,
+                        is_order_sensitive: false,
+                        accepts_config: false,
+                        config_arg_indices: Vec::new(),
+                    });
+                }
+                WitFnCategory::Window => {
+                    synthetic_windows.push(shim_bridge_codegen_core::WindowFn {
+                        canonical_name: bare.clone(),
+                        aliases: Vec::new(),
+                        param_signatures: vec![param_sig.clone()],
+                    });
+                }
+            }
         }
         // #690: when a free function in a `<ns>-<resource>-*` family
         // interface takes `borrow<resource>` as its first parameter,
@@ -1266,7 +1311,115 @@ pub fn augment_plan_with_upstream_wit_scalars(
             .scalars
             .sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
     }
+    // #768: same deterministic-order convention for the aggregate /
+    // window slots the shape classifier now routes to.
+    if !synthetic_aggregates.is_empty() {
+        eprintln!(
+            "[codegen] augment-plan: synthesised {} aggregate(s) from upstream WIT (#768)",
+            synthetic_aggregates.len(),
+        );
+        for a in &synthetic_aggregates {
+            eprintln!("  + {}", a.canonical_name);
+        }
+        plan.extensions[0].aggregates.extend(synthetic_aggregates);
+        plan.extensions[0]
+            .aggregates
+            .sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    }
+    if !synthetic_windows.is_empty() {
+        eprintln!(
+            "[codegen] augment-plan: synthesised {} window function(s) from upstream WIT (#768)",
+            synthetic_windows.len(),
+        );
+        for w in &synthetic_windows {
+            eprintln!("  + {}", w.canonical_name);
+        }
+        plan.extensions[0].window_functions.extend(synthetic_windows);
+        plan.extensions[0]
+            .window_functions
+            .sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    }
     Ok(())
+}
+
+/// #768: routing category the WIT-scalar auto-synthesiser assigns to
+/// each upstream WIT function it visits. Detection is cheap and
+/// conservative (name-suffix + interface-name + window-shape signature);
+/// `classify_aggregate_shape` / `classify_window_shape` remain the
+/// authoritative shape-checkers downstream and will unwire mis-routed
+/// entries with an informative reason rather than silently emitting
+/// wrong code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WitFnCategory {
+    Scalar,
+    Aggregate,
+    Window,
+}
+
+/// #768: primary aggregate interfaces — WIT functions declared here
+/// are semantically aggregates even without an `-aggregate` / `-agg`
+/// suffix (e.g. `postgis-aggregates::st-extent-threed`). Mirrors the
+/// `is_primary_agg_interface` list in `build_aggregate_registry`
+/// (which routes plan-side aggregate entries to the aggregate
+/// dispatcher); keeping the two in step means "aggregate interface"
+/// has one meaning across the whole codegen.
+fn is_primary_aggregate_interface(iface: &str) -> bool {
+    matches!(
+        iface,
+        "postgis-aggregates" | "postgis-raster-aggregates" | "temporal-aggregate-ops"
+    )
+}
+
+/// #768: does the WIT function's signature match the window-fn
+/// shape (`list<borrow<geometry>>` + `result<list<option<u32>|u32|
+/// geometry>>`)? Used as a fallback when the kebab name lacks the
+/// `-win` suffix but the signature is unambiguously window-shaped —
+/// e.g. `st-cluster-dbscan`, `st-cluster-kmeans`,
+/// `st-cluster-kmeans-max-radius` in `postgis-clustering`.
+///
+/// Kept separate from `classify_window_shape` (which returns a full
+/// `WindowShape` with alias / extra-arg classification) — this only
+/// needs a yes/no.
+fn wit_fn_matches_window_shape(f: &wit_parse::WitFunction) -> bool {
+    let Some(first) = f.params.first() else {
+        return false;
+    };
+    if !matches!(first.ty, wit_parse::WitType::ListGeomBorrow) {
+        return false;
+    }
+    match &f.ret.inner {
+        wit_parse::WitType::ListOptionU32 => true,
+        wit_parse::WitType::ListGeomOwned => true,
+        wit_parse::WitType::List(inner) => matches!(inner.as_ref(), wit_parse::WitType::U32),
+        _ => false,
+    }
+}
+
+/// #768: assign one of `Scalar`/`Aggregate`/`Window` to an upstream
+/// WIT function so the auto-synthesiser lands it on the right plan
+/// surface. Priority order: window (suffix beats shape, but shape
+/// alone is enough), aggregate (suffix or primary interface),
+/// scalar (default).
+///
+/// Window is checked before aggregate because a `-win`-suffixed
+/// name could otherwise be pulled into the aggregate bucket by a
+/// naming coincidence (none observed today, but the ordering
+/// keeps future additions honest).
+fn classify_wit_fn_category(f: &wit_parse::WitFunction) -> WitFnCategory {
+    // Window: `-win` suffix OR window-shape signature.
+    if f.kebab_name.ends_with("-win") || wit_fn_matches_window_shape(f) {
+        return WitFnCategory::Window;
+    }
+    // Aggregate: `-aggregate` / `-agg` suffix OR primary aggregate
+    // interface (catches `postgis-aggregates::st-extent-threed`,
+    // which has no explicit suffix).
+    if f.kebab_name.ends_with("-aggregate")
+        || f.kebab_name.ends_with("-agg")
+        || is_primary_aggregate_interface(&f.interface)
+    {
+        return WitFnCategory::Aggregate;
+    }
+    WitFnCategory::Scalar
 }
 
 /// #690: return the resource kebab name (`topology`, `raster`) when
@@ -4142,5 +4295,211 @@ mod geom_record_tests {
             matches!(shape, RetShape::FirstGeomBlob),
             "expected FirstGeomBlob, got {shape:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod wit_fn_category_tests {
+    //! #768: shape-classifier for `augment_plan_with_upstream_wit_scalars`.
+    //!
+    //! Covers the ~9 fns flagged by the postgis category audit
+    //! (#767) — `_aggregate` / `_agg` / `_win` suffix, primary
+    //! aggregate interfaces, and unsuffixed window-shape signatures
+    //! (`st-cluster-dbscan`, `st-cluster-kmeans`,
+    //! `st-cluster-kmeans-max-radius`) — plus a control set of
+    //! ordinary scalars that must NOT be re-routed.
+    use super::*;
+    use crate::wit_parse::{WitFunction, WitParam, WitRet, WitType};
+
+    fn make_wit_fn(
+        interface: &str,
+        kebab_name: &str,
+        params: Vec<WitParam>,
+        ret_inner: WitType,
+    ) -> WitFunction {
+        WitFunction {
+            package: "postgis:wasm".to_string(),
+            package_version: "0.1.0".to_string(),
+            interface: interface.to_string(),
+            kebab_name: kebab_name.to_string(),
+            params,
+            ret: WitRet {
+                inner: ret_inner,
+                fallible: false,
+                error_ty: None,
+            },
+            resource: None,
+            is_constructor: false,
+        }
+    }
+
+    fn geom_list_param() -> WitParam {
+        WitParam {
+            name: "geoms".to_string(),
+            ty: WitType::ListGeomBorrow,
+        }
+    }
+
+    #[test]
+    fn aggregate_suffix_routes_to_aggregate() {
+        // st-envelope-aggregate, st-coverage-union-aggregate,
+        // st-cluster-kmeans-aggregate, st-cluster-dbscan-aggregate,
+        // st-union-threed-aggregate, st-rast-union-aggregate — all
+        // land here.
+        let f = make_wit_fn(
+            "postgis-aggregates",
+            "st-envelope-aggregate",
+            vec![geom_list_param()],
+            WitType::Geometry { borrowed: false },
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
+    }
+
+    #[test]
+    fn agg_suffix_routes_to_aggregate() {
+        // mobilitydb's `<name>_agg` duplicates surface with a `-agg`
+        // kebab suffix.
+        let f = make_wit_fn(
+            "temporal-aggregate-ops",
+            "tint-min-agg",
+            vec![geom_list_param()],
+            WitType::S64,
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
+    }
+
+    #[test]
+    fn primary_aggregate_interface_routes_to_aggregate_without_suffix() {
+        // `postgis-aggregates::st-extent-threed` — no `-aggregate`
+        // suffix but semantically an aggregate. Interface-name
+        // fallback catches it.
+        let f = make_wit_fn(
+            "postgis-aggregates",
+            "st-extent-threed",
+            vec![geom_list_param()],
+            WitType::Unsupported("bbox3d".to_string()),
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
+    }
+
+    #[test]
+    fn raster_aggregate_interface_routes_to_aggregate() {
+        let f = make_wit_fn(
+            "postgis-raster-aggregates",
+            "st-rast-union-aggregate",
+            vec![geom_list_param()],
+            WitType::Raster { borrowed: false },
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
+    }
+
+    #[test]
+    fn win_suffix_routes_to_window() {
+        // `st-cluster-intersecting-win`, `st-cluster-within-win` —
+        // explicit `-win` suffix.
+        let f = make_wit_fn(
+            "postgis-clustering",
+            "st-cluster-intersecting-win",
+            vec![geom_list_param()],
+            WitType::List(Box::new(WitType::U32)),
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Window);
+    }
+
+    #[test]
+    fn window_shape_option_u32_routes_to_window_without_suffix() {
+        // `st-cluster-dbscan`: list<borrow<geometry>> →
+        // list<option<u32>>. No `-win` suffix, but the shape is
+        // unambiguously window-shaped.
+        let f = make_wit_fn(
+            "postgis-clustering",
+            "st-cluster-dbscan",
+            vec![geom_list_param()],
+            WitType::ListOptionU32,
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Window);
+    }
+
+    #[test]
+    fn window_shape_u32_routes_to_window_without_suffix() {
+        // `st-cluster-kmeans`, `st-cluster-kmeans-max-radius`:
+        // list<borrow<geometry>> → list<u32>.
+        let f = make_wit_fn(
+            "postgis-clustering",
+            "st-cluster-kmeans",
+            vec![geom_list_param()],
+            WitType::List(Box::new(WitType::U32)),
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Window);
+    }
+
+    #[test]
+    fn window_shape_kmeans_max_radius_routes_to_window() {
+        let f = make_wit_fn(
+            "postgis-clustering",
+            "st-cluster-kmeans-max-radius",
+            vec![geom_list_param()],
+            WitType::List(Box::new(WitType::U32)),
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Window);
+    }
+
+    #[test]
+    fn ordinary_scalar_stays_scalar() {
+        // `st-area(borrow<geometry>) -> f64` — vanilla scalar.
+        let f = make_wit_fn(
+            "postgis-measurements",
+            "st-area",
+            vec![WitParam {
+                name: "geom".to_string(),
+                ty: WitType::Geometry { borrowed: true },
+            }],
+            WitType::F64,
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Scalar);
+    }
+
+    #[test]
+    fn scalar_returning_list_stays_scalar_without_geom_list_input() {
+        // A scalar that returns `list<u32>` but does NOT take
+        // `list<borrow<geometry>>` as its first arg must not be
+        // pulled into the window bucket by the shape check.
+        let f = make_wit_fn(
+            "postgis-analysis",
+            "srid-supported",
+            vec![WitParam {
+                name: "srid".to_string(),
+                ty: WitType::S32,
+            }],
+            WitType::List(Box::new(WitType::U32)),
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Scalar);
+    }
+
+    #[test]
+    fn window_takes_precedence_over_aggregate_shape() {
+        // `-win` suffix wins over `-aggregate` even in a contrived
+        // clash — postgis has no such collision today but the
+        // ordering keeps future additions predictable.
+        let f = make_wit_fn(
+            "postgis-clustering",
+            "foo-aggregate-win",
+            vec![geom_list_param()],
+            WitType::List(Box::new(WitType::U32)),
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Window);
+    }
+
+    #[test]
+    fn scalar_geometry_output_from_aggregate_interface_still_aggregate() {
+        // `postgis-aggregates::st-union-aggregate` (returns a
+        // geometry) — no `-Nd` weirdness, standard aggregate shape.
+        let f = make_wit_fn(
+            "postgis-aggregates",
+            "st-union-aggregate",
+            vec![geom_list_param()],
+            WitType::Geometry { borrowed: false },
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
     }
 }
