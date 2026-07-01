@@ -209,7 +209,7 @@ pub fn emit_arm_body(
                 ));
                 call_args.push(format!("arg{idx}"));
             }
-            ParamShape::ListRecord { kebab_name, .. } => {
+            ParamShape::ListRecord { helper_snake, .. } => {
                 // W2 Phase 2 (#553): record-element `list<X>` param
                 // via JSON-as-TEXT marshaling.
                 //
@@ -226,7 +226,13 @@ pub fn emit_arm_body(
                 // UPSTREAM record so the parse is direct; no
                 // LOCAL→UPSTREAM ciborium round-trip is needed
                 // (dispatch is by func_id, not type_id).
-                let snake = kebab_name.replace('-', "_");
+                //
+                // #709: use `helper_snake` — pre-computed by the
+                // classifier as `<iface>_<kebab>` when two sibling
+                // interfaces share a kebab (mobilitydb `stbox3d`),
+                // plain `<kebab>` otherwise (byte-identical to the
+                // pre-#709 output on postgis's collision-free set).
+                let snake = helper_snake;
                 s.push_str(&format!(
                     "{i}let arg{idx} = parse_json_list_record_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
                 ));
@@ -321,7 +327,7 @@ pub fn emit_arm_body(
                 call_args.push(format!("&arg{idx}"));
             }
             ParamShape::WitValueRecord {
-                kebab_name,
+                helper_snake,
                 upstream_by_value,
                 ..
             } => {
@@ -345,7 +351,10 @@ pub fn emit_arm_body(
                 // (all-primitive records), by `&Record` reference
                 // otherwise. The record registry's `is_copy`
                 // analysis drives the pass-mode selection here.
-                let snake = kebab_name.replace('-', "_");
+                //
+                // #709: use pre-computed `helper_snake` for cross-
+                // interface kebab disambiguation.
+                let snake = helper_snake;
                 s.push_str(&format!(
                     "{i}let arg{idx} = arg_witvalue_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
                 ));
@@ -627,9 +636,8 @@ pub fn emit_arm_body(
         // Phase E: record-typed return — wrap as WitValue. Helper
         // `ret_to_witvalue_<snake>` is emitted once per record at
         // the lib.rs top scope; see `emit_lib::emit_wit_value_helpers`.
-        RetShape::WitValueRecord { kebab_name, .. } => {
-            let snake = kebab_name.replace('-', "_");
-            format!("ret_to_witvalue_{snake}({call_expr}{unwrap_chain})")
+        RetShape::WitValueRecord { helper_snake, .. } => {
+            format!("ret_to_witvalue_{helper_snake}({call_expr}{unwrap_chain})")
         }
         // Phase F (#522): option<bool> — Some(true|false) →
         // SqlValue::Integer; None → SqlValue::Null.
@@ -642,11 +650,10 @@ pub fn emit_arm_body(
         // Phase F (#522): option<record> — Some(rec) → encoded via
         // the per-record helper; None → SqlValue::Null. Mirrors the
         // bare `WitValueRecord` shape but unwraps the Option first.
-        RetShape::OptionWitValueRecord { kebab_name, .. } => {
-            let snake = kebab_name.replace('-', "_");
+        RetShape::OptionWitValueRecord { helper_snake, .. } => {
             format!(
                 "match {call_expr}{unwrap_chain} {{\n\
-                 {i}    Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
+                 {i}    Some(__rec) => ret_to_witvalue_{helper_snake}(__rec),\n\
                  {i}    None => Ok(SqlValue::Null),\n\
                  {i}}}"
             )
@@ -656,14 +663,13 @@ pub fn emit_arm_body(
         // no native list variant on `sql-value`, so scalar
         // semantics require collapsing to one element. Multi-row
         // exposure stays on the table-function path.
-        RetShape::FirstWitValueRecord { kebab_name, .. } => {
-            let snake = kebab_name.replace('-', "_");
+        RetShape::FirstWitValueRecord { helper_snake, .. } => {
             format!(
                 "{{\n\
                  {i}    let __r = {call_expr}{unwrap_chain};\n\
                  {i}    let mut __it = __r.into_iter();\n\
                  {i}    match __it.next() {{\n\
-                 {i}        Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
+                 {i}        Some(__rec) => ret_to_witvalue_{helper_snake}(__rec),\n\
                  {i}        None => Ok(SqlValue::Null),\n\
                  {i}    }}\n\
                  {i}}}"
@@ -1252,8 +1258,10 @@ fn emit_aggregate_finalize_body_record(
     // #612 (OQ1): decode side resolves the per-record helper on the
     // INPUT record; encode side resolves on the OUTPUT record. For
     // same-record aggregates the two snakes are identical.
-    let in_snake = input.kebab_name.replace('-', "_");
-    let out_snake = output.kebab_name.replace('-', "_");
+    // #709: use RecordSpec's pre-computed `helper_snake` so cross-
+    // interface kebab collisions route to disambiguated names.
+    let in_snake = &input.helper_snake;
+    let out_snake = &output.helper_snake;
 
     let mut s = String::new();
     // Drain the per-context witvalue accumulator, then decode each
@@ -1323,7 +1331,8 @@ fn emit_aggregate_finalize_body_record_to_scalar(
         unreachable!("invariant: caller checks AccKind::RecordToScalar");
     };
     let optional = *optional;
-    let in_snake = input.kebab_name.replace('-', "_");
+    // #709: use pre-computed helper snake (see emit_aggregate_finalize_body_record).
+    let in_snake = &input.helper_snake;
 
     let mut s = String::new();
     // Drain the per-context witvalue accumulator + decode each
@@ -1503,7 +1512,8 @@ fn emit_aggregate_finalize_body_record_to_tuple(
         unreachable!("invariant: caller checks AccKind::RecordToTuple");
     };
     let optional = *optional;
-    let in_snake = input.kebab_name.replace('-', "_");
+    // #709: use pre-computed helper snake (see emit_aggregate_finalize_body_record).
+    let in_snake = &input.helper_snake;
 
     let mut s = String::new();
     // Drain the per-context witvalue accumulator + decode each

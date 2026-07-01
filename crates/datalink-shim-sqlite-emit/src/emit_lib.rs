@@ -1079,11 +1079,14 @@ struct {bridge_struct};
     // postgis's `CoordZ` — declared in WIT, never referenced by a
     // function, so wit-bindgen drops it from
     // `bindings::postgis::wasm::postgis_types`).
-    let referenced_records: std::collections::BTreeSet<String> =
+    let referenced_records: std::collections::BTreeSet<(String, String)> =
         collect_referenced_records(&scalar_entries, &agg_entries, &udtf_entries);
     let helper_records: Vec<RecordType> = records
         .iter()
-        .filter(|r| referenced_records.contains(&r.kebab_name))
+        .filter(|r| {
+            referenced_records
+                .contains(&(r.interface.clone(), r.kebab_name.clone()))
+        })
         .cloned()
         .collect();
     if !helper_records.is_empty() {
@@ -2460,8 +2463,24 @@ fn emit_serde_ops_impl(
     // (wit-bindgen re-exports the `use`'d types under the exporting
     // interface's export path so they're addressable as
     // `bindings::exports::<pkg>::<iface>::<Type>`).
-    let record_names_pascal: Vec<String> =
-        records.iter().map(|r| pascal_case(&r.kebab_name)).collect();
+    // #709: dedup by kebab. The registry keeps both entries when a
+    // kebab collides across sibling interfaces (mobilitydb `stbox3d`),
+    // but the LOCAL serde-ops interface holds ONE record per kebab
+    // and one `<kebab>_from_canon_cbor`/`_to_canon_cbor` pair. CBOR
+    // encodes struct fields by name so field-order differences
+    // between the upstream twins are byte-transparent — either
+    // twin's LOCAL clone round-trips correctly against either
+    // upstream type.
+    let mut seen_kebabs: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let unique_records: Vec<&RecordType> = records
+        .iter()
+        .filter(|r| seen_kebabs.insert(r.kebab_name.clone()))
+        .collect();
+    let record_names_pascal: Vec<String> = unique_records
+        .iter()
+        .map(|r| pascal_case(&r.kebab_name))
+        .collect();
     if !record_names_pascal.is_empty() {
         s.push_str(&format!(
             "use bindings::exports::sqlink_bridge::{primary_snake}::serde_ops::{{{}}};\n",
@@ -2471,7 +2490,7 @@ fn emit_serde_ops_impl(
     s.push_str(&format!(
         "impl SerdeOpsGuest for {bridge_struct} {{\n"
     ));
-    for r in records {
+    for r in &unique_records {
         let snake = r.snake_name();
         let pascal = pascal_case(&r.kebab_name);
         // Decoder: bytes → record. Errors map ciborium's
@@ -2519,44 +2538,82 @@ fn collect_referenced_records(
     scalar_entries: &[(dispatch::DispatchEntry, bool)],
     agg_entries: &[dispatch::AggregateEntry],
     udtf_entries: &[dispatch::UdtfEntry],
-) -> std::collections::BTreeSet<String> {
-    let mut out: std::collections::BTreeSet<String> =
+) -> std::collections::BTreeSet<(String, String)> {
+    // #709: key on (interface, kebab). Two sibling upstream interfaces
+    // may declare records that share a kebab (mobilitydb `stbox3d`);
+    // each maps to a distinct wit-bindgen Rust type at a distinct
+    // module path, so the helper-emission filter must distinguish
+    // them or the second variant's arm calls into a helper that
+    // decodes into the wrong upstream type.
+    let mut out: std::collections::BTreeSet<(String, String)> =
         std::collections::BTreeSet::new();
-    fn record_name_in_ret(r: &dispatch::RetShape) -> Option<&String> {
+    fn record_key_in_ret(r: &dispatch::RetShape) -> Option<(String, String)> {
         match r {
-            dispatch::RetShape::WitValueRecord { kebab_name, .. }
-            | dispatch::RetShape::OptionWitValueRecord { kebab_name, .. }
-            | dispatch::RetShape::FirstWitValueRecord { kebab_name, .. } => Some(kebab_name),
+            dispatch::RetShape::WitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            }
+            | dispatch::RetShape::OptionWitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            }
+            | dispatch::RetShape::FirstWitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            } => Some((wit_interface.clone(), kebab_name.clone())),
             _ => None,
         }
     }
     for (entry, _f) in scalar_entries {
         for p in &entry.shape.params {
-            if let dispatch::ParamShape::WitValueRecord { kebab_name, .. } = p {
-                out.insert(kebab_name.clone());
+            if let dispatch::ParamShape::WitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            } = p
+            {
+                out.insert((wit_interface.clone(), kebab_name.clone()));
             }
             // W2 Phase 2 (#553): ListRecord params also need the
             // per-record `parse_json_list_record_<snake>` helper
             // emitted, so the same registry sweep must include them.
-            if let dispatch::ParamShape::ListRecord { kebab_name, .. } = p {
-                out.insert(kebab_name.clone());
+            if let dispatch::ParamShape::ListRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            } = p
+            {
+                out.insert((wit_interface.clone(), kebab_name.clone()));
             }
         }
-        if let Some(name) = record_name_in_ret(&entry.shape.ret) {
-            out.insert(name.clone());
+        if let Some(key) = record_key_in_ret(&entry.shape.ret) {
+            out.insert(key);
         }
     }
     for entry in agg_entries {
         for p in &entry.shape.extra_args {
-            if let dispatch::ParamShape::WitValueRecord { kebab_name, .. } = p {
-                out.insert(kebab_name.clone());
+            if let dispatch::ParamShape::WitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            } = p
+            {
+                out.insert((wit_interface.clone(), kebab_name.clone()));
             }
-            if let dispatch::ParamShape::ListRecord { kebab_name, .. } = p {
-                out.insert(kebab_name.clone());
+            if let dispatch::ParamShape::ListRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            } = p
+            {
+                out.insert((wit_interface.clone(), kebab_name.clone()));
             }
         }
-        if let Some(name) = record_name_in_ret(&entry.shape.ret) {
-            out.insert(name.clone());
+        if let Some(key) = record_key_in_ret(&entry.shape.ret) {
+            out.insert(key);
         }
         // #607 Phase 1 + #612 (OQ1): AccKind::Record aggregates
         // reference TWO per-record codec sites — `arg_witvalue_<in>`
@@ -2573,23 +2630,33 @@ fn collect_referenced_records(
         // primitive tuple (#640), not a record codec call.
         match &entry.shape.accumulator_kind {
             dispatch::AccKind::Record { input, output } => {
-                out.insert(input.kebab_name.clone());
-                out.insert(output.kebab_name.clone());
+                out.insert((input.wit_interface.clone(), input.kebab_name.clone()));
+                out.insert((output.wit_interface.clone(), output.kebab_name.clone()));
             }
             dispatch::AccKind::RecordToScalar { input, .. }
             | dispatch::AccKind::RecordToTuple { input, .. } => {
-                out.insert(input.kebab_name.clone());
+                out.insert((input.wit_interface.clone(), input.kebab_name.clone()));
             }
             dispatch::AccKind::Geom | dispatch::AccKind::Raster => {}
         }
     }
     for entry in udtf_entries {
         for p in &entry.shape.params {
-            if let dispatch::ParamShape::WitValueRecord { kebab_name, .. } = p {
-                out.insert(kebab_name.clone());
+            if let dispatch::ParamShape::WitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            } = p
+            {
+                out.insert((wit_interface.clone(), kebab_name.clone()));
             }
-            if let dispatch::ParamShape::ListRecord { kebab_name, .. } = p {
-                out.insert(kebab_name.clone());
+            if let dispatch::ParamShape::ListRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            } = p
+            {
+                out.insert((wit_interface.clone(), kebab_name.clone()));
             }
         }
     }
@@ -2739,7 +2806,15 @@ fn emit_wit_value_helpers(
     s.push_str("#[allow(dead_code)]\n");
     s.push_str("use bindings::sqlite::extension::types::WitValuePayload;\n\n");
     for r in records {
-        let snake = r.snake_name();
+        // #709: helper function name uses the disambiguated
+        // `helper_snake()` — kebab-snake for unique kebabs (byte-
+        // identical to pre-#709 output), `<iface>_<kebab>` when a
+        // kebab collides across sibling interfaces. The LOCAL codec
+        // method name (`<local_codec_snake>_from_canon_cbor`) stays
+        // kebab-based because the LOCAL serde-ops interface dedups
+        // by kebab (one LOCAL type per kebab).
+        let snake = r.helper_snake();
+        let local_codec_snake = r.snake_name();
         let pascal = pascal_case(&r.kebab_name);
         let upstream_iface_snake = sanitize_module(&r.interface);
         let (pkg_ns, pkg_name) = split_pkg(&r.package);
@@ -2799,7 +2874,7 @@ fn emit_wit_value_helpers(
                  \x20   }};\n\
                  \x20   // LOCAL serde-ops decode — proves the codec\n\
                  \x20   // fires (not the identity-passthrough fallback).\n\
-                 \x20   let __loc: {local_path} = <{bridge_struct} as bindings::exports::sqlink_bridge::{primary_snake}::serde_ops::Guest>::{snake}_from_canon_cbor(\n\
+                 \x20   let __loc: {local_path} = <{bridge_struct} as bindings::exports::sqlink_bridge::{primary_snake}::serde_ops::Guest>::{local_codec_snake}_from_canon_cbor(\n\
                  \x20       payload.bytes.clone(),\n\
                  \x20   )\n\
                  \x20   .map_err(|e| format!(\"{{name}}: decode arg {{idx}}: {{}}\", e))?;\n\

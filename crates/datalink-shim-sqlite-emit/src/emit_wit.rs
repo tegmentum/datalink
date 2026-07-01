@@ -384,7 +384,18 @@ fn render_serde_ops_interface(
     // declaration order, which the upstream WIT keeps in a sensible
     // bottom-up shape.  Phase E ships the registry order; if a
     // future shim needs explicit topo-sort, that's a follow-up.
-    for r in records {
+    // #709: dedup by kebab. The registry keeps both entries when the
+    // same kebab appears in two upstream interfaces (mobilitydb
+    // `stbox3d`); the LOCAL serde-ops interface has ONE record per
+    // kebab. Field-order differences between the upstream twins are
+    // absorbed by CBOR's field-name encoding at the round-trip site.
+    let mut seen: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let unique_records: Vec<&RecordType> = records
+        .iter()
+        .filter(|r| seen.insert(r.kebab_name.clone()))
+        .collect();
+    for r in &unique_records {
         s.push_str(&format!("    record {} {{\n", r.kebab_name));
         for (fname, ftype) in &r.fields {
             let resolved = inline_aliases(ftype, alias_map);
@@ -395,7 +406,7 @@ fn render_serde_ops_interface(
     s.push('\n');
 
     // Codec function declarations.
-    for r in records {
+    for r in &unique_records {
         s.push_str(&format!(
             "    {name}-from-canon-cbor: func(bytes: list<u8>) -> result<{name}, string>;\n",
             name = r.kebab_name,

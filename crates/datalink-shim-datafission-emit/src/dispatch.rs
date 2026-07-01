@@ -215,10 +215,11 @@ pub fn emit_scalar_arm_body(
                 ));
                 call_args.push(format!("arg{idx}"));
             }
-            ParamShape::ListRecord { kebab_name, .. } => {
-                let snake = kebab_name.replace('-', "_");
+            ParamShape::ListRecord { helper_snake, .. } => {
+                // #709: `helper_snake` disambiguates cross-interface
+                // kebab collisions (e.g. mobilitydb `stbox3d`).
                 s.push_str(&format!(
-                    "{i}let arg{idx} = parse_json_list_record_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
+                    "{i}let arg{idx} = parse_json_list_record_{helper_snake}(&args, {idx}, \"{sql_name}\")?;\n",
                 ));
                 call_args.push(format!("&arg{idx}"));
             }
@@ -274,18 +275,20 @@ pub fn emit_scalar_arm_body(
                 call_args.push(format!("&arg{idx}"));
             }
             ParamShape::WitValueRecord {
-                kebab_name,
+                helper_snake,
                 upstream_by_value,
                 ..
             } => {
                 // Magic-prefix Binary scheme (4-byte WTV magic +
                 // 32-byte type_id + canonical-CBOR payload). The
-                // per-record `arg_witvalue_<snake>` helper checks
-                // the magic + type_id and ciborium-decodes the
-                // payload directly into the upstream record type.
-                let snake = kebab_name.replace('-', "_");
+                // per-record `arg_witvalue_<helper_snake>` helper
+                // checks the magic + type_id and ciborium-decodes
+                // the payload directly into the upstream record
+                // type. #709: `helper_snake` is pre-computed by the
+                // classifier — disambiguates cross-interface kebab
+                // collisions (mobilitydb `stbox3d`).
                 s.push_str(&format!(
-                    "{i}let arg{idx} = arg_witvalue_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
+                    "{i}let arg{idx} = arg_witvalue_{helper_snake}(&args, {idx}, \"{sql_name}\")?;\n",
                 ));
                 if *upstream_by_value {
                     call_args.push(format!("arg{idx}"));
@@ -697,27 +700,24 @@ fn render_ret_to_scalarvalue(
                  {i}}}"
             )
         }
-        RetShape::WitValueRecord { kebab_name, .. } => {
-            let snake = kebab_name.replace('-', "_");
-            format!("ret_to_witvalue_{snake}({call_expr}{unwrap_chain})")
+        RetShape::WitValueRecord { helper_snake, .. } => {
+            format!("ret_to_witvalue_{helper_snake}({call_expr}{unwrap_chain})")
         }
-        RetShape::OptionWitValueRecord { kebab_name, .. } => {
-            let snake = kebab_name.replace('-', "_");
+        RetShape::OptionWitValueRecord { helper_snake, .. } => {
             format!(
                 "match {call_expr}{unwrap_chain} {{\n\
-                 {i}    Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
+                 {i}    Some(__rec) => ret_to_witvalue_{helper_snake}(__rec),\n\
                  {i}    None => Ok(types::ScalarValue::Null),\n\
                  {i}}}"
             )
         }
-        RetShape::FirstWitValueRecord { kebab_name, .. } => {
-            let snake = kebab_name.replace('-', "_");
+        RetShape::FirstWitValueRecord { helper_snake, .. } => {
             format!(
                 "{{\n\
                  {i}    let __r = {call_expr}{unwrap_chain};\n\
                  {i}    let mut __it = __r.into_iter();\n\
                  {i}    match __it.next() {{\n\
-                 {i}        Some(__rec) => ret_to_witvalue_{snake}(__rec),\n\
+                 {i}        Some(__rec) => ret_to_witvalue_{helper_snake}(__rec),\n\
                  {i}        None => Ok(types::ScalarValue::Null),\n\
                  {i}    }}\n\
                  {i}}}"
@@ -1196,8 +1196,10 @@ fn emit_aggregate_finalize_body_record(
     // #612 (OQ1): decode side resolves the per-record helper on the
     // INPUT record; encode side resolves on the OUTPUT record. For
     // same-record aggregates the two snakes are identical.
-    let in_snake = input.kebab_name.replace('-', "_");
-    let out_snake = output.kebab_name.replace('-', "_");
+    // #709: use RecordSpec's pre-computed `helper_snake` so cross-
+    // interface kebab collisions route to disambiguated names.
+    let in_snake = &input.helper_snake;
+    let out_snake = &output.helper_snake;
 
     let mut s = String::new();
     s.push_str(&format!(
@@ -1261,7 +1263,8 @@ fn emit_aggregate_finalize_body_record_to_scalar(
         unreachable!("invariant: caller checks AccKind::RecordToScalar");
     };
     let optional = *optional;
-    let in_snake = input.kebab_name.replace('-', "_");
+    // #709: use pre-computed helper snake.
+    let in_snake = &input.helper_snake;
 
     let mut s = String::new();
     s.push_str(&format!(
@@ -1438,7 +1441,8 @@ fn emit_aggregate_finalize_body_record_to_tuple(
         unreachable!("invariant: caller checks AccKind::RecordToTuple");
     };
     let optional = *optional;
-    let in_snake = input.kebab_name.replace('-', "_");
+    // #709: use pre-computed helper snake.
+    let in_snake = &input.helper_snake;
 
     let mut s = String::new();
     s.push_str(&format!(
@@ -1888,10 +1892,10 @@ fn emit_udtf_param_marshal_df(
             ParamShape::OptionNone => {
                 call_args.push("None".to_string());
             }
-            ParamShape::WitValueRecord { kebab_name, .. } => {
-                let snake = kebab_name.replace('-', "_");
+            ParamShape::WitValueRecord { helper_snake, .. } => {
+                // #709: use pre-computed helper snake.
                 s.push_str(&format!(
-                    "{i}let arg{idx} = arg_witvalue_{snake}(&args, {idx}, \"{sql_name}\")?;\n",
+                    "{i}let arg{idx} = arg_witvalue_{helper_snake}(&args, {idx}, \"{sql_name}\")?;\n",
                 ));
                 call_args.push(format!("&arg{idx}"));
             }

@@ -430,23 +430,50 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     // per-record `arg_witvalue_<snake>` / `ret_to_witvalue_<snake>`
     // helpers at the finalize site, so their accumulator kebab needs
     // to be in the helper-emission set too.
-    let mut referenced_records: std::collections::BTreeSet<String> =
+    // #709: key referenced-records on (interface, kebab). Two
+    // sibling upstream interfaces may declare records that share a
+    // kebab (mobilitydb `stbox3d`); each maps to a distinct
+    // wit-bindgen Rust type, so the helper-emission filter must
+    // distinguish them.
+    let mut referenced_records: std::collections::BTreeSet<(String, String)> =
         std::collections::BTreeSet::new();
     for (entry, _f) in &scalar_entries {
         for p in &entry.shape.params {
             match p {
-                interface_db::ParamShape::WitValueRecord { kebab_name, .. }
-                | interface_db::ParamShape::ListRecord { kebab_name, .. } => {
-                    referenced_records.insert(kebab_name.clone());
+                interface_db::ParamShape::WitValueRecord {
+                    kebab_name,
+                    wit_interface,
+                    ..
+                }
+                | interface_db::ParamShape::ListRecord {
+                    kebab_name,
+                    wit_interface,
+                    ..
+                } => {
+                    referenced_records
+                        .insert((wit_interface.clone(), kebab_name.clone()));
                 }
                 _ => {}
             }
         }
         match &entry.shape.ret {
-            interface_db::RetShape::WitValueRecord { kebab_name, .. }
-            | interface_db::RetShape::OptionWitValueRecord { kebab_name, .. }
-            | interface_db::RetShape::FirstWitValueRecord { kebab_name, .. } => {
-                referenced_records.insert(kebab_name.clone());
+            interface_db::RetShape::WitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            }
+            | interface_db::RetShape::OptionWitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            }
+            | interface_db::RetShape::FirstWitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            } => {
+                referenced_records
+                    .insert((wit_interface.clone(), kebab_name.clone()));
             }
             _ => {}
         }
@@ -463,27 +490,46 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         // a JSON-encoded primitive tuple (#640)).
         match &entry.shape.accumulator_kind {
             interface_db::AccKind::Record { input, output } => {
-                referenced_records.insert(input.kebab_name.clone());
-                referenced_records.insert(output.kebab_name.clone());
+                referenced_records
+                    .insert((input.wit_interface.clone(), input.kebab_name.clone()));
+                referenced_records
+                    .insert((output.wit_interface.clone(), output.kebab_name.clone()));
             }
             interface_db::AccKind::RecordToScalar { input, .. }
             | interface_db::AccKind::RecordToTuple { input, .. } => {
-                referenced_records.insert(input.kebab_name.clone());
+                referenced_records
+                    .insert((input.wit_interface.clone(), input.kebab_name.clone()));
             }
             interface_db::AccKind::Geom | interface_db::AccKind::Raster => {}
         }
         match &entry.shape.ret {
-            interface_db::RetShape::WitValueRecord { kebab_name, .. }
-            | interface_db::RetShape::OptionWitValueRecord { kebab_name, .. }
-            | interface_db::RetShape::FirstWitValueRecord { kebab_name, .. } => {
-                referenced_records.insert(kebab_name.clone());
+            interface_db::RetShape::WitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            }
+            | interface_db::RetShape::OptionWitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            }
+            | interface_db::RetShape::FirstWitValueRecord {
+                kebab_name,
+                wit_interface,
+                ..
+            } => {
+                referenced_records
+                    .insert((wit_interface.clone(), kebab_name.clone()));
             }
             _ => {}
         }
     }
     let helper_records: Vec<RecordType> = records
         .iter()
-        .filter(|r| referenced_records.contains(&r.kebab_name))
+        .filter(|r| {
+            referenced_records
+                .contains(&(r.interface.clone(), r.kebab_name.clone()))
+        })
         .cloned()
         .collect();
 
@@ -2911,7 +2957,11 @@ fn emit_wit_value_helpers(records: &[RecordType]) -> String {
     s.push_str("const WTV_MAGIC: [u8; 4] = *b\"WTV\\x01\";\n\n");
 
     for r in records {
-        let snake = r.snake_name();
+        // #709: outer helper function names use the disambiguated
+        // `helper_snake()` — byte-identical to `snake_name()` when
+        // the kebab is unique across sibling interfaces, prefixed
+        // with the interface snake otherwise.
+        let snake = r.helper_snake();
         let pascal = pascal_case(&r.kebab_name);
         let upstream_iface_snake = sanitize_module(&r.interface);
         let (pkg_ns, pkg_name) = split_pkg(&r.package);
