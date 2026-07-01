@@ -1495,15 +1495,23 @@ fn parse_type(s: &str) -> WitType {
         // → OptionNone dispatch, and the specific shape
         // `tuple<bool, option<string>, option<geometry>>` (from
         // `st-is-valid-detail`) classifies as a tuple return.
+        //
+        // #724: keep the `Tuple(Vec<WitType>)` variant even when
+        // some elements are `Unsupported(kebab)` — record kebabs
+        // parse to `Unsupported` at this layer and get resolved
+        // against the shim's record registry in `classify_param`
+        // / `classify_return`. Downstream classifiers still reject
+        // tuples whose elements they can't wire, so this only
+        // opens the door for the mixed-tuple record path
+        // (`list<tuple<string, tfloat-sequence>>` etc.) — the
+        // pre-#724 rejection sites still fire for genuinely
+        // unclassifiable elements.
         let parts = split_top_level_comma(&inner);
         let elems: Vec<WitType> = parts
             .into_iter()
             .filter(|p| !p.trim().is_empty())
             .map(|p| parse_type(p.trim()))
             .collect();
-        if elems.iter().any(|t| matches!(t, WitType::Unsupported(_))) {
-            return WitType::Unsupported(format!("tuple<{}>", inner.trim()));
-        }
         return WitType::Tuple(elems);
     }
     match s {

@@ -326,6 +326,26 @@ pub fn emit_arm_body(
                 ));
                 call_args.push(format!("&arg{idx}"));
             }
+            ParamShape::ListTupleMixed { elements } => {
+                // #724: `list<tuple<E1, E2, ...>>` param where at
+                // least one Ei is a same-shim record. Today's
+                // surface (mobilitydb): `tfloat-batch-to-parquet`
+                // — `list<tuple<string, tfloat-sequence>>`. The
+                // codegen-emitted helper `parse_json_list_tuple_<sig>`
+                // (e.g. `parse_json_list_tuple_string_tfloat_sequence`)
+                // calls `serde_json::from_str::<Vec<(String,
+                // UPSTREAM_R)>>` — records deserialize via
+                // wit-bindgen's `additional_derives:
+                // [serde::Deserialize]`, same reasoning as
+                // `ListRecord`. Dispatch is by func_id (not
+                // type_id) so no LOCAL→UPSTREAM ciborium round-trip
+                // is needed.
+                let suffix = list_tuple_mixed_sig_suffix(elements);
+                s.push_str(&format!(
+                    "{i}let arg{idx} = parse_json_list_tuple_{suffix}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
             ParamShape::WitValueRecord {
                 helper_snake,
                 upstream_by_value,
@@ -774,8 +794,14 @@ pub fn emit_arm_body(
         //     WKB-hex projection matches the existing `GeomBlob`
         //     ret shape (same `as_wkb` bytes).
         RetShape::JsonText { kind } => match kind {
+            // #724: `ListTupleMixed` slots into the same
+            // `serde_json::to_string(&__r)` template as
+            // `ListTuplePrim` — the upstream `Vec<(String,
+            // UPSTREAM_R)>` serializes via wit-bindgen's
+            // `Serialize` derive on the record element.
             JsonRetKind::ListListPrim(_)
             | JsonRetKind::ListTuplePrim(_)
+            | JsonRetKind::ListTupleMixed(_)
             | JsonRetKind::TuplePrim(_) => format!(
                 "{{\n\
                  {i}    let __r = {call_expr}{unwrap_chain};\n\
@@ -1137,6 +1163,7 @@ pub fn emit_aggregate_finalize_body(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
+                | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
                 | ParamShape::ListListPrim(_) => {
                     // Extra args that are themselves geometries or
@@ -1458,6 +1485,7 @@ fn emit_aggregate_finalize_body_record_to_scalar(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
+                | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
                 | ParamShape::ListListPrim(_) => {
                     return format!(
@@ -1638,6 +1666,7 @@ fn emit_aggregate_finalize_body_record_to_tuple(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
+                | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
                 | ParamShape::ListListPrim(_) => {
                     return format!(

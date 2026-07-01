@@ -265,6 +265,24 @@ pub enum ParamShape {
     /// same way per-record `parse_json_list_record_<snake>`
     /// helpers are de-duplicated.
     ListTuple { elements: Vec<ListPrimElem> },
+    /// #724: `list<tuple<E1, E2, ...>>` param where at least one
+    /// Ei is a same-shim record (rest may be primitives). Today's
+    /// surface (mobilitydb): `tfloat-batch-to-parquet` /
+    /// `tgeompoint-batch-to-parquet` — first arg is
+    /// `list<tuple<string, {tfloat,tgeompoint}-sequence>>`.
+    ///
+    /// SQL surface: JSON-array of arrays, e.g.
+    /// `'[["seq1", {"instants":[...], "interpolation":"linear", ...}]]'`.
+    ///
+    /// Dispatch arm parses via
+    /// `serde_json::from_str::<Vec<(String, UPSTREAM_R)>>` — the
+    /// per-signature helper `parse_json_list_tuple_<sig>` where
+    /// `<sig>` mixes prim helper_suffix() and record helper_snake
+    /// (e.g. `string_tfloat_sequence`). Records deserialize via
+    /// wit-bindgen's `additional_derives: [serde::Deserialize]`;
+    /// no LOCAL→UPSTREAM ciborium round-trip needed (dispatch is
+    /// by func_id, not type_id — same reasoning as `ListRecord`).
+    ListTupleMixed { elements: Vec<ListTupleElem> },
 }
 
 impl ParamShape {
@@ -275,6 +293,17 @@ impl ParamShape {
     pub fn list_tuple_sig(&self) -> Option<&[ListPrimElem]> {
         match self {
             ParamShape::ListTuple { elements } => Some(elements.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// #724: exposes the mixed tuple-element signature when this
+    /// shape is `ListTupleMixed`, so emit_lib can de-duplicate
+    /// per-signature `parse_json_list_tuple_<sig>` helpers that
+    /// reference upstream record types (Vec<(String, UPSTREAM_R)>).
+    pub fn list_tuple_mixed_sig(&self) -> Option<&[ListTupleElem]> {
+        match self {
+            ParamShape::ListTupleMixed { elements } => Some(elements.as_slice()),
             _ => None,
         }
     }
@@ -662,6 +691,16 @@ pub enum JsonRetKind {
     /// as JSON `null` on the None side, matching SQL callers'
     /// existing `json_extract` handling for missing values.
     OptionTuplePrimOrOptPrim(Vec<TupleElemKind>),
+    /// #724: `list<tuple<E1, E2, ...>>` where at least one Ei is a
+    /// same-shim record (rest may be primitives). Today's surface
+    /// (mobilitydb): `tfloat-batch-from-parquet` /
+    /// `tgeompoint-batch-from-parquet` — both return
+    /// `result<list<tuple<string, {tfloat,tgeompoint}-sequence>>, arrow-error>`.
+    /// serde_json::to_string renders the outer `Vec<(String, UPSTREAM_R)>`
+    /// directly — records carry `serde::Serialize` via wit-bindgen's
+    /// `additional_derives` so no per-element hand-marshaling is
+    /// needed. Same emit template as `ListTuplePrim`.
+    ListTupleMixed(Vec<ListTupleElem>),
 }
 
 /// #716: element kind for tuple returns that mix bare primitives
@@ -674,6 +713,34 @@ pub enum JsonRetKind {
 pub enum TupleElemKind {
     Prim(ListPrimElem),
     OptionPrim(ListPrimElem),
+}
+
+/// #724: element kind for `list<tuple<...>>` param/return shapes
+/// that admit either a primitive or a same-shim record. Records
+/// carry the same identity fields as `ParamShape::ListRecord` /
+/// `ParamShape::WitValueRecord` — kebab + interface + package +
+/// helper_snake — so the emit paths can reconstruct the upstream
+/// Rust type (`bindings::<ns>::<name>::<iface>::<Pascal>`) and
+/// pick the disambiguated helper suffix (#709/#710).
+#[derive(Debug, Clone)]
+pub enum ListTupleElem {
+    Prim(ListPrimElem),
+    Record(TupleRecordRef),
+}
+
+/// #724: identity fields for a same-shim record referenced from
+/// inside a `list<tuple<...>>` shape. Mirrors the
+/// `ParamShape::ListRecord` field set (kebab, interface, package,
+/// package_version, helper_snake) so upstream-path resolution in
+/// the emit crates uses the same inputs and helper-name
+/// disambiguation stays in lock-step with the #709/#710 machinery.
+#[derive(Debug, Clone)]
+pub struct TupleRecordRef {
+    pub kebab_name: String,
+    pub wit_interface: String,
+    pub wit_package: String,
+    pub wit_package_version: String,
+    pub helper_snake: String,
 }
 
 /// Diagnostic: a scalar the codegen wanted to wire but couldn't.
@@ -2389,6 +2456,42 @@ pub fn classify_param(
                         return Ok(ParamShape::ListTuple { elements: prims });
                     }
                 }
+                // #724: mixed tuple with at least one same-shim record
+                // element. `tfloat-batch-to-parquet` param is
+                // `list<tuple<string, tfloat-sequence>>`. Records fall
+                // through as `WitType::Unsupported(kebab)`; look them up
+                // in the registry via `find_record`, preserving the
+                // #709 caller-interface preference for same-kebab
+                // collisions.
+                let mixed: Option<Vec<ListTupleElem>> = elems
+                    .iter()
+                    .map(|e| {
+                        if let Some(p) = list_prim_elem(e) {
+                            return Some(ListTupleElem::Prim(p));
+                        }
+                        if let WitType::Unsupported(kebab) = e {
+                            if let Some(rec) = find_record(records, kebab, caller_interface) {
+                                return Some(ListTupleElem::Record(TupleRecordRef {
+                                    kebab_name: rec.kebab_name.clone(),
+                                    wit_interface: rec.interface.clone(),
+                                    wit_package: rec.package.clone(),
+                                    wit_package_version: rec.package_version.clone(),
+                                    helper_snake: rec.helper_snake(),
+                                }));
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+                if let Some(mixed) = mixed {
+                    if !mixed.is_empty()
+                        && mixed
+                            .iter()
+                            .any(|e| matches!(e, ListTupleElem::Record(_)))
+                    {
+                        return Ok(ParamShape::ListTupleMixed { elements: mixed });
+                    }
+                }
             }
             return Err(format!(
                 "param type not in dispatcher alphabet: list<{}> (element shape not yet wired; record elements need a matching kebab in the registry)",
@@ -2740,6 +2843,41 @@ pub fn classify_return(
                         });
                     }
                 }
+                // #724: mixed tuple with at least one same-shim record
+                // element — mirrors the `ListTupleMixed` param path.
+                // `tfloat-batch-from-parquet` return is
+                // `list<tuple<string, tfloat-sequence>>`.
+                let mixed: Option<Vec<ListTupleElem>> = elems
+                    .iter()
+                    .map(|e| {
+                        if let Some(p) = list_prim_elem(e) {
+                            return Some(ListTupleElem::Prim(p));
+                        }
+                        if let WitType::Unsupported(kebab) = e {
+                            if let Some(rec) = find_record(records, kebab, caller_interface) {
+                                return Some(ListTupleElem::Record(TupleRecordRef {
+                                    kebab_name: rec.kebab_name.clone(),
+                                    wit_interface: rec.interface.clone(),
+                                    wit_package: rec.package.clone(),
+                                    wit_package_version: rec.package_version.clone(),
+                                    helper_snake: rec.helper_snake(),
+                                }));
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+                if let Some(mixed) = mixed {
+                    if !mixed.is_empty()
+                        && mixed
+                            .iter()
+                            .any(|e| matches!(e, ListTupleElem::Record(_)))
+                    {
+                        return Ok(RetShape::JsonText {
+                            kind: JsonRetKind::ListTupleMixed(mixed),
+                        });
+                    }
+                }
                 let parts: Vec<String> = elems.iter().map(type_label_dbg).collect();
                 return Err(format!(
                     "return type not in dispatcher alphabet: list<tuple<{}>> (tuple shape not yet wired)",
@@ -2887,6 +3025,23 @@ pub fn list_tuple_sig_suffix(elements: &[ListPrimElem]) -> String {
     elements
         .iter()
         .map(|e| e.helper_suffix())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// #724: mixed-tuple helper-name suffix. Primitives use their
+/// `helper_suffix()` (identical to `list_tuple_sig_suffix`);
+/// records use `helper_snake` (already disambiguated for
+/// same-kebab collisions via `RecordType::helper_snake` per
+/// #709/#710). E.g. `[Prim(String), Record(tfloat-sequence)]`
+/// → `"string_tfloat_sequence"`.
+pub fn list_tuple_mixed_sig_suffix(elements: &[ListTupleElem]) -> String {
+    elements
+        .iter()
+        .map(|e| match e {
+            ListTupleElem::Prim(p) => p.helper_suffix().to_string(),
+            ListTupleElem::Record(r) => r.helper_snake.clone(),
+        })
         .collect::<Vec<_>>()
         .join("_")
 }

@@ -224,6 +224,7 @@ pub fn paramshape_to_logicaltype(p: &ParamShape) -> String {
         ParamShape::ListPrim(_)
         | ParamShape::ListRecord { .. }
         | ParamShape::ListTuple { .. }
+        | ParamShape::ListTupleMixed { .. }
         | ParamShape::ListListU8
         | ParamShape::ListListPrim(_) => "types::Logicaltype::Text".to_string(),
         ParamShape::Enum { .. } => "types::Logicaltype::Int64".to_string(),

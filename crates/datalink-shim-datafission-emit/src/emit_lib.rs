@@ -551,6 +551,29 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         }
     }
 
+    // #724: same for mixed-tuple signatures where at least one
+    // element is a same-shim record (e.g. `string_tfloat_sequence`).
+    // Dedup by suffix-name since `ListTupleElem` is `!Ord` (holds
+    // Strings via `TupleRecordRef`).
+    let mut tuple_mixed_sigs: Vec<Vec<interface_db::ListTupleElem>> = Vec::new();
+    let mut push_mixed = |sig: &[interface_db::ListTupleElem],
+                          out: &mut Vec<Vec<interface_db::ListTupleElem>>| {
+        let suf = interface_db::list_tuple_mixed_sig_suffix(sig);
+        if !out
+            .iter()
+            .any(|prev| interface_db::list_tuple_mixed_sig_suffix(prev) == suf)
+        {
+            out.push(sig.to_vec());
+        }
+    };
+    for (entry, _f) in &scalar_entries {
+        for p in &entry.shape.params {
+            if let Some(sig) = p.list_tuple_mixed_sig() {
+                push_mixed(sig, &mut tuple_mixed_sigs);
+            }
+        }
+    }
+
     // Discover whether the primary shim's WIT declares
     // geometry/raster/topology resource + matching error variant.
     // The per-resource helper bodies (`from_wkb`, `from_raster_binary`,
@@ -833,6 +856,7 @@ use bindings::datafission::function_plugin::types as types;
     }
     s.push_str(JSON_LIST_PRIM_HELPERS);
     s.push_str(&render_tuple_list_helpers(&tuple_sigs));
+    s.push_str(&render_tuple_list_mixed_helpers(&tuple_mixed_sigs));
     if !helper_records.is_empty() {
         s.push_str(&emit_wit_value_helpers(&helper_records));
     }
@@ -2908,6 +2932,74 @@ fn render_tuple_list_helpers(
                 interface_db::ListPrimElem::U8 => "u8",
                 interface_db::ListPrimElem::Bool => "bool",
                 interface_db::ListPrimElem::String => "string",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "#[allow(dead_code)]\n\
+             fn parse_json_list_tuple_{suffix}(args: &[ftypes::ScalarValue], idx: usize, name: &str) -> Result<Vec<{rust_tuple}>, types::FunctionError> {{\n\
+             \x20   let text = dfv_text(args, idx, name)?;\n\
+             \x20   serde_json::from_str::<Vec<{rust_tuple}>>(text)\n\
+             \x20       .map_err(|e| types::FunctionError::ExecutionError(\n\
+             \x20           format!(\"{{name}}: arg {{idx}} must be JSON array of [{wit_label}] tuples ({{e}})\")))\n\
+             }}\n\n",
+        ));
+    }
+    s
+}
+
+/// #724: render each mixed-tuple helper (`list<tuple<prim|record, ...>>`).
+/// Records resolve to their upstream Rust binding path;
+/// `additional_derives: [Deserialize]` supplies the codec.
+fn render_tuple_list_mixed_helpers(
+    sigs: &[Vec<interface_db::ListTupleElem>],
+) -> String {
+    if sigs.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push_str(
+        "\n// ─── #724 mixed-tuple list<tuple<primitive|record, ...>> helpers ───\n",
+    );
+    for sig in sigs {
+        let suffix = interface_db::list_tuple_mixed_sig_suffix(sig);
+        let rust_elems: Vec<String> = sig
+            .iter()
+            .map(|e| match e {
+                interface_db::ListTupleElem::Prim(p) => p.rust_elem().to_string(),
+                interface_db::ListTupleElem::Record(r) => {
+                    let (pkg_ns, pkg_name) = split_pkg(&r.wit_package);
+                    format!(
+                        "bindings::{ns}::{name}::{iface}::{pascal}",
+                        ns = sanitize_module(&pkg_ns),
+                        name = sanitize_module(&pkg_name),
+                        iface = sanitize_module(&r.wit_interface),
+                        pascal = pascal_case(&r.kebab_name),
+                    )
+                }
+            })
+            .collect();
+        let rust_tuple = if rust_elems.len() == 1 {
+            format!("({},)", rust_elems[0])
+        } else {
+            format!("({})", rust_elems.join(", "))
+        };
+        let wit_label = sig
+            .iter()
+            .map(|e| match e {
+                interface_db::ListTupleElem::Prim(p) => match p {
+                    interface_db::ListPrimElem::F64 => "f64",
+                    interface_db::ListPrimElem::F32 => "f32",
+                    interface_db::ListPrimElem::S32 => "s32",
+                    interface_db::ListPrimElem::S64 => "s64",
+                    interface_db::ListPrimElem::U32 => "u32",
+                    interface_db::ListPrimElem::U64 => "u64",
+                    interface_db::ListPrimElem::U8 => "u8",
+                    interface_db::ListPrimElem::Bool => "bool",
+                    interface_db::ListPrimElem::String => "string",
+                }
+                .to_string(),
+                interface_db::ListTupleElem::Record(r) => r.kebab_name.clone(),
             })
             .collect::<Vec<_>>()
             .join(", ");

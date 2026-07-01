@@ -436,6 +436,11 @@ use bindings::exports::duckdb::extension::guest;
     let tuple_sigs = collect_tuple_list_sigs(&scalar_entries);
     helpers_block.push_str(&render_tuple_list_helpers(&tuple_sigs));
 
+    // #724: mixed-tuple helpers where at least one element is a
+    // same-shim record (e.g. `string_tfloat_sequence`).
+    let tuple_mixed_sigs = collect_tuple_list_mixed_sigs(&scalar_entries);
+    helpers_block.push_str(&render_tuple_list_mixed_helpers(&tuple_mixed_sigs));
+
     // Per-record wit-value helpers — only for records referenced
     // by a wired param or return.
     let referenced_records =
@@ -1979,6 +1984,94 @@ fn render_tuple_list_helpers(
                 ListPrimElem::U8 => "u8",
                 ListPrimElem::Bool => "bool",
                 ListPrimElem::String => "string",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "fn parse_json_list_tuple_{suffix}(args: &[types::Duckvalue], idx: usize, name: &str) -> Result<Vec<{rust_tuple}>, types::Duckerror> {{\n\
+             \x20   let text = dv_text(args, idx, name)?;\n\
+             \x20   serde_json::from_str::<Vec<{rust_tuple}>>(text)\n\
+             \x20       .map_err(|e| types::Duckerror::Invalidargument(format!(\"{{name}}: arg {{idx}} must be JSON array of [{wit_label}] tuples ({{e}})\")))\n\
+             }}\n\n",
+        ));
+    }
+    s
+}
+
+/// #724: collect mixed-tuple signatures (each element is a primitive
+/// OR a same-shim record) for `ParamShape::ListTupleMixed`.
+fn collect_tuple_list_mixed_sigs(
+    scalar_entries: &[(interface_db::DispatchEntry, bool)],
+) -> Vec<Vec<interface_db::ListTupleElem>> {
+    let mut out: Vec<Vec<interface_db::ListTupleElem>> = Vec::new();
+    for (entry, _f) in scalar_entries {
+        for p in &entry.shape.params {
+            if let Some(sig) = p.list_tuple_mixed_sig() {
+                let suf = interface_db::list_tuple_mixed_sig_suffix(sig);
+                if !out
+                    .iter()
+                    .any(|prev| interface_db::list_tuple_mixed_sig_suffix(prev) == suf)
+                {
+                    out.push(sig.to_vec());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// #724: render mixed-tuple `parse_json_list_tuple_<sig>` helpers.
+/// Record elements resolve to upstream Rust paths carrying
+/// `serde::Deserialize` via wit-bindgen's `additional_derives`.
+fn render_tuple_list_mixed_helpers(
+    sigs: &[Vec<interface_db::ListTupleElem>],
+) -> String {
+    if sigs.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push_str(
+        "\n// ─── #724 mixed-tuple list<tuple<primitive|record, ...>> helpers ───\n",
+    );
+    for sig in sigs {
+        let suffix = interface_db::list_tuple_mixed_sig_suffix(sig);
+        let rust_elems: Vec<String> = sig
+            .iter()
+            .map(|e| match e {
+                interface_db::ListTupleElem::Prim(p) => p.rust_elem().to_string(),
+                interface_db::ListTupleElem::Record(r) => {
+                    let (pkg_ns, pkg_name) = split_pkg(&r.wit_package);
+                    format!(
+                        "bindings::{ns}::{name}::{iface}::{pascal}",
+                        ns = sanitize_module(&pkg_ns),
+                        name = sanitize_module(&pkg_name),
+                        iface = sanitize_module(&r.wit_interface),
+                        pascal = pascal_case(&r.kebab_name),
+                    )
+                }
+            })
+            .collect();
+        let rust_tuple = if rust_elems.len() == 1 {
+            format!("({},)", rust_elems[0])
+        } else {
+            format!("({})", rust_elems.join(", "))
+        };
+        let wit_label = sig
+            .iter()
+            .map(|e| match e {
+                interface_db::ListTupleElem::Prim(p) => match p {
+                    ListPrimElem::F64 => "f64",
+                    ListPrimElem::F32 => "f32",
+                    ListPrimElem::S32 => "s32",
+                    ListPrimElem::S64 => "s64",
+                    ListPrimElem::U32 => "u32",
+                    ListPrimElem::U64 => "u64",
+                    ListPrimElem::U8 => "u8",
+                    ListPrimElem::Bool => "bool",
+                    ListPrimElem::String => "string",
+                }
+                .to_string(),
+                interface_db::ListTupleElem::Record(r) => r.kebab_name.clone(),
             })
             .collect::<Vec<_>>()
             .join(", ");

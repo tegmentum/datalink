@@ -547,6 +547,16 @@ use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
         &collect_tuple_list_sigs(&scalar_entries, &agg_entries, &udtf_entries),
     );
 
+    // #724: emit `parse_json_list_tuple_<sig>` helpers for
+    // mixed-tuple sigs where at least one element is a same-shim
+    // record (e.g. `string_tfloat_sequence`). Uses the same
+    // naming family as `render_tuple_list_helpers`; unique helpers
+    // per sig since the record path resolves to a fully-qualified
+    // upstream Rust type.
+    let tuple_list_mixed_helpers = render_tuple_list_mixed_helpers(
+        &collect_tuple_list_mixed_sigs(&scalar_entries, &agg_entries, &udtf_entries),
+    );
+
     // #607 Phase 1 + #614: only emit the witvalue-typed aggregator
     // state (thread-local Vec<WitValuePayload> + push/take helpers)
     // when there's at least one record-input aggregate (Record or
@@ -917,7 +927,7 @@ fn parse_json_list_list_string(args: &[SqlValue], idx: usize, name: &str) -> Res
     serde_json::from_str::<Vec<Vec<String>>>(text)
         .map_err(|e| format!("{{name}}: arg {{idx}} must be JSON array of string arrays ({{e}})"))
 }}
-{TUPLE_LIST_HELPERS}{POSTGIS_HELPERS}{FORCE_LINK_BLOCK}
+{TUPLE_LIST_HELPERS}{TUPLE_LIST_MIXED_HELPERS}{POSTGIS_HELPERS}{FORCE_LINK_BLOCK}
 
 // ── Aggregate state ──
 //
@@ -1056,6 +1066,7 @@ struct {bridge_struct};
         bridge_struct = bridge_struct,
         POSTGIS_HELPERS = helpers_block.as_str(),
         TUPLE_LIST_HELPERS = tuple_list_helpers.as_str(),
+        TUPLE_LIST_MIXED_HELPERS = tuple_list_mixed_helpers.as_str(),
         FORCE_LINK_BLOCK = force_link_block.as_str(),
         WITVALUE_AGG_STATE_DECL = witvalue_state_decl.as_str(),
         WITVALUE_AGG_STATE_HELPERS = witvalue_state_helpers.as_str(),
@@ -2752,6 +2763,121 @@ fn render_tuple_list_helpers(
                 dispatch::ListPrimElem::U8 => "u8",
                 dispatch::ListPrimElem::Bool => "bool",
                 dispatch::ListPrimElem::String => "string",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "#[allow(dead_code)]\n\
+             fn parse_json_list_tuple_{suffix}(args: &[SqlValue], idx: usize, name: &str) -> Result<Vec<{rust_tuple}>, String> {{\n\
+             \x20   let text = arg_text(args, idx, name)?;\n\
+             \x20   serde_json::from_str::<Vec<{rust_tuple}>>(text)\n\
+             \x20       .map_err(|e| format!(\"{{name}}: arg {{idx}} must be JSON array of [{wit_label}] tuples ({{e}})\"))\n\
+             }}\n\n",
+        ));
+    }
+    s
+}
+
+/// #724: collect the mixed-tuple signatures (each element is a
+/// primitive OR a same-shim record). Deduplication key is the raw
+/// `Vec<ListTupleElem>` — same interface+kebab always renders to
+/// the same helper name so the emit collapses correctly across
+/// callers.
+fn collect_tuple_list_mixed_sigs(
+    scalar_entries: &[(dispatch::DispatchEntry, bool)],
+    agg_entries: &[dispatch::AggregateEntry],
+    udtf_entries: &[dispatch::UdtfEntry],
+) -> Vec<Vec<dispatch::ListTupleElem>> {
+    let mut out: Vec<Vec<dispatch::ListTupleElem>> = Vec::new();
+    let mut push = |sig: &[dispatch::ListTupleElem]| {
+        let suf = dispatch::list_tuple_mixed_sig_suffix(sig);
+        if !out
+            .iter()
+            .any(|prev| dispatch::list_tuple_mixed_sig_suffix(prev) == suf)
+        {
+            out.push(sig.to_vec());
+        }
+    };
+    for (entry, _f) in scalar_entries {
+        for p in &entry.shape.params {
+            if let Some(sig) = p.list_tuple_mixed_sig() {
+                push(sig);
+            }
+        }
+    }
+    for entry in agg_entries {
+        for p in &entry.shape.extra_args {
+            if let Some(sig) = p.list_tuple_mixed_sig() {
+                push(sig);
+            }
+        }
+    }
+    for entry in udtf_entries {
+        for p in &entry.shape.params {
+            if let Some(sig) = p.list_tuple_mixed_sig() {
+                push(sig);
+            }
+        }
+    }
+    out
+}
+
+/// #724: render a `parse_json_list_tuple_<sig>` helper for each
+/// mixed-tuple signature. Uses `serde_json::from_str::<Vec<(T1, T2, ...)>>`
+/// — record elements resolve to their upstream Rust type
+/// (`bindings::<ns>::<name>::<iface>::<Pascal>`), which carries
+/// `serde::Deserialize` via wit-bindgen's `additional_derives`.
+fn render_tuple_list_mixed_helpers(
+    sigs: &[Vec<dispatch::ListTupleElem>],
+) -> String {
+    if sigs.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push_str(
+        "\n// #724: list<tuple<primitive|record, ...>> param helpers.\n\
+         // One per unique mixed-tuple signature. Records deserialize\n\
+         // via wit-bindgen's `additional_derives: [Deserialize]`.\n",
+    );
+    for sig in sigs {
+        let suffix = dispatch::list_tuple_mixed_sig_suffix(sig);
+        let rust_elems: Vec<String> = sig
+            .iter()
+            .map(|e| match e {
+                dispatch::ListTupleElem::Prim(p) => p.rust_elem().to_string(),
+                dispatch::ListTupleElem::Record(r) => {
+                    let (pkg_ns, pkg_name) = split_pkg(&r.wit_package);
+                    format!(
+                        "bindings::{ns}::{name}::{iface}::{pascal}",
+                        ns = sanitize_module(&pkg_ns),
+                        name = sanitize_module(&pkg_name),
+                        iface = sanitize_module(&r.wit_interface),
+                        pascal = pascal_case(&r.kebab_name),
+                    )
+                }
+            })
+            .collect();
+        let rust_tuple = if rust_elems.len() == 1 {
+            format!("({},)", rust_elems[0])
+        } else {
+            format!("({})", rust_elems.join(", "))
+        };
+        let wit_label = sig
+            .iter()
+            .map(|e| match e {
+                dispatch::ListTupleElem::Prim(p) => match p {
+                    dispatch::ListPrimElem::F64 => "f64",
+                    dispatch::ListPrimElem::F32 => "f32",
+                    dispatch::ListPrimElem::S32 => "s32",
+                    dispatch::ListPrimElem::S64 => "s64",
+                    dispatch::ListPrimElem::U32 => "u32",
+                    dispatch::ListPrimElem::U64 => "u64",
+                    dispatch::ListPrimElem::U8 => "u8",
+                    dispatch::ListPrimElem::Bool => "bool",
+                    dispatch::ListPrimElem::String => "string",
+                }
+                .to_string(),
+                dispatch::ListTupleElem::Record(r) => r.kebab_name.clone(),
             })
             .collect::<Vec<_>>()
             .join(", ");

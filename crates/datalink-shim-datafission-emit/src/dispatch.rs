@@ -49,9 +49,9 @@
 //!     `ExecutionError`.
 
 use datalink_shim_codegen_core::interface_db::{
-    AccKind, AggregateShape, ColumnAffinity, DispatchShape, JsonRetKind,
-    ListPrimElem, ParamShape, RetShape, ScalarReturnKind, UdtfFieldShape,
-    UdtfOutputRow, UdtfShape,
+    list_tuple_mixed_sig_suffix, AccKind, AggregateShape, ColumnAffinity,
+    DispatchShape, JsonRetKind, ListPrimElem, ParamShape, RetShape,
+    ScalarReturnKind, UdtfFieldShape, UdtfOutputRow, UdtfShape,
 };
 
 /// Emit the body of one match arm of the scalar dispatch by name
@@ -245,6 +245,20 @@ pub fn emit_scalar_arm_body(
                 };
                 s.push_str(&format!(
                     "{i}let arg{idx}: Vec<{rust_tuple}> = parse_json_list_tuple_{suffix}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
+            ParamShape::ListTupleMixed { elements } => {
+                // #724: `list<tuple<E1, E2, ...>>` param where at
+                // least one Ei is a same-shim record. Today's
+                // surface (mobilitydb): `tfloat-batch-to-parquet`
+                // — `list<tuple<string, tfloat-sequence>>`. The
+                // per-signature helper handles the fully-qualified
+                // `Vec<(String, UPSTREAM_R)>` type; the arm just
+                // calls it by suffix.
+                let suffix = list_tuple_mixed_sig_suffix(elements);
+                s.push_str(&format!(
+                    "{i}let arg{idx} = parse_json_list_tuple_{suffix}(&args, {idx}, \"{sql_name}\")?;\n",
                 ));
                 call_args.push(format!("&arg{idx}"));
             }
@@ -642,8 +656,13 @@ fn render_ret_to_scalarvalue(
             )
         }
         RetShape::JsonText { kind } => match kind {
+            // #724: `ListTupleMixed` uses the same
+            // `serde_json::to_string(&__r)` template — the
+            // upstream `Vec<(String, UPSTREAM_R)>` serializes
+            // via the record's wit-bindgen `Serialize` derive.
             JsonRetKind::ListListPrim(_)
             | JsonRetKind::ListTuplePrim(_)
+            | JsonRetKind::ListTupleMixed(_)
             | JsonRetKind::TuplePrim(_) => format!(
                 "{{\n\
                  {i}    let __r = {call_expr}{unwrap_chain};\n\
@@ -808,6 +827,7 @@ pub fn paramshape_to_logicaltype(p: &ParamShape) -> String {
         ParamShape::ListPrim(_)
         | ParamShape::ListRecord { .. }
         | ParamShape::ListTuple { .. }
+                | ParamShape::ListTupleMixed { .. }
         | ParamShape::ListListU8
         | ParamShape::ListListPrim(_) => "types::LogicalType::Utf8".to_string(),
         ParamShape::Enum { .. } => "types::LogicalType::Int64".to_string(),
@@ -1102,6 +1122,7 @@ pub fn emit_aggregate_finalize_body(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
+                | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
                 | ParamShape::ListListPrim(_) => {
                     return format!(
@@ -1396,6 +1417,7 @@ fn emit_aggregate_finalize_body_record_to_scalar(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
+                | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
                 | ParamShape::ListListPrim(_) => {
                     return format!(
@@ -1574,6 +1596,7 @@ fn emit_aggregate_finalize_body_record_to_tuple(
                 | ParamShape::ListPrim(_)
                 | ParamShape::ListRecord { .. }
                 | ParamShape::ListTuple { .. }
+                | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
                 | ParamShape::ListListPrim(_) => {
                     return format!(
@@ -1666,6 +1689,7 @@ pub fn emit_udtf_begin_body(
             ParamShape::ListGeom => Some((idx, "list<geometry>")),
             ParamShape::ListRecord { .. } => Some((idx, "list<record>")),
             ParamShape::ListTuple { .. } => Some((idx, "list<tuple>")),
+            ParamShape::ListTupleMixed { .. } => Some((idx, "list<tuple<mixed>>")),
             ParamShape::ListPrim(_) => Some((idx, "list<primitive>")),
             ParamShape::ListListU8 => Some((idx, "list<list<u8>>")),
             ParamShape::ListListPrim(_) => Some((idx, "list<list<primitive>>")),
@@ -1938,6 +1962,7 @@ fn emit_udtf_param_marshal_df(
             | ParamShape::ListGeom
             | ParamShape::ListRecord { .. }
             | ParamShape::ListTuple { .. }
+            | ParamShape::ListTupleMixed { .. }
             | ParamShape::ListPrim(_)
             | ParamShape::ListListU8
             | ParamShape::ListListPrim(_) => {
