@@ -245,6 +245,38 @@ pub enum ParamShape {
     ///     `make-multilinestring` (`list<list<f64>>` coords).
     /// Symmetric with `RetShape::JsonText { ListListPrim }`.
     ListListPrim(ListPrimElem),
+    /// #781: `list<list<R>>` param where `R` is a record type
+    /// declared in the shim's WIT. Extends the `ListRecord`
+    /// pattern to the nested-list shape used by mobilitydb's
+    /// spanset-extent-ops interface — the four
+    /// `<int|float|date|tstz>-spanset-extent` scalars take
+    /// `list<list<{int,float,date}-span>>` where the outer list
+    /// is the batch of spansets and each inner list is one
+    /// spanset's spans.
+    ///
+    /// SQL surface: JSON-array of arrays of record-shaped
+    /// objects, e.g.
+    /// `'[[{"lower":1,"upper":10,"lower-inc":true,"upper-inc":false}], ...]'`.
+    ///
+    /// Dispatch arm parses the TEXT via
+    /// `serde_json::from_str::<Vec<Vec<UPSTREAM>>>` (wit-bindgen's
+    /// `additional_derives: [Deserialize]` makes UPSTREAM records
+    /// directly deserialisable; no LOCAL serde-ops codec is
+    /// needed because dispatch is by func_id / name, not by
+    /// type_id). The resulting `Vec<Vec<UPSTREAM>>` is passed to
+    /// the WIT call as `&arg{idx}`.
+    ///
+    /// Mirrors the field layout of `ListRecord` so the
+    /// emit_arm_body machinery re-uses the upstream-path lookup
+    /// and the per-record helper suffix.
+    ListListRecord {
+        kebab_name: String,
+        wit_interface: String,
+        wit_package: String,
+        wit_package_version: String,
+        /// #710: helper-function suffix — see `ParamShape::WitValueRecord::helper_snake`.
+        helper_snake: String,
+    },
     /// W2 Phase 2 mop-up (#555): `list<tuple<T1, T2, ...>>` param
     /// where every Ti is primitive (today: only `list<tuple<s32,
     /// s32>>` is on the surface for mobilitydb's datespanset
@@ -2684,6 +2716,31 @@ pub fn classify_param(
                 if let Some(elem) = list_prim_elem(inner_inner) {
                     return Ok(ParamShape::ListListPrim(elem));
                 }
+                // #781: `list<list<R>>` where R is a same-shim
+                // record. Today's scalar surface (mobilitydb):
+                // the spanset-extent-ops interface's four
+                // `<int|float|date|tstz>-spanset-extent` fns take
+                // `list<list<{int,float,date}-span>>`. Records
+                // arrive as `WitType::Unsupported(kebab)`; look up
+                // in the registry via `find_record` (respects
+                // caller_interface for same-kebab collisions,
+                // parallel to how `ListRecord` handles the flat
+                // case). The sibling `spanset-aggregate-union`
+                // family routes through `classify_aggregate_shape`
+                // on the aggregate path (see #782 for the
+                // `-aggregate-` infix detection) so it doesn't
+                // reach this scalar-param arm.
+                if let WitType::Unsupported(name) = inner_inner.as_ref() {
+                    if let Some(rec) = find_record(records, name, caller_interface) {
+                        return Ok(ParamShape::ListListRecord {
+                            kebab_name: rec.kebab_name.clone(),
+                            wit_interface: rec.interface.clone(),
+                            wit_package: rec.package.clone(),
+                            wit_package_version: rec.package_version.clone(),
+                            helper_snake: rec.helper_snake(),
+                        });
+                    }
+                }
             }
             // W2 Phase 1 (#542): primitive-element `list<X>` param
             // via JSON-as-TEXT marshaling. SQL passes a JSON array
@@ -4569,5 +4626,115 @@ mod wit_fn_category_tests {
             WitType::F64,
         );
         assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
+    }
+}
+
+#[cfg(test)]
+mod list_list_record_tests {
+    //! #781: `list<list<R>>` param classifier coverage.
+    //!
+    //! Mobilitydb's spanset-extent-ops interface takes
+    //! `list<list<{int,float,date}-span>>` inputs — the outer list
+    //! is the batch of spansets and each inner list is one
+    //! spanset's spans. Before this variant landed, `classify_param`
+    //! fell through to the generic Err on the nested-list-of-record
+    //! shape and the four
+    //! `<int|float|date|tstz>-spanset-extent` scalars never made it
+    //! into the generated bridge's list_functions. The sibling
+    //! `spanset-aggregate-union` family is handled on the aggregate
+    //! path via #782's `-aggregate-` infix classifier.
+    use super::*;
+    use crate::record_registry::RecordType;
+    use crate::wit_parse::WitType;
+
+    fn make_int_span_record() -> RecordType {
+        RecordType {
+            package: "mobilitydb:temporal".to_string(),
+            package_version: "0.1.0".to_string(),
+            interface: "spans-ops".to_string(),
+            kebab_name: "int-span".to_string(),
+            fields: vec![
+                ("lower".to_string(), "s32".to_string()),
+                ("upper".to_string(), "s32".to_string()),
+                ("lower-inc".to_string(), "bool".to_string()),
+                ("upper-inc".to_string(), "bool".to_string()),
+            ],
+            type_id: [0u8; 32],
+            symbolic_name: "mobilitydb:temporal@0.1.0/spans-ops/int-span".to_string(),
+            is_copy: true,
+            direct: true,
+            kebab_collides_in_pkg: false,
+        }
+    }
+
+    #[test]
+    fn param_list_list_record_routes_to_list_list_record() {
+        // `list<list<int-span>>` — the shape from
+        // `int-spanset-extent`.
+        let records = vec![make_int_span_record()];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let t = WitType::List(Box::new(WitType::List(Box::new(
+            WitType::Unsupported("int-span".to_string()),
+        ))));
+        let shape = classify_param(&t, &records, &enums, "spanset-extent-ops").unwrap();
+        match shape {
+            ParamShape::ListListRecord {
+                kebab_name,
+                wit_interface,
+                helper_snake,
+                ..
+            } => {
+                assert_eq!(kebab_name, "int-span");
+                assert_eq!(wit_interface, "spans-ops");
+                assert_eq!(helper_snake, "int_span");
+            }
+            other => panic!("expected ListListRecord, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn param_list_list_record_without_matching_record_errors() {
+        // No record registered → the classifier can't route the
+        // shape and must surface a diagnostic naming the shape so
+        // the codegen's per-scalar unwired reason names the gap.
+        let records: Vec<RecordType> = vec![];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let t = WitType::List(Box::new(WitType::List(Box::new(
+            WitType::Unsupported("mystery-span".to_string()),
+        ))));
+        let err = classify_param(&t, &records, &enums, "spanset-extent-ops").unwrap_err();
+        assert!(
+            err.contains("not in dispatcher alphabet"),
+            "expected alphabet-diagnostic, got {err}",
+        );
+    }
+
+    #[test]
+    fn param_list_list_prim_still_routes_to_list_list_prim() {
+        // Regression: adding `ListListRecord` must not steal the
+        // pre-existing `list<list<f64>>` (`ListListPrim`) surface
+        // — the prim check runs first inside the nested-list arm.
+        let records: Vec<RecordType> = vec![];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let t = WitType::List(Box::new(WitType::List(Box::new(WitType::F64))));
+        let shape = classify_param(&t, &records, &enums, "postgis-raster").unwrap();
+        assert!(
+            matches!(shape, ParamShape::ListListPrim(ListPrimElem::F64)),
+            "expected ListListPrim(F64), got {shape:?}",
+        );
+    }
+
+    #[test]
+    fn param_list_list_u8_still_routes_to_list_list_u8() {
+        // Regression: `list<list<u8>>` — the postgis batch WKB
+        // path — stays on the dedicated ListListU8 arm.
+        let records: Vec<RecordType> = vec![];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let t = WitType::List(Box::new(WitType::ListU8));
+        let shape = classify_param(&t, &records, &enums, "postgis-batch").unwrap();
+        assert!(
+            matches!(shape, ParamShape::ListListU8),
+            "expected ListListU8, got {shape:?}",
+        );
     }
 }

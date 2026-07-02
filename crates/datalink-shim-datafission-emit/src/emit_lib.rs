@@ -3137,6 +3137,29 @@ fn emit_wit_value_helpers(records: &[RecordType]) -> String {
             kebab = r.kebab_name,
         ));
 
+        // #781: `parse_json_list_list_record_<snake>` for
+        // ListListRecord params. Mirrors the flat helper one
+        // level deeper — reads a TEXT arg holding JSON-of-JSON of
+        // record-shaped objects and hands back
+        // `Vec<Vec<UPSTREAM>>`. wit-bindgen's
+        // `additional_derives: [Deserialize]` makes UPSTREAM
+        // records directly deserializable (dispatch by name, not
+        // by type_id, so no ciborium round-trip needed).
+        s.push_str(&format!(
+            "#[allow(dead_code)]\n\
+             fn parse_json_list_list_record_{snake}(\n\
+             \x20   args: &[ftypes::ScalarValue],\n\
+             \x20   idx: usize,\n\
+             \x20   name: &str,\n\
+             ) -> Result<Vec<Vec<{upstream_path}>>, types::FunctionError> {{\n\
+             \x20   let text = dfv_text(args, idx, name)?;\n\
+             \x20   serde_json::from_str::<Vec<Vec<{upstream_path}>>>(text)\n\
+             \x20       .map_err(|e| types::FunctionError::ExecutionError(\n\
+             \x20           format!(\"{{name}}: arg {{idx}} must be JSON array of arrays of {kebab} ({{e}})\")))\n\
+             }}\n\n",
+            kebab = r.kebab_name,
+        ));
+
         // Encoder: UPSTREAM → WTV-framed Binary.
         s.push_str(&format!(
             "#[allow(dead_code)]\n\

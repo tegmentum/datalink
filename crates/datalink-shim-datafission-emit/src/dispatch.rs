@@ -288,6 +288,21 @@ pub fn emit_scalar_arm_body(
                 ));
                 call_args.push(format!("&arg{idx}"));
             }
+            ParamShape::ListListRecord { helper_snake, .. } => {
+                // #781: `list<list<R>>` over a same-shim record.
+                // Mirrors `ListRecord` (`parse_json_list_record_<snake>`)
+                // one level deeper — the per-record
+                // `parse_json_list_list_record_<snake>` helper reads
+                // TEXT holding JSON `Vec<Vec<UPSTREAM>>` and hands
+                // the WIT call a `&Vec<Vec<UPSTREAM>>` (coerces to
+                // `&[Vec<UPSTREAM>]`, the wit-bindgen binding for
+                // `list<list<record>>`). Covers mobilitydb's
+                // `<int|float|date|tstz>-spanset-extent` scalars.
+                s.push_str(&format!(
+                    "{i}let arg{idx} = parse_json_list_list_record_{helper_snake}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
             ParamShape::WitValueRecord {
                 helper_snake,
                 upstream_by_value,
@@ -829,7 +844,8 @@ pub fn paramshape_to_logicaltype(p: &ParamShape) -> String {
         | ParamShape::ListTuple { .. }
                 | ParamShape::ListTupleMixed { .. }
         | ParamShape::ListListU8
-        | ParamShape::ListListPrim(_) => "types::LogicalType::Utf8".to_string(),
+        | ParamShape::ListListPrim(_)
+        | ParamShape::ListListRecord { .. } => "types::LogicalType::Utf8".to_string(),
         ParamShape::Enum { .. } => "types::LogicalType::Int64".to_string(),
         ParamShape::WitValueRecord { .. } => "types::LogicalType::Binary".to_string(),
         ParamShape::OptionNone => "types::LogicalType::Utf8".to_string(),
@@ -1124,7 +1140,8 @@ pub fn emit_aggregate_finalize_body(
                 | ParamShape::ListTuple { .. }
                 | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
-                | ParamShape::ListListPrim(_) => {
+                | ParamShape::ListListPrim(_)
+                | ParamShape::ListListRecord { .. } => {
                     return format!(
                         "{i}Err(ftypes::FunctionError::ExecutionError(\
                          format!(\"{sql_name}: aggregate config arg #{j} shape not wired\")))",
@@ -1419,7 +1436,8 @@ fn emit_aggregate_finalize_body_record_to_scalar(
                 | ParamShape::ListTuple { .. }
                 | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
-                | ParamShape::ListListPrim(_) => {
+                | ParamShape::ListListPrim(_)
+                | ParamShape::ListListRecord { .. } => {
                     return format!(
                         "{i}Err(ftypes::FunctionError::ExecutionError(\
                          format!(\"{sql_name}: aggregate config arg #{j} shape not wired\")))",
@@ -1598,7 +1616,8 @@ fn emit_aggregate_finalize_body_record_to_tuple(
                 | ParamShape::ListTuple { .. }
                 | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
-                | ParamShape::ListListPrim(_) => {
+                | ParamShape::ListListPrim(_)
+                | ParamShape::ListListRecord { .. } => {
                     return format!(
                         "{i}Err(ftypes::FunctionError::ExecutionError(\
                          format!(\"{sql_name}: aggregate config arg #{j} shape not wired\")))",
@@ -1693,6 +1712,7 @@ pub fn emit_udtf_begin_body(
             ParamShape::ListPrim(_) => Some((idx, "list<primitive>")),
             ParamShape::ListListU8 => Some((idx, "list<list<u8>>")),
             ParamShape::ListListPrim(_) => Some((idx, "list<list<primitive>>")),
+            ParamShape::ListListRecord { .. } => Some((idx, "list<list<record>>")),
             ParamShape::Enum { .. } => Some((idx, "enum")),
             _ => None,
         }
@@ -1965,7 +1985,8 @@ fn emit_udtf_param_marshal_df(
             | ParamShape::ListTupleMixed { .. }
             | ParamShape::ListPrim(_)
             | ParamShape::ListListU8
-            | ParamShape::ListListPrim(_) => {
+            | ParamShape::ListListPrim(_)
+            | ParamShape::ListListRecord { .. } => {
                 s.push_str(&format!(
                     "{i}return Err(ftypes::FunctionError::ExecutionError(format!(\"{sql_name}: UDTF param shape not wired\")));\n",
                 ));

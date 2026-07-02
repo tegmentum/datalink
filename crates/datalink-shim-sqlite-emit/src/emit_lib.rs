@@ -3045,6 +3045,27 @@ fn emit_wit_value_helpers(
              }}\n\n",
             kebab = r.kebab_name,
         ));
+        // #781: `list<list<R>>` param helper. Same JSON-as-TEXT
+        // marshaling as `parse_json_list_record_<snake>` one
+        // level deeper — SQL callers pass a JSON array-of-arrays
+        // and the dispatch arm hands the WIT call
+        // `&Vec<Vec<UPSTREAM>>`. Emitted for every record in the
+        // helper-records set so ListListRecord-param scalars find
+        // the helper regardless of whether the bridge also has
+        // flat-list or WitValue uses of the same record.
+        s.push_str(&format!(
+            "#[allow(dead_code)]\n\
+             fn parse_json_list_list_record_{snake}(\n\
+             \x20   args: &[SqlValue],\n\
+             \x20   idx: usize,\n\
+             \x20   name: &str,\n\
+             ) -> Result<Vec<Vec<{upstream_path}>>, String> {{\n\
+             \x20   let text = arg_text(args, idx, name)?;\n\
+             \x20   serde_json::from_str::<Vec<Vec<{upstream_path}>>>(text)\n\
+             \x20       .map_err(|e| format!(\"{{name}}: arg {{idx}} must be JSON array of arrays of {kebab} ({{e}})\"))\n\
+             }}\n\n",
+            kebab = r.kebab_name,
+        ));
         // Encoder helper: UPSTREAM → bytes → WitValue.
         s.push_str(&format!(
             "#[allow(dead_code)]\n\

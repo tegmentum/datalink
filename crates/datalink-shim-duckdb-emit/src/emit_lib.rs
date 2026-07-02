@@ -2162,6 +2162,26 @@ fn render_wit_value_helpers(records: &[RecordType]) -> String {
              }}\n\n",
             kebab = kebab,
         ));
+        // #781: `list<list<R>>` param helper — parallel to the
+        // flat-list `parse_json_list_record_<snake>` one level
+        // deeper. Reads a TEXT arg holding
+        // `serde_json::from_str::<Vec<Vec<UPSTREAM>>>` and hands
+        // back a `Vec<Vec<UPSTREAM>>` for the dispatcher to pass
+        // as `&arg{idx}` (coerces to `&[Vec<UPSTREAM>]`, the
+        // wit-bindgen binding for `list<list<record>>`).
+        s.push_str(&format!(
+            "fn parse_json_list_list_record_{snake}(\n\
+             \x20   args: &[types::Duckvalue],\n\
+             \x20   idx: usize,\n\
+             \x20   name: &str,\n\
+             ) -> Result<Vec<Vec<{upstream_path}>>, types::Duckerror> {{\n\
+             \x20   let text = dv_text(args, idx, name)?;\n\
+             \x20   serde_json::from_str::<Vec<Vec<{upstream_path}>>>(text)\n\
+             \x20       .map_err(|e| types::Duckerror::Invalidargument(\n\
+             \x20           format!(\"{{name}}: arg {{idx}} must be JSON array of arrays of {kebab} ({{e}})\")))\n\
+             }}\n\n",
+            kebab = kebab,
+        ));
         s.push_str(&format!(
             "fn ret_to_witvalue_{snake}(\n\
              \x20   upstream: {upstream_path},\n\

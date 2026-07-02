@@ -268,6 +268,21 @@ pub fn emit_scalar_arm_body(
                 ));
                 call_args.push(format!("&arg{idx}"));
             }
+            ParamShape::ListListRecord { helper_snake, .. } => {
+                // #781: `list<list<R>>` over a same-shim record.
+                // Mirrors `ListRecord` one level deeper — the
+                // per-record `parse_json_list_list_record_<snake>`
+                // helper reads TEXT holding JSON
+                // `Vec<Vec<UPSTREAM>>` and hands the WIT call a
+                // `&Vec<Vec<UPSTREAM>>` (coerces to
+                // `&[Vec<UPSTREAM>]`, the wit-bindgen binding for
+                // `list<list<record>>`). Covers mobilitydb's
+                // `<int|float|date|tstz>-spanset-extent` scalars.
+                s.push_str(&format!(
+                    "{i}let arg{idx} = parse_json_list_list_record_{helper_snake}(&args, {idx}, \"{sql_name}\")?;\n",
+                ));
+                call_args.push(format!("&arg{idx}"));
+            }
             ParamShape::WitValueRecord {
                 helper_snake,
                 upstream_by_value,
@@ -1010,7 +1025,8 @@ pub fn emit_aggregate_arm_body(
                 | ParamShape::ListTuple { .. }
                 | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
-                | ParamShape::ListListPrim(_) => {
+                | ParamShape::ListListPrim(_)
+                | ParamShape::ListListRecord { .. } => {
                     // Record / list / enum extras are not part of
                     // the postgis or mobilitydb aggregate surfaces
                     // today. Bail clearly so the unwired-symbol
@@ -1312,7 +1328,8 @@ fn emit_aggregate_arm_body_record_to_scalar(
                 | ParamShape::ListTuple { .. }
                 | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
-                | ParamShape::ListListPrim(_) => {
+                | ParamShape::ListListPrim(_)
+                | ParamShape::ListListRecord { .. } => {
                     return format!(
                         "{i}Err(types::Duckerror::Unsupported(format!(\
                          \"{sql_name}: aggregate extra arg #{j} shape not wired\")))",
@@ -1494,7 +1511,8 @@ fn emit_aggregate_arm_body_record_to_tuple(
                 | ParamShape::ListTuple { .. }
                 | ParamShape::ListTupleMixed { .. }
                 | ParamShape::ListListU8
-                | ParamShape::ListListPrim(_) => {
+                | ParamShape::ListListPrim(_)
+                | ParamShape::ListListRecord { .. } => {
                     return format!(
                         "{i}Err(types::Duckerror::Unsupported(format!(\
                          \"{sql_name}: aggregate extra arg #{j} shape not wired\")))",
@@ -1581,6 +1599,7 @@ pub fn emit_udtf_call_body(
             ParamShape::ListPrim(_) => Some((idx, "list<primitive>")),
             ParamShape::ListListU8 => Some((idx, "list<list<u8>>")),
             ParamShape::ListListPrim(_) => Some((idx, "list<list<primitive>>")),
+            ParamShape::ListListRecord { .. } => Some((idx, "list<list<record>>")),
             _ => None,
         }
     }) {
@@ -1829,7 +1848,8 @@ fn emit_udtf_param_marshal(
             | ParamShape::ListTupleMixed { .. }
             | ParamShape::ListPrim(_)
             | ParamShape::ListListU8
-            | ParamShape::ListListPrim(_) => {
+            | ParamShape::ListListPrim(_)
+            | ParamShape::ListListRecord { .. } => {
                 s.push_str(&format!(
                     "{i}return Err(types::Duckerror::Unsupported(format!(\"{sql_name}: UDTF list-param shape not wired\")));\n",
                 ));
