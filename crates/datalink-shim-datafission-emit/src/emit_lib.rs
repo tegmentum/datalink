@@ -94,6 +94,18 @@ fn build_cast_rewrites_body(plan: &BridgePlan) -> String {
     for ext in &plan.extensions {
         for c in &ext.cast_rewrites {
             let variant = cast_source_kind_variant(&c.source_kind);
+            // #798: `source_type_id` is carried through the interface
+            // DB and BridgePlan so distinct source-side rewrites
+            // survive PK dedup. The datafission
+            // `sql-extension-plugin/metadata` cast-rewrite record
+            // doesn't yet carry the field, so we drop it here on the
+            // way through the datafission-target emit. Downstream
+            // datafission consumers dispatch on `(target_type,
+            // source_kind, source_fn_hint)` only. If the datafission
+            // metadata WIT gains a `source-type-id` field, wire it in
+            // by adding a `source_type_id: <expr>,` line to the
+            // format string below.
+            let _ = c.source_type_id;
             s.push_str(&format!(
                 "            setypes::CastRewrite {{\n\
                  \x20               target_type: \"{tt}\".to_string(),\n\

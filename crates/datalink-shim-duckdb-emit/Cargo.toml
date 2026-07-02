@@ -11,7 +11,7 @@ name = "datalink_shim_duckdb_emit"
 path = "src/lib.rs"
 
 [dependencies]
-shim-bridge-codegen-core = { git = "https://github.com/tegmentum/shim-bridge-codegen-core.git", rev = "4cfd54965a930fb0f77c40ed71633dbc0347f3e0" }
+shim-bridge-codegen-core = { git = "https://github.com/tegmentum/shim-bridge-codegen-core.git", rev = "1bcc5bbe78467b1d74a4f3e4bbe4d15b2765b142" }
 datalink-shim-codegen-core = { path = "../datalink-shim-codegen-core" }
 anyhow = "1"
 # Canonical-WIT shape hashing — present here for symmetry with
