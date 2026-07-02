@@ -60,7 +60,7 @@ pub fn write_world(plan: &BridgePlan, dest: &Path) -> Result<()> {
     let primary = primary_extension_name(plan);
     let shim_deps = source_shim_deps_dir(primary)?;
     let shim_packages = discover_shim_packages(&shim_deps)?;
-    let datafission_packages = discover_datafission_packages()?;
+    let datafission_packages = discover_datafission_packages(primary)?;
     let world = render_world(primary, &shim_packages, &datafission_packages)?;
     fs::write(dest, world).with_context(|| format!("writing {}", dest.display()))?;
     Ok(())
@@ -108,7 +108,7 @@ pub fn write_deps(plan: &BridgePlan, deps_dir: &Path) -> Result<()> {
         copy_tree(&from, &to)
             .with_context(|| format!("copying {} -> {}", from.display(), to.display()))?;
     }
-    let datafission_wit_root = source_datafission_wit_root()?;
+    let datafission_wit_root = source_datafission_wit_root(primary)?;
     for pkg_dir_name in DATAFISSION_PACKAGE_DIRS {
         let from = datafission_wit_root.join(pkg_dir_name);
         if !from.is_dir() {
@@ -140,9 +140,18 @@ pub fn write_deps(plan: &BridgePlan, deps_dir: &Path) -> Result<()> {
 ///      `~/git/datafission/wit` (or wherever the seven plugin
 ///      packages live).
 ///   3. `$HOME/git/datafission/extensions/<primary>/wit/deps`
-///      (per-extension pre-laid-out deps tree).
+///      (per-extension pre-laid-out deps tree). Scoped to the CURRENT
+///      primary extension — using another extension's wit/deps as
+///      source is nearly always wrong (that extension's real-dir copy
+///      of a datafission package would produce a `from` whose canonical
+///      path differs from the bridge's `dst` symlink target, causing
+///      the `copy_tree` guard to clobber the intentional symlink layout
+///      on every regen). Only accepted when the candidate's package
+///      dirs canonicalize to the canonical wit root's package dirs
+///      (i.e. the candidate is a symlink farm to canonical, not an
+///      independent copy). #812.
 ///   4. `$HOME/git/datafission/wit` (canonical source-of-truth).
-fn source_datafission_wit_root() -> Result<PathBuf> {
+fn source_datafission_wit_root(primary: &str) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("DATAFISSION_EXTENSION_WIT_DEPS") {
         let p = PathBuf::from(p);
         if p.is_dir() {
@@ -165,16 +174,33 @@ fn source_datafission_wit_root() -> Result<PathBuf> {
     }
     if let Some(home) = std::env::var_os("HOME") {
         let home_pb = PathBuf::from(&home);
-        let per_ext = home_pb.join("git/datafission/extensions");
-        if per_ext.is_dir() {
-            for entry in fs::read_dir(&per_ext)?.flatten() {
-                let pe_wit = entry.path().join("wit/deps");
-                if pe_wit.is_dir() && pe_wit.join("extension/world.wit").is_file() {
-                    return Ok(pe_wit);
-                }
-            }
-        }
         let canonical = home_pb.join("git/datafission/wit");
+        // Option 3: per-primary pre-laid-out deps tree. Scoped to the
+        // CURRENT primary — previously iterated ALL extensions and
+        // picked the first that had extension/world.wit, which was the
+        // root cause of #812 (regenerating postgis picked mobilitydb's
+        // wit/deps because mobilitydb sorts first, and mobilitydb's
+        // real-dir copies of the datafission packages produced a `from`
+        // canonical path that didn't match the postgis bridge's `dst`
+        // symlink target under canonical wit, so every regen clobbered
+        // the intentional symlinks).
+        let per_primary = home_pb.join(format!(
+            "git/datafission/extensions/{primary}/wit/deps"
+        ));
+        if per_primary.is_dir()
+            && per_primary.join("extension/world.wit").is_file()
+            && wit_root_canonicalizes_to(&per_primary, &canonical)
+        {
+            return Ok(per_primary);
+        }
+        // Option 4: canonical source-of-truth. Also the safe fall-through
+        // for #812 — when option 3's candidate has real-dir per-package
+        // copies (not symlinks to canonical), returning `canonical` here
+        // means downstream `copy_tree`'s `same_file(from, dst-symlink)`
+        // check succeeds: `from` = canonical wit/<pkg>, dst-symlink's
+        // canonical target = canonical wit/<pkg>, `canonicalize` on both
+        // yields the same path, and the intentional symlink layout is
+        // preserved.
         if canonical.is_dir() {
             return Ok(canonical);
         }
@@ -185,10 +211,45 @@ fn source_datafission_wit_root() -> Result<PathBuf> {
     ))
 }
 
+/// Returns true when every `DATAFISSION_PACKAGE_DIRS` entry under
+/// `candidate` canonicalizes to the corresponding entry under
+/// `canonical_root` — i.e. `candidate` is a symlink farm to
+/// `canonical_root`.
+///
+/// #812: this is the "canonicalize ultimate targets against the same
+/// canonical wit root" check. A per-extension `wit/deps` is safe to
+/// use as source ONLY when its packages resolve to the same filesystem
+/// objects as the canonical wit root's packages (matching the `dst`
+/// symlink layout the emitter installs). When any package is an
+/// independent real-dir copy, `canonicalize(from) != canonicalize(dst)`
+/// even though the file contents may be identical, so `copy_tree`
+/// treats them as different and clobbers the destination.
+fn wit_root_canonicalizes_to(candidate: &Path, canonical_root: &Path) -> bool {
+    if !canonical_root.is_dir() {
+        return false;
+    }
+    for pkg in DATAFISSION_PACKAGE_DIRS {
+        let cand_pkg = candidate.join(pkg);
+        let canon_pkg = canonical_root.join(pkg);
+        let cand_c = match fs::canonicalize(&cand_pkg) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let canon_c = match fs::canonicalize(&canon_pkg) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        if cand_c != canon_c {
+            return false;
+        }
+    }
+    true
+}
+
 /// Discover datafission's `extension` package, used to render the
 /// world's `include` statement with the correct version pin.
-pub fn discover_datafission_extension_package(_primary: &str) -> Result<WitPackage> {
-    let root = source_datafission_wit_root()?;
+pub fn discover_datafission_extension_package(primary: &str) -> Result<WitPackage> {
+    let root = source_datafission_wit_root(primary)?;
     let pkg_dir = root.join("extension");
     let pkg = wit_parse::parse_package_dir(&pkg_dir)?.ok_or_else(|| {
         anyhow!(
@@ -206,8 +267,8 @@ pub fn discover_datafission_extension_package(_primary: &str) -> Result<WitPacka
 /// the world renderer can pin every per-interface export at the
 /// version actually shipped by the vendored WIT — no hardcoded
 /// `@1.0.0` strings on the bridge side.
-pub fn discover_datafission_packages() -> Result<Vec<WitPackage>> {
-    let root = source_datafission_wit_root()?;
+pub fn discover_datafission_packages(primary: &str) -> Result<Vec<WitPackage>> {
+    let root = source_datafission_wit_root(primary)?;
     let mut out = Vec::with_capacity(DATAFISSION_PACKAGE_DIRS.len());
     for pkg_dir_name in DATAFISSION_PACKAGE_DIRS {
         let pkg_dir = root.join(pkg_dir_name);
@@ -610,6 +671,168 @@ mod tests {
         assert!(
             subdir_meta.file_type().is_symlink(),
             "#812 regression: subdir symlink was replaced with real dir"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// #812 permanent fix — regression test for the actual bug case:
+    /// `source_datafission_wit_root` used to iterate ALL extensions
+    /// and pick the first with `extension/world.wit`, so regenerating
+    /// postgis picked mobilitydb's `wit/deps` (mobilitydb sorts first).
+    /// mobilitydb has REAL DIRs at `wit/deps/<pkg>` — not symlinks to
+    /// canonical wit — so `canonicalize(from) != canonicalize(dst)`
+    /// even when dst is a symlink to the canonical wit tree, and the
+    /// pre-fix `copy_tree` clobbered the symlink into a real dir on
+    /// every regen. The fix makes `copy_tree` skip when `from` and
+    /// `dst`'s ultimate canonical targets match — and, upstream,
+    /// makes `source_datafission_wit_root` return canonical wit
+    /// directly when option 3's candidate isn't a symlink farm.
+    ///
+    /// This test exercises the LOWER-LEVEL guard: `from` and dst
+    /// symlink target both canonicalize to the SAME real dir (which
+    /// is what the upstream fix produces). No env-var workaround
+    /// required to keep the dst symlink intact.
+    #[test]
+    fn copy_tree_preserves_symlink_when_from_and_dst_target_match() {
+        let tmp = std::env::temp_dir().join(format!(
+            "datafission-812-opt3-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        // Canonical wit tree — the "source of truth".
+        let canonical = tmp.join("canonical/wit/extension");
+        fs::create_dir_all(&canonical).unwrap();
+        fs::write(canonical.join("world.wit"), "canonical content").unwrap();
+
+        // Bridge output — dst is a symlink to canonical (mirroring
+        // the postgis extension's `wit/deps/extension -> ../../../../wit/extension`
+        // layout).
+        let dst_parent = tmp.join("bridge/wit/deps");
+        fs::create_dir_all(&dst_parent).unwrap();
+        let dst = dst_parent.join("extension");
+        symlink(&canonical, &dst).unwrap();
+
+        // `from` points at canonical (post-fix behaviour of
+        // `source_datafission_wit_root`).
+        copy_tree(&canonical, &dst).unwrap();
+
+        let meta = fs::symlink_metadata(&dst).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "#812 regression: dst symlink to canonical was clobbered when from == canonical"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// #812 permanent fix — verifies the pre-fix bug case still
+    /// clobbers when `from` is a DIFFERENT canonical path than the
+    /// dst symlink's target (mobilitydb-wit-deps-as-source vs
+    /// postgis-dst-symlink-to-canonical). This is what the guard
+    /// legitimately can't detect purely at the copy_tree level — the
+    /// files are two independent copies with matching content but
+    /// different canonical paths. The upstream fix in
+    /// `source_datafission_wit_root` prevents this pairing from ever
+    /// arising in practice.
+    #[test]
+    fn copy_tree_still_clobbers_when_source_and_dst_target_differ() {
+        let tmp = std::env::temp_dir().join(format!(
+            "datafission-812-differ-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let other = tmp.join("mobilitydb/wit/deps/extension");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("world.wit"), "mobilitydb copy").unwrap();
+
+        let canonical = tmp.join("canonical/wit/extension");
+        fs::create_dir_all(&canonical).unwrap();
+        fs::write(canonical.join("world.wit"), "canonical content").unwrap();
+
+        let dst_parent = tmp.join("bridge/wit/deps");
+        fs::create_dir_all(&dst_parent).unwrap();
+        let dst = dst_parent.join("extension");
+        symlink(&canonical, &dst).unwrap();
+
+        // With `from = other` (an independent copy), canonicalize
+        // paths differ, so `copy_tree` proceeds — this documents the
+        // behaviour the upstream `source_datafission_wit_root` fix
+        // is specifically designed to avoid.
+        copy_tree(&other, &dst).unwrap();
+        let meta = fs::symlink_metadata(&dst).unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "expected dst symlink to be replaced with real dir when \
+             `from` legitimately differs from dst's canonical target"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// #812 permanent fix — `wit_root_canonicalizes_to` correctly
+    /// identifies a per-extension `wit/deps` symlink farm as
+    /// equivalent to canonical wit, so option 3 accepts it.
+    #[test]
+    fn wit_root_canonicalizes_to_accepts_symlink_farm() {
+        let tmp = std::env::temp_dir().join(format!(
+            "datafission-812-symfarm-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let canonical = tmp.join("wit");
+        fs::create_dir_all(&canonical).unwrap();
+        for pkg in DATAFISSION_PACKAGE_DIRS {
+            let d = canonical.join(pkg);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("world.wit"), "canonical").unwrap();
+        }
+        let candidate = tmp.join("extensions/postgis/wit/deps");
+        fs::create_dir_all(&candidate).unwrap();
+        for pkg in DATAFISSION_PACKAGE_DIRS {
+            symlink(canonical.join(pkg), candidate.join(pkg)).unwrap();
+        }
+
+        assert!(
+            wit_root_canonicalizes_to(&candidate, &canonical),
+            "symlink farm to canonical should be recognised as equivalent"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// #812 permanent fix — `wit_root_canonicalizes_to` rejects a
+    /// per-extension `wit/deps` that has real-dir independent copies
+    /// (mobilitydb's current layout). Rejection triggers the option 3
+    /// → option 4 fall-through in `source_datafission_wit_root`.
+    #[test]
+    fn wit_root_canonicalizes_to_rejects_real_dir_copies() {
+        let tmp = std::env::temp_dir().join(format!(
+            "datafission-812-realdir-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let canonical = tmp.join("wit");
+        fs::create_dir_all(&canonical).unwrap();
+        for pkg in DATAFISSION_PACKAGE_DIRS {
+            let d = canonical.join(pkg);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("world.wit"), "canonical").unwrap();
+        }
+        // Candidate has REAL dirs, not symlinks — mobilitydb's layout.
+        let candidate = tmp.join("extensions/mobilitydb/wit/deps");
+        fs::create_dir_all(&candidate).unwrap();
+        for pkg in DATAFISSION_PACKAGE_DIRS {
+            let d = candidate.join(pkg);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("world.wit"), "mobilitydb copy").unwrap();
+        }
+
+        assert!(
+            !wit_root_canonicalizes_to(&candidate, &canonical),
+            "real-dir independent copies must NOT be recognised as \
+             equivalent to canonical — that misidentification was the \
+             root of #812"
         );
 
         let _ = fs::remove_dir_all(&tmp);

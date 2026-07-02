@@ -716,7 +716,7 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     // we WANT to round-trip — stay off the ignore list.
     let mut derives_ignore: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
-    let datafission_pkgs = emit_wit::discover_datafission_packages()
+    let datafission_pkgs = emit_wit::discover_datafission_packages(primary)
         .unwrap_or_default();
     // #794: build the set of every kebab name declared by a
     // PRIMARY-shim record / enum. When a datafission contract package
