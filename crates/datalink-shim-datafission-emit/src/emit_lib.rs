@@ -668,6 +668,14 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             for f in &pkg.flags {
                 derives_ignore.insert(f.kebab_name.clone());
             }
+            // #794: primary-shim RESOURCES are opaque handles;
+            // wit-bindgen never generates a Serialize/Deserialize
+            // impl for them.  Any parent record with a resource
+            // field also can't derive serde. Add resources here so
+            // the transitive walk below can find them.
+            for r in &pkg.resources {
+                derives_ignore.insert(r.kebab_name.clone());
+            }
         } else {
             for r in &pkg.records {
                 derives_ignore.insert(r.kebab_name.clone());
@@ -681,6 +689,98 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             for f in &pkg.flags {
                 derives_ignore.insert(f.kebab_name.clone());
             }
+            for r in &pkg.resources {
+                derives_ignore.insert(r.kebab_name.clone());
+            }
+        }
+    }
+    // #794: transitively propagate `additional_derives_ignore` up
+    // through every record wit-bindgen might materialise. A record
+    // whose field type references an already-ignored kebab name
+    // (canonical trigger: a resource like `geometry`, or a helper
+    // record that itself references a resource) can't compile with
+    // `serde::Serialize + Deserialize` applied. Walk records from
+    // ALL packages (primary + helper) until fixed point.
+    fn extract_wit_type_idents(
+        type_text: &str,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        fn flush(buf: &mut String, out: &mut std::collections::BTreeSet<String>) {
+            if buf.is_empty() {
+                return;
+            }
+            let ident = std::mem::take(buf);
+            if matches!(
+                ident.as_str(),
+                "bool"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "s8"
+                    | "s16"
+                    | "s32"
+                    | "s64"
+                    | "f32"
+                    | "f64"
+                    | "char"
+                    | "string"
+                    | "list"
+                    | "option"
+                    | "result"
+                    | "tuple"
+                    | "borrow"
+            ) {
+                return;
+            }
+            out.insert(ident);
+        }
+        let mut buf = String::new();
+        for c in type_text.chars() {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                buf.push(c);
+            } else {
+                flush(&mut buf, out);
+            }
+        }
+        flush(&mut buf, out);
+    }
+    let mut all_records: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for pkg in &shim_packages {
+        for r in &pkg.records {
+            all_records.push((
+                r.kebab_name.clone(),
+                r.fields.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
+            ));
+        }
+    }
+    for pkg in &datafission_pkgs {
+        for r in &pkg.records {
+            all_records.push((
+                r.kebab_name.clone(),
+                r.fields.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
+            ));
+        }
+    }
+    loop {
+        let mut added = false;
+        for (name, fields) in &all_records {
+            if derives_ignore.contains(name) {
+                continue;
+            }
+            let hits_ignored = fields.iter().any(|(_, ftype)| {
+                let mut idents: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                extract_wit_type_idents(ftype, &mut idents);
+                idents.iter().any(|id| derives_ignore.contains(id))
+            });
+            if hits_ignored {
+                derives_ignore.insert(name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
         }
     }
     let derives_ignore_lits: String = derives_ignore
