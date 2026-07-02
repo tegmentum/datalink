@@ -643,17 +643,47 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         std::collections::BTreeSet::new();
     let datafission_pkgs = emit_wit::discover_datafission_packages()
         .unwrap_or_default();
+    // #794: build the set of every kebab name declared by a
+    // PRIMARY-shim record / enum. When a datafission contract package
+    // (or a helper package) declares a type with the same kebab
+    // (canonical trigger: `cast-source-kind` in postgis-metadata AND
+    // in datafission's sql-extension-plugin; `cast-rewrite` same
+    // pattern), adding the contract's copy to the ignore list also
+    // suppresses derives on the primary-shim's copy — which the
+    // per-scalar dispatch arms need serialisable. Skip contract /
+    // helper entries whose kebab collides with a primary declaration.
+    let primary_kebab_names: std::collections::BTreeSet<String> = shim_packages
+        .iter()
+        .filter(|p| emit_wit::package_belongs_to_primary(&p.ns_name, primary))
+        .flat_map(|p| {
+            let recs = p.records.iter().map(|r| r.kebab_name.clone());
+            let ens = p.enums.iter().map(|e| e.kebab_name.clone());
+            recs.chain(ens)
+        })
+        .collect();
     for pkg in &datafission_pkgs {
         for r in &pkg.records {
+            if primary_kebab_names.contains(&r.kebab_name) {
+                continue;
+            }
             derives_ignore.insert(r.kebab_name.clone());
         }
         for v in &pkg.variants {
+            if primary_kebab_names.contains(&v.kebab_name) {
+                continue;
+            }
             derives_ignore.insert(v.kebab_name.clone());
         }
         for e in &pkg.enums {
+            if primary_kebab_names.contains(&e.kebab_name) {
+                continue;
+            }
             derives_ignore.insert(e.kebab_name.clone());
         }
         for f in &pkg.flags {
+            if primary_kebab_names.contains(&f.kebab_name) {
+                continue;
+            }
             derives_ignore.insert(f.kebab_name.clone());
         }
     }
@@ -678,15 +708,27 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             }
         } else {
             for r in &pkg.records {
+                if primary_kebab_names.contains(&r.kebab_name) {
+                    continue;
+                }
                 derives_ignore.insert(r.kebab_name.clone());
             }
             for v in &pkg.variants {
+                if primary_kebab_names.contains(&v.kebab_name) {
+                    continue;
+                }
                 derives_ignore.insert(v.kebab_name.clone());
             }
             for e in &pkg.enums {
+                if primary_kebab_names.contains(&e.kebab_name) {
+                    continue;
+                }
                 derives_ignore.insert(e.kebab_name.clone());
             }
             for f in &pkg.flags {
+                if primary_kebab_names.contains(&f.kebab_name) {
+                    continue;
+                }
                 derives_ignore.insert(f.kebab_name.clone());
             }
             for r in &pkg.resources {
