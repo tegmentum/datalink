@@ -529,11 +529,86 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             _ => {}
         }
     }
+    // #794: skip codec helpers for records that would end up in
+    // `additional_derives_ignore`. The generated
+    // `arg_witvalue_<snake>` / `parse_json_list_record_<snake>` /
+    // `ret_to_witvalue_<snake>` bodies use ciborium + serde_json,
+    // which require Serialize + Deserialize on the type. When a
+    // record's field type references a resource (canonical trigger:
+    // `pixel-vec-entry.geom: geometry`), wit-bindgen can't derive
+    // those traits and the helper won't compile. Walk shim resources
+    // + transitively over records to build the skip set.
+    let resource_names: std::collections::BTreeSet<String> = shim_packages
+        .iter()
+        .flat_map(|p| p.resources.iter().map(|r| r.kebab_name.clone()))
+        .collect();
+    let mut record_skip: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    fn walk_type_idents(text: &str, out: &mut std::collections::BTreeSet<String>) {
+        let mut buf = String::new();
+        for c in text.chars() {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                buf.push(c);
+            } else if !buf.is_empty() {
+                let ident = std::mem::take(&mut buf);
+                if !matches!(
+                    ident.as_str(),
+                    "bool" | "u8" | "u16" | "u32" | "u64" | "s8" | "s16" | "s32"
+                        | "s64" | "f32" | "f64" | "char" | "string" | "list"
+                        | "option" | "result" | "tuple" | "borrow"
+                ) {
+                    out.insert(ident);
+                }
+            }
+        }
+        if !buf.is_empty() && !matches!(
+            buf.as_str(),
+            "bool" | "u8" | "u16" | "u32" | "u64" | "s8" | "s16" | "s32"
+                | "s64" | "f32" | "f64" | "char" | "string" | "list"
+                | "option" | "result" | "tuple" | "borrow"
+        ) {
+            out.insert(buf);
+        }
+    }
+    let candidate_records: Vec<(String, Vec<(String, String)>)> = shim_packages
+        .iter()
+        .flat_map(|p| p.records.iter().map(|r| {
+            (
+                r.kebab_name.clone(),
+                r.fields
+                    .iter()
+                    .map(|(n, t)| (n.clone(), t.clone()))
+                    .collect(),
+            )
+        }))
+        .collect();
+    loop {
+        let mut added = false;
+        for (name, fields) in &candidate_records {
+            if record_skip.contains(name) {
+                continue;
+            }
+            let hits_blocked = fields.iter().any(|(_, ftype)| {
+                let mut idents = std::collections::BTreeSet::new();
+                walk_type_idents(ftype, &mut idents);
+                idents.iter().any(|id|
+                    resource_names.contains(id) || record_skip.contains(id))
+            });
+            if hits_blocked {
+                record_skip.insert(name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
     let helper_records: Vec<RecordType> = records
         .iter()
         .filter(|r| {
             referenced_records
                 .contains(&(r.interface.clone(), r.kebab_name.clone()))
+                && !record_skip.contains(&r.kebab_name)
         })
         .cloned()
         .collect();
