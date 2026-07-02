@@ -133,6 +133,14 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         .into_iter()
         .filter(|r| emit_wit::package_belongs_to_primary(&r.package, primary))
         .collect();
+    // #794: filter records with resource-typed fields OUT of the
+    // serde-ops surface. Same filter `write_world` applies; records
+    // whose field types reference a resource-kind identifier can't
+    // ride the ciborium codec (wit-bindgen strips Serialize +
+    // Deserialize on the resource-typed handle). Dispatch still uses
+    // the upstream binding directly for these records.
+    let records: Vec<RecordType> =
+        emit_wit::filter_serde_ops_records(&records, &shim_packages, primary);
 
     // Phase E: wit-bindgen's `additional_derives` adds the
     // requested derives to EVERY generated type. The contract

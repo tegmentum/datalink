@@ -59,9 +59,72 @@ pub fn write_world(plan: &BridgePlan, dest: &Path) -> Result<()> {
         .into_iter()
         .filter(|r| package_belongs_to_primary(&r.package, primary))
         .collect::<Vec<_>>();
+    // #794: skip records whose fields (transitively) reference a
+    // resource-kind upstream identifier. The bridge can't emit a
+    // ciborium codec for such a record — wit-bindgen suppresses
+    // Serialize/Deserialize on the resource-typed handle, so the
+    // record can't derive them either. `filter_serde_ops_records`
+    // walks the type source map + primary alias map so post-#785 the
+    // filter matches the same set the emit_lib codec walker uses.
+    let records = filter_serde_ops_records(&records, &shim_packages, primary);
     let world = render_world(primary, &shim_packages, &contract_pkg, &records);
     fs::write(dest, world).with_context(|| format!("writing {}", dest.display()))?;
     Ok(())
+}
+
+/// #794: shared filter — remove records that can't participate in
+/// the serde-ops surface because they reference a resource-kind
+/// identifier in one of their field types. The bridge's wit-value
+/// codec (ciborium round-trip) requires Serialize + Deserialize on
+/// both the LOCAL serde-ops copy and the UPSTREAM binding; a resource
+/// field breaks both derives. The dispatch layer keeps using the
+/// upstream binding directly (no wit-value codec) so upstream
+/// functions returning such records still wire.
+pub fn filter_serde_ops_records(
+    records: &[RecordType],
+    shim_packages: &[wit_parse::WitPackage],
+    primary: &str,
+) -> Vec<RecordType> {
+    let type_source_map = build_type_source_map(shim_packages);
+    let alias_map: std::collections::BTreeMap<String, String> = shim_packages
+        .iter()
+        .filter(|p| package_belongs_to_primary(&p.ns_name, primary))
+        .flat_map(|p| p.type_aliases.iter())
+        .map(|a| (a.kebab_name.clone(), a.body.clone()))
+        .collect();
+    records
+        .iter()
+        .filter(|r| !record_has_resource_field(r, &alias_map, &type_source_map))
+        .cloned()
+        .collect()
+}
+
+/// #794: true when any of the record's field types (after alias
+/// resolution) references an identifier whose `TypeKind` is
+/// `Resource`. Resources in wit-bindgen materialise as opaque
+/// handles without Serialize / Deserialize impls, so a record with
+/// a resource field can't take part in the ciborium codec surface.
+fn record_has_resource_field(
+    record: &RecordType,
+    alias_map: &std::collections::BTreeMap<String, String>,
+    type_source_map: &std::collections::BTreeMap<String, TypeSource>,
+) -> bool {
+    for (_fname, ftype) in &record.fields {
+        let resolved = inline_aliases(ftype, alias_map);
+        let mut idents: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let local_record_names: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        collect_type_idents(&resolved, &local_record_names, &mut idents);
+        for ident in &idents {
+            if let Some(src) = type_source_map.get(ident) {
+                if matches!(src.kind, TypeKind::Resource) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Returns true when `package` is the primary shim's own package
