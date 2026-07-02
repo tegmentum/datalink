@@ -1373,18 +1373,55 @@ fn emit_aggregate_finalize_body_record(
     }
 
     // Upstream takes `list<R>` which wit-bindgen lowers to `&[R]`;
-    // `&upstream_vec` coerces to a slice cleanly. The Option<R'>
-    // result encodes back via the output-record's ret helper, which
-    // may differ from the input record (#612 OQ1: e.g. decode via
-    // `arg_witvalue_tgeompoint_sequence`, encode via
-    // `ret_to_witvalue_stbox`).
-    s.push_str(&format!(
-        "{i}let __r = {module}::{func}(&upstream_vec);\n\
-         {i}match __r {{\n\
-         {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
-         {i}    None => Ok(SqlValue::Null),\n\
-         {i}}}",
-    ));
+    // `&upstream_vec` coerces to a slice cleanly. The return-side
+    // encoder dispatches on `shape.ret` so both `option<R>` (the
+    // Phase 1 pilot mobilitydb temporal-min/max/etc. shape) and
+    // `list<R>` (#795: `<T>_span_aggregate_union` returns
+    // `list<T-span>`) are wired. The bare-record `R` arm is
+    // included for symmetry with the classifier — no known caller
+    // uses it today.
+    //
+    // #795: `list<R>` follows the scalar-shape `FirstWitValueRecord`
+    // precedent — SQL has no native list, so collapse to first
+    // element (Null if empty). Multi-row exposure stays on the
+    // table-function path.
+    let ret_encoder = match &shape.ret {
+        RetShape::OptionWitValueRecord { .. } => {
+            format!(
+                "{i}let __r = {module}::{func}(&upstream_vec);\n\
+                 {i}match __r {{\n\
+                 {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
+                 {i}    None => Ok(SqlValue::Null),\n\
+                 {i}}}",
+            )
+        }
+        RetShape::WitValueRecord { .. } => {
+            format!(
+                "{i}let __rec = {module}::{func}(&upstream_vec);\n\
+                 {i}ret_to_witvalue_{out_snake}(__rec)",
+            )
+        }
+        RetShape::FirstWitValueRecord { .. } => {
+            format!(
+                "{i}let __r = {module}::{func}(&upstream_vec);\n\
+                 {i}let mut __it = __r.into_iter();\n\
+                 {i}match __it.next() {{\n\
+                 {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
+                 {i}    None => Ok(SqlValue::Null),\n\
+                 {i}}}",
+            )
+        }
+        _ => {
+            // Classifier only builds `AccKind::Record` for the three
+            // record-out `RetShape`s above (see
+            // `classify_aggregate_shape` output_kebab resolution).
+            // A future ret shape landing here needs an emit arm.
+            format!(
+                "{i}Err(format!(\"{sql_name}: AccKind::Record aggregate return shape not wired\"))",
+            )
+        }
+    };
+    s.push_str(&ret_encoder);
     s
 }
 

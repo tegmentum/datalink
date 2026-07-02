@@ -1190,16 +1190,51 @@ fn emit_aggregate_arm_body_record(
     ));
 
     // Upstream call + encode. `&upstream_vec` coerces to `&[R]`
-    // which wit-bindgen lowers as `list<R>`. Option<R'> result
-    // encodes via the OUTPUT record's ret helper (may differ from
-    // input for OQ1 / #612 cases).
-    s.push_str(&format!(
-        "{i}let __r = {module}::{func}(&upstream_vec);\n\
-         {i}match __r {{\n\
-         {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
-         {i}    None => Ok(types::Duckvalue::Null),\n\
-         {i}}}",
-    ));
+    // which wit-bindgen lowers as `list<R>`. The return-side
+    // encoder dispatches on `shape.ret` so both `option<R>` (the
+    // Phase 1 pilot mobilitydb temporal-min/max/etc. shape) and
+    // `list<R>` (#795: `<T>_span_aggregate_union` returns
+    // `list<T-span>`) are wired. Bare-record `R` included for
+    // symmetry with the classifier — no known caller today.
+    //
+    // #795: `list<R>` follows the scalar-shape `FirstWitValueRecord`
+    // precedent — collapse to first element (Null if empty). Multi-
+    // row exposure stays on the table-function path.
+    let ret_encoder = match &shape.ret {
+        RetShape::OptionWitValueRecord { .. } => {
+            format!(
+                "{i}let __r = {module}::{func}(&upstream_vec);\n\
+                 {i}match __r {{\n\
+                 {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
+                 {i}    None => Ok(types::Duckvalue::Null),\n\
+                 {i}}}",
+            )
+        }
+        RetShape::WitValueRecord { .. } => {
+            format!(
+                "{i}let __rec = {module}::{func}(&upstream_vec);\n\
+                 {i}ret_to_witvalue_{out_snake}(__rec)",
+            )
+        }
+        RetShape::FirstWitValueRecord { .. } => {
+            format!(
+                "{i}let __r = {module}::{func}(&upstream_vec);\n\
+                 {i}let mut __it = __r.into_iter();\n\
+                 {i}match __it.next() {{\n\
+                 {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
+                 {i}    None => Ok(types::Duckvalue::Null),\n\
+                 {i}}}",
+            )
+        }
+        _ => {
+            // Classifier only builds AccKind::Record for the three
+            // record-out RetShapes above. Future shapes need an arm.
+            format!(
+                "{i}Err(types::Duckerror::Invalidargument(format!(\"{sql_name}: AccKind::Record aggregate return shape not wired\")))",
+            )
+        }
+    };
+    s.push_str(&ret_encoder);
     s
 }
 

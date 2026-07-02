@@ -1299,17 +1299,50 @@ fn emit_aggregate_finalize_body_record(
         return s;
     }
 
-    // Option<R'> result encodes via the output-record's ret helper,
-    // which may differ from the input record (#612 OQ1: e.g. decode
-    // via `arg_witvalue_tgeompoint_sequence`, encode via
-    // `ret_to_witvalue_stbox`).
-    s.push_str(&format!(
-        "{i}let __r = {module}::{func}(&upstream_vec);\n\
-         {i}match __r {{\n\
-         {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
-         {i}    None => Ok(ftypes::ScalarValue::Null),\n\
-         {i}}}\n",
-    ));
+    // Return-side encoder dispatches on `shape.ret` so both
+    // `option<R>` (Phase 2 pilot mobilitydb temporal-min/max/etc.)
+    // and `list<R>` (#795: `<T>_span_aggregate_union` returns
+    // `list<T-span>`) are wired. Bare-record `R` included for
+    // symmetry with the classifier — no known caller today.
+    //
+    // #795: `list<R>` follows the scalar-shape `FirstWitValueRecord`
+    // precedent — collapse to first element (Null if empty). Multi-
+    // row exposure stays on the table-function path.
+    let ret_encoder = match &shape.ret {
+        RetShape::OptionWitValueRecord { .. } => {
+            format!(
+                "{i}let __r = {module}::{func}(&upstream_vec);\n\
+                 {i}match __r {{\n\
+                 {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
+                 {i}    None => Ok(ftypes::ScalarValue::Null),\n\
+                 {i}}}\n",
+            )
+        }
+        RetShape::WitValueRecord { .. } => {
+            format!(
+                "{i}let __rec = {module}::{func}(&upstream_vec);\n\
+                 {i}ret_to_witvalue_{out_snake}(__rec)\n",
+            )
+        }
+        RetShape::FirstWitValueRecord { .. } => {
+            format!(
+                "{i}let __r = {module}::{func}(&upstream_vec);\n\
+                 {i}let mut __it = __r.into_iter();\n\
+                 {i}match __it.next() {{\n\
+                 {i}    Some(__rec) => ret_to_witvalue_{out_snake}(__rec),\n\
+                 {i}    None => Ok(ftypes::ScalarValue::Null),\n\
+                 {i}}}\n",
+            )
+        }
+        _ => {
+            // Classifier only builds AccKind::Record for the three
+            // record-out RetShapes above. Future shapes need an arm.
+            format!(
+                "{i}Err(ftypes::FunctionError::ExecutionError(format!(\"{sql_name}: AccKind::Record aggregate return shape not wired\")))\n",
+            )
+        }
+    };
+    s.push_str(&ret_encoder);
     s
 }
 
