@@ -30,6 +30,56 @@ use datalink_shim_codegen_core::force_link::render_force_link_upstream_imports;
 use datalink_shim_codegen_core::record_registry::{self, RecordType};
 use datalink_shim_codegen_core::wit_parse;
 
+/// #794: extract kebab-case identifiers from a WIT type-text expr.
+/// Splits on non-`[A-Za-z0-9-]` and yields each chunk that is not a
+/// WIT primitive or a wrapper keyword. Used by the transitive
+/// `additional_derives_ignore` walker to see which record fields
+/// reference already-ignored types.
+fn extract_wit_type_idents(
+    type_text: &str,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    fn flush(buf: &mut String, out: &mut std::collections::BTreeSet<String>) {
+        if buf.is_empty() {
+            return;
+        }
+        let ident = std::mem::take(buf);
+        if matches!(
+            ident.as_str(),
+            "bool"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "s8"
+                | "s16"
+                | "s32"
+                | "s64"
+                | "f32"
+                | "f64"
+                | "char"
+                | "string"
+                | "list"
+                | "option"
+                | "result"
+                | "tuple"
+                | "borrow"
+        ) {
+            return;
+        }
+        out.insert(ident);
+    }
+    let mut buf = String::new();
+    for c in type_text.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            buf.push(c);
+        } else {
+            flush(&mut buf, out);
+        }
+    }
+    flush(&mut buf, out);
+}
+
 /// Generate `src/lib.rs`. `crate_name` is the bridge crate
 /// name (e.g. "postgis-sqlink-bridge"); used only inside the
 /// emitted stub error strings.
@@ -55,6 +105,11 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     // (step/finalize/value/inverse) with `is_window: true` on the
     // manifest entry. Same demux-by-func-id pattern as aggregates.
     let window_id_for = build_window_id_index(plan);
+    // #793: alias dispatch arms must call the CANONICAL's
+    // `compute_window_<id>` helper (only canonicals get helpers
+    // emitted). Map every canonical/alias sql-name -> canonical id
+    // so the aggregate impl can route aliases to the right helper.
+    let window_canonical_id_for = build_window_canonical_id_index(plan);
 
     // Generate the dispatch registries from the WIT + interface DB.
     //
@@ -167,6 +222,58 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         // inside `tfloat-sequence`) needs serde for the record's
         // own derive to compile.
         let _ = &pkg.enums;
+    }
+    // #794: transitively propagate `additional_derives_ignore` up
+    // through primary-shim records. Wit-bindgen applies the requested
+    // derives to EVERY generated Rust type — but a record whose
+    // field type references an identifier already in the ignore list
+    // (canonical trigger: `pixel-vec-entry { geom: geometry, ... }`
+    // where `geometry` is a helper-package resource) can't compile
+    // with `serde::Serialize + Deserialize` applied (the derive
+    // requires the field types to also implement those traits).
+    // Add the parent record to the ignore list too, and repeat
+    // until fixed point so N-hop chains propagate cleanly. Walks
+    // records from BOTH the primary shim packages and the contract
+    // package — any record wit-bindgen materialises can hit this.
+    let mut all_ignore_candidates: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for r in &records {
+        all_ignore_candidates.push((r.kebab_name.clone(), r.fields.clone()));
+    }
+    for pkg in &shim_packages {
+        if !emit_wit::package_belongs_to_primary(&pkg.ns_name, primary) {
+            continue;
+        }
+        for r in &pkg.records {
+            all_ignore_candidates.push((
+                r.kebab_name.clone(),
+                r.fields.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
+            ));
+        }
+    }
+    loop {
+        let mut added = false;
+        for (name, fields) in &all_ignore_candidates {
+            if derives_ignore.contains(name) {
+                continue;
+            }
+            let mut hits_ignored = false;
+            for (_fname, ftype) in fields {
+                let mut idents: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                extract_wit_type_idents(ftype, &mut idents);
+                if idents.iter().any(|id| derives_ignore.contains(id)) {
+                    hits_ignored = true;
+                    break;
+                }
+            }
+            if hits_ignored {
+                derives_ignore.insert(name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
     }
     let derives_ignore_list: Vec<String> = derives_ignore.into_iter().collect();
 
@@ -661,7 +768,7 @@ use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
                     "}\n"
                 )
                 .to_string(),
-                emit_window_compute_helpers(&window_entries),
+                emit_window_compute_helpers(&window_entries, plan),
             )
         } else {
             (String::new(), String::new(), String::new())
@@ -1129,6 +1236,7 @@ struct {bridge_struct};
         &agg_id_for,
         &window_entries,
         &window_id_for,
+        &window_canonical_id_for,
     ));
 
     // VtabGuest impl — every wired UDTF gets a per-vtab arm in
@@ -1221,6 +1329,7 @@ fn emit_aggregate_impl(
     agg_id_for: &HashMap<&str, u64>,
     window_entries: &[WindowEntry],
     window_id_for: &HashMap<&str, u64>,
+    window_canonical_id_for: &HashMap<&str, u64>,
 ) -> String {
     let mut step_arms = String::new();
     let mut final_arms = String::new();
@@ -1281,7 +1390,16 @@ fn emit_aggregate_impl(
             ));
         }
         if seen_value.insert(id) {
-            let compute_fn = window_compute_fn_name(id);
+            // #793: aliases share the canonical's `compute_window_<id>`
+            // helper — one helper is emitted per canonical (see
+            // `emit_window_compute_helpers`). Route every alias
+            // dispatch arm to the canonical's id here so we never
+            // reference a helper that isn't emitted.
+            let canonical_id = window_canonical_id_for
+                .get(entry.sql_name.as_str())
+                .copied()
+                .unwrap_or(id);
+            let compute_fn = window_compute_fn_name(canonical_id);
             value_arms.push_str(&format!(
                 "            {id} => {{\n\
                  \x20               // First value() call materialises the cached results;\n\
@@ -1368,27 +1486,32 @@ fn window_compute_fn_name(id: u64) -> String {
 ///   4. Calls the upstream cluster function.
 ///   5. Marshals each per-row Y back to a `SqlValue` per the
 ///      classified `WindowReturn` shape.
-fn emit_window_compute_helpers(entries: &[WindowEntry]) -> String {
+fn emit_window_compute_helpers(entries: &[WindowEntry], plan: &BridgePlan) -> String {
     if entries.is_empty() {
         return String::new();
     }
+    // #793: id assignment MUST mirror `build_window_id_index` — that
+    // walk assigns sequential ids to canonical + each alias in the
+    // plan (21 slots for 17 canonicals + 4 aliases). Reconstruct the
+    // full canonical + alias id map from the plan so alias entries
+    // in the `entries` list map to the SAME id the dispatch arm sees.
+    // Then emit ONE helper per canonical (not per sql_name); the
+    // aggregate impl routes alias arms to the canonical's helper.
+    let window_id_for = build_window_id_index(plan);
+    let canonical_names: std::collections::HashSet<&str> = plan
+        .extensions
+        .iter()
+        .flat_map(|ext| ext.window_functions.iter().map(|w| w.canonical_name.as_str()))
+        .collect();
     let mut emitted: std::collections::HashSet<u64> =
         std::collections::HashSet::new();
-    let mut window_id_for: HashMap<&str, u64> = HashMap::new();
-    {
-        // Reconstruct id-for map locally (mirrors build_window_id_index).
-        let mut id: u64 = 3_000_000;
-        for e in entries {
-            window_id_for.entry(e.sql_name.as_str()).or_insert_with(|| {
-                let i = id;
-                id += 1;
-                i
-            });
-        }
-    }
     let mut out = String::new();
     out.push('\n');
     for entry in entries {
+        // Skip alias entries — helpers are only emitted for canonicals.
+        if !canonical_names.contains(entry.sql_name.as_str()) {
+            continue;
+        }
         let Some(&id) = window_id_for.get(entry.sql_name.as_str()) else {
             continue;
         };
@@ -2153,6 +2276,28 @@ fn build_window_id_index(plan: &BridgePlan) -> HashMap<&str, u64> {
             id += 1;
             for alias in &w.aliases {
                 idx.insert(alias.as_str(), id);
+                id += 1;
+            }
+        }
+    }
+    idx
+}
+
+/// #793: parallel index to `build_window_id_index`. Every canonical
+/// AND every alias points at the CANONICAL's id (the one whose
+/// `compute_window_<id>` helper is actually emitted). Alias dispatch
+/// arms consult this map so they call the canonical's helper rather
+/// than a non-existent `compute_window_<alias_id>`.
+fn build_window_canonical_id_index(plan: &BridgePlan) -> HashMap<&str, u64> {
+    let mut idx = HashMap::new();
+    let mut id: u64 = 3_000_000;
+    for ext in &plan.extensions {
+        for w in &ext.window_functions {
+            let canonical_id = id;
+            idx.insert(w.canonical_name.as_str(), canonical_id);
+            id += 1;
+            for alias in &w.aliases {
+                idx.insert(alias.as_str(), canonical_id);
                 id += 1;
             }
         }
@@ -3298,4 +3443,223 @@ fn topology_err_string(e: TopologyError) -> String {{
         pkg_ns = pkg_ns,
         pkg_name = pkg_name,
     )
+}
+
+#[cfg(test)]
+mod window_alias_tests {
+    //! #793: alias dispatch arms must route to the CANONICAL's
+    //! `compute_window_<id>` helper. `build_window_id_index` assigns
+    //! sequential ids to canonical + each alias (so 1 canonical with
+    //! 2 aliases occupies ids N, N+1, N+2). Helpers are emitted only
+    //! for canonicals; alias arms must call the canonical's helper
+    //! (`build_window_canonical_id_index`).
+    use super::*;
+    use shim_bridge_codegen_core::{Extension, WindowFn};
+
+    fn plan_with_one_window(canonical: &str, aliases: &[&str]) -> BridgePlan {
+        BridgePlan {
+            extensions: vec![Extension {
+                name: "test".to_string(),
+                version: "0".to_string(),
+                api_version: None,
+                wasm_path: String::new(),
+                wasm_blake3: String::new(),
+                extracted_at: String::new(),
+                scalars: vec![],
+                aggregates: vec![],
+                table_functions: vec![],
+                window_functions: vec![WindowFn {
+                    canonical_name: canonical.to_string(),
+                    aliases: aliases.iter().map(|s| s.to_string()).collect(),
+                    param_signatures: vec![],
+                }],
+                column_types: vec![],
+                operators: vec![],
+                cast_rewrites: vec![],
+                preprocessor_patterns: vec![],
+                system_catalog_tables: vec![],
+                spatial_indexes: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn canonical_id_index_routes_aliases_to_canonical_id() {
+        let plan = plan_with_one_window("st_cluster_dbscan", &["st_clusterdbscan"]);
+        let ids = build_window_id_index(&plan);
+        let canonicals = build_window_canonical_id_index(&plan);
+        assert_eq!(ids.get("st_cluster_dbscan").copied(), Some(3_000_000));
+        assert_eq!(ids.get("st_clusterdbscan").copied(), Some(3_000_001));
+        // Both names route to the canonical's id (3_000_000).
+        assert_eq!(canonicals.get("st_cluster_dbscan").copied(), Some(3_000_000));
+        assert_eq!(canonicals.get("st_clusterdbscan").copied(), Some(3_000_000));
+    }
+
+    #[test]
+    fn helper_count_matches_canonical_count_not_alias_count() {
+        // 2 canonicals; canonical1 has 2 aliases, canonical2 has 1
+        // alias. 5 slots total in the id map, but only 2 helpers
+        // should be emitted (one per canonical).
+        let plan = BridgePlan {
+            extensions: vec![Extension {
+                name: "test".to_string(),
+                version: "0".to_string(),
+                api_version: None,
+                wasm_path: String::new(),
+                wasm_blake3: String::new(),
+                extracted_at: String::new(),
+                scalars: vec![],
+                aggregates: vec![],
+                table_functions: vec![],
+                window_functions: vec![
+                    WindowFn {
+                        canonical_name: "c1".to_string(),
+                        aliases: vec!["a1a".to_string(), "a1b".to_string()],
+                        param_signatures: vec![],
+                    },
+                    WindowFn {
+                        canonical_name: "c2".to_string(),
+                        aliases: vec!["a2".to_string()],
+                        param_signatures: vec![],
+                    },
+                ],
+                column_types: vec![],
+                operators: vec![],
+                cast_rewrites: vec![],
+                preprocessor_patterns: vec![],
+                system_catalog_tables: vec![],
+                spatial_indexes: vec![],
+            }],
+        };
+        let ids = build_window_id_index(&plan);
+        assert_eq!(ids.len(), 5);
+        // Ids assigned in canonical, aliases..., canonical, aliases order.
+        assert_eq!(ids.get("c1").copied(), Some(3_000_000));
+        assert_eq!(ids.get("a1a").copied(), Some(3_000_001));
+        assert_eq!(ids.get("a1b").copied(), Some(3_000_002));
+        assert_eq!(ids.get("c2").copied(), Some(3_000_003));
+        assert_eq!(ids.get("a2").copied(), Some(3_000_004));
+
+        let canonicals = build_window_canonical_id_index(&plan);
+        // Aliases share their canonical's id.
+        assert_eq!(canonicals.get("c1").copied(), Some(3_000_000));
+        assert_eq!(canonicals.get("a1a").copied(), Some(3_000_000));
+        assert_eq!(canonicals.get("a1b").copied(), Some(3_000_000));
+        assert_eq!(canonicals.get("c2").copied(), Some(3_000_003));
+        assert_eq!(canonicals.get("a2").copied(), Some(3_000_003));
+    }
+}
+
+#[cfg(test)]
+mod derives_ignore_transitive_tests {
+    //! #794: `additional_derives_ignore` must propagate transitively
+    //! from a helper-package resource (e.g. `geometry`) up through
+    //! any primary-shim record that references it, otherwise
+    //! wit-bindgen applies `serde::Serialize + Deserialize` to a
+    //! Rust struct whose field can't satisfy those bounds.
+    use super::*;
+
+    #[test]
+    fn extract_wit_type_idents_covers_wrappers_and_primitives() {
+        let mut out: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        extract_wit_type_idents("list<option<geometry>>", &mut out);
+        assert!(out.contains("geometry"));
+        assert!(!out.contains("list"));
+        assert!(!out.contains("option"));
+
+        let mut out2: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        extract_wit_type_idents("tuple<f64, u32, coord>", &mut out2);
+        assert!(out2.contains("coord"));
+        assert!(!out2.contains("f64"));
+        assert!(!out2.contains("u32"));
+        assert!(!out2.contains("tuple"));
+    }
+
+    /// Canonical trigger: a record `pixel-vec-entry { geom: geometry }`
+    /// where `geometry` is already in the ignore list must cause
+    /// `pixel-vec-entry` to also land in the ignore list.
+    #[test]
+    fn record_referencing_ignored_type_propagates() {
+        let mut ignore: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        ignore.insert("geometry".to_string());
+        // Simulate the propagation loop's per-record check.
+        let candidates: Vec<(String, Vec<(String, String)>)> = vec![(
+            "pixel-vec-entry".to_string(),
+            vec![
+                ("geom".to_string(), "geometry".to_string()),
+                ("val".to_string(), "f64".to_string()),
+                ("x".to_string(), "u32".to_string()),
+                ("y".to_string(), "u32".to_string()),
+            ],
+        )];
+        loop {
+            let mut added = false;
+            for (name, fields) in &candidates {
+                if ignore.contains(name) {
+                    continue;
+                }
+                let hits_ignored = fields.iter().any(|(_, ftype)| {
+                    let mut idents = std::collections::BTreeSet::new();
+                    extract_wit_type_idents(ftype, &mut idents);
+                    idents.iter().any(|id| ignore.contains(id))
+                });
+                if hits_ignored {
+                    ignore.insert(name.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        assert!(
+            ignore.contains("pixel-vec-entry"),
+            "pixel-vec-entry should have been added to ignore because \
+             its `geom: geometry` field references an already-ignored type"
+        );
+    }
+
+    /// N-hop chain: recA -> recB -> geometry. After propagation both
+    /// recA and recB should be in the ignore list.
+    #[test]
+    fn multi_hop_propagation() {
+        let mut ignore: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        ignore.insert("geometry".to_string());
+        let candidates: Vec<(String, Vec<(String, String)>)> = vec![
+            (
+                "rec-a".to_string(),
+                vec![("inner".to_string(), "rec-b".to_string())],
+            ),
+            (
+                "rec-b".to_string(),
+                vec![("g".to_string(), "list<geometry>".to_string())],
+            ),
+        ];
+        loop {
+            let mut added = false;
+            for (name, fields) in &candidates {
+                if ignore.contains(name) {
+                    continue;
+                }
+                let hits_ignored = fields.iter().any(|(_, ftype)| {
+                    let mut idents = std::collections::BTreeSet::new();
+                    extract_wit_type_idents(ftype, &mut idents);
+                    idents.iter().any(|id| ignore.contains(id))
+                });
+                if hits_ignored {
+                    ignore.insert(name.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        assert!(ignore.contains("rec-b"), "rec-b should propagate via `list<geometry>`");
+        assert!(ignore.contains("rec-a"), "rec-a should propagate via `inner: rec-b`");
+    }
 }
