@@ -413,16 +413,28 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         return Err(anyhow!("source {} is not a directory", src.display()));
     }
-    // #656: if `dst` is itself a symlink (datafission extensions ship
-    // `wit/deps/<pkg> -> ../../../../wit/<pkg>` symlinks pointing back at
-    // the source-of-truth WIT tree), every subsequent path operation that
-    // joins onto `dst` traverses the symlink. The umbrella-prune below
-    // (#642) would then `unlink` files at the SOURCE location, silently
-    // deleting `$DATAFISSION_WIT/<pkg>/world.wit` on each regen.
-    // Replace any dst symlink with a real directory before continuing —
-    // the copy loop below will repopulate it from `src`.
+    // #812: if `dst` is a symlink pointing at the SAME canonical
+    // location as `src` (datafission extensions ship
+    // `wit/deps/<pkg> -> ../../../../wit/<pkg>` symlinks whose target
+    // IS the canonical source-of-truth), the copy is a no-op — the
+    // symlink already ferries the source content through to the
+    // destination. Preserving the symlink keeps the extension's
+    // `wit/deps/` structure intact across regens (the pre-fix code
+    // clobbered every symlinked subdir into a real directory on each
+    // pass, silently drifting from the intended `wit/deps` layout).
     if let Ok(meta) = fs::symlink_metadata(dst) {
         if meta.file_type().is_symlink() {
+            if same_file(src, dst) {
+                return Ok(());
+            }
+            // #656: dst is a symlink pointing SOMEWHERE ELSE than
+            // src's canonical (e.g. stale symlink from a previous
+            // vendoring). Every subsequent path operation that joins
+            // onto `dst` would traverse the symlink; the umbrella-prune
+            // below (#642) would then `unlink` files at the wrong
+            // location. Replace the symlink with a real directory
+            // before continuing — the copy loop repopulates it from
+            // `src`.
             fs::remove_file(dst).with_context(|| {
                 format!("removing dst symlink {}", dst.display())
             })?;
@@ -453,6 +465,16 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let file_type = entry.file_type()?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
+        // #812: if a target-tree entry is already a symlink pointing at
+        // the corresponding source, skip it — the recursive `copy_tree`
+        // below would otherwise clobber it into a real directory on
+        // every regen. The top-level guard handles `dst` itself; this
+        // guard covers per-subdir symlinks inside `dst`.
+        if let Ok(to_meta) = fs::symlink_metadata(&to) {
+            if to_meta.file_type().is_symlink() && same_file(&from, &to) {
+                continue;
+            }
+        }
         if file_type.is_dir() {
             copy_tree(&from, &to)?;
         } else if file_type.is_symlink() {
@@ -510,15 +532,20 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    /// #656: when `dst` is a symlink pointing back at the source WIT
-    /// tree, `copy_tree` must not delete source files through the
-    /// symlink. The pre-fix code path called `fs::remove_file` on
+    /// #656 + #812: when `dst` is a symlink pointing back at the source
+    /// WIT tree, `copy_tree` must not delete source files through the
+    /// symlink. The pre-#656 code path called `fs::remove_file` on
     /// `dst.join("world.wit")`, whose path traversal followed the dst
-    /// symlink and unlinked the file at the source location.
+    /// symlink and unlinked the file at the source location. #656's
+    /// original fix replaced the dst symlink with a real directory;
+    /// #812 tightens that to PRESERVE the symlink when it already
+    /// points at the source (the datafission extension wit/deps
+    /// symlink layout is intentional and shouldn't be clobbered on
+    /// every regen).
     #[test]
-    fn copy_tree_does_not_delete_through_dst_symlink() {
+    fn copy_tree_preserves_dst_symlink_to_source() {
         let tmp = std::env::temp_dir().join(format!(
-            "datafission-656-{}",
+            "datafission-812-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&tmp);
@@ -533,10 +560,11 @@ mod tests {
         symlink(&src, &dst).unwrap();
 
         // src has a single regular file (world.wit) which copy_tree
-        // will iterate over.
+        // would iterate over — but since dst is a symlink pointing
+        // back at src, the top-level short-circuit skips the copy.
         copy_tree(&src, &dst).unwrap();
 
-        // Source file must still exist with original content.
+        // Source file must still exist with original content (#656).
         assert!(
             source_world.is_file(),
             "source world.wit was deleted by copy_tree"
@@ -544,9 +572,45 @@ mod tests {
         let after = fs::read_to_string(&source_world).unwrap();
         assert_eq!(after, "source content");
 
-        // dst is now a real directory (the symlink got replaced).
+        // #812: dst stays a symlink (no clobbering).
         let meta = fs::symlink_metadata(&dst).unwrap();
-        assert!(meta.file_type().is_dir(), "dst should be real dir");
+        assert!(
+            meta.file_type().is_symlink(),
+            "#812 regression: dst symlink was replaced with real dir"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// #812: when a per-subdir target is a symlink pointing back at
+    /// the corresponding source subdir, the subdir walk should skip
+    /// it — otherwise the recursive `copy_tree` call re-enters and
+    /// clobbers the symlink into a real dir even though the top-level
+    /// dst wasn't a symlink.
+    #[test]
+    fn copy_tree_preserves_subdir_symlink_to_source() {
+        let tmp = std::env::temp_dir().join(format!(
+            "datafission-812-sub-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        let src_pkg = src.join("postgis-wasm");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src_pkg.join("world.wit"), "pkg content").unwrap();
+
+        // dst has a subdir symlink at postgis-wasm -> src/postgis-wasm.
+        symlink(&src_pkg, dst.join("postgis-wasm")).unwrap();
+
+        copy_tree(&src, &dst).unwrap();
+
+        let subdir_meta = fs::symlink_metadata(dst.join("postgis-wasm")).unwrap();
+        assert!(
+            subdir_meta.file_type().is_symlink(),
+            "#812 regression: subdir symlink was replaced with real dir"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

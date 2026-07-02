@@ -1313,6 +1313,14 @@ fn parse_interface_open(line: &str) -> Option<String> {
 /// the colon and the `func(` keyword may be zero or more horizontal
 /// whitespace characters (spaces or tabs). Lines without a `func(`
 /// keyword anywhere after a candidate `:` return None.
+///
+/// #811: also matches `<kebab-name>: <ws>* static func(...)` — WIT
+/// resource static methods (`from-wkt: static func(...)`) look
+/// syntactically like free functions with a `static` marker between
+/// the `:` and the `func(` keyword. Capturing these gives the
+/// force-link block a reference to every static method on every
+/// imported resource, which wac plug 0.10 needs to satisfy the
+/// resource's structural-match check.
 fn find_func_token(line: &str) -> Option<usize> {
     let mut search_from = 0;
     while let Some(rel) = line[search_from..].find(':') {
@@ -1321,6 +1329,13 @@ fn find_func_token(line: &str) -> Option<usize> {
         let trimmed = after.trim_start_matches(|c: char| c == ' ' || c == '\t');
         if trimmed.starts_with("func(") {
             return Some(colon_at);
+        }
+        // #811: `static func(...)` on resource static methods.
+        if let Some(rest) = trimmed.strip_prefix("static") {
+            let rest2 = rest.trim_start_matches(|c: char| c == ' ' || c == '\t');
+            if rest2.starts_with("func(") {
+                return Some(colon_at);
+            }
         }
         search_from = colon_at + 1;
         if search_from >= line.len() {
@@ -2350,6 +2365,56 @@ interface bitemporal-residue-ops {
         assert!(names.contains(&"bitemporal-bool-current"), "got {names:?}");
         assert!(names.contains(&"bitemporal-int-current"), "got {names:?}");
         assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn parses_resource_static_methods_811() {
+        // #811: `static func(...)` inside a resource block was
+        // previously silently dropped by `find_func_token` because it
+        // looked for `: func(` but the WIT spells the line
+        // `<name>: static func(...)`. Failing to capture these methods
+        // meant the force-link block didn't reference them, and
+        // wit-component pruned them from the bridge's imported
+        // resource surface — breaking `wac plug` 0.10's structural
+        // match against the plug's full 16-method Geometry resource.
+        let src = r#"
+package postgis:wasm@0.1.0;
+interface postgis-types {
+    resource geometry {
+        from-wkt: static func(wkt: string) -> result<geometry, postgis-error>;
+        from-wkb: static func(wkb: list<u8>) -> result<geometry, postgis-error>;
+        point: static func(x: f64, y: f64) -> geometry;
+        as-wkb: func() -> list<u8>;
+        srid: func() -> option<s32>;
+        clone: func() -> geometry;
+    }
+}
+"#;
+        let mut out = Vec::new();
+        parse_text(src, &mut out);
+        let names: Vec<&str> = out.iter().map(|f| f.kebab_name.as_str()).collect();
+        // All six methods should be captured; each carries
+        // `resource = Some("geometry")` since they're declared inside
+        // the resource block.
+        for m in &["from-wkt", "from-wkb", "point", "as-wkb", "srid", "clone"] {
+            assert!(
+                names.contains(m),
+                "resource method {m} not captured; got {names:?}"
+            );
+        }
+        for f in &out {
+            assert_eq!(
+                f.resource.as_deref(),
+                Some("geometry"),
+                "{} should carry resource=Some(geometry)",
+                f.kebab_name
+            );
+            assert!(
+                !f.is_constructor,
+                "{} was flagged as constructor",
+                f.kebab_name
+            );
+        }
     }
 
     #[test]
