@@ -1405,16 +1405,26 @@ fn wit_fn_matches_window_shape(f: &wit_parse::WitFunction) -> bool {
 /// name could otherwise be pulled into the aggregate bucket by a
 /// naming coincidence (none observed today, but the ordering
 /// keeps future additions honest).
+///
+/// #782: aggregate detection covers BOTH `-aggregate` / `-agg` at
+/// the tail AND `-aggregate-` / `-agg-` as an infix. mobilitydb's
+/// temporal-aggregate-ops surface produces names like
+/// `int-span-aggregate-union` where `aggregate` sits between two
+/// meaningful tokens rather than at the end; the tail-only check
+/// mis-routed ~53 fns as scalars.
 fn classify_wit_fn_category(f: &wit_parse::WitFunction) -> WitFnCategory {
     // Window: `-win` suffix OR window-shape signature.
     if f.kebab_name.ends_with("-win") || wit_fn_matches_window_shape(f) {
         return WitFnCategory::Window;
     }
-    // Aggregate: `-aggregate` / `-agg` suffix OR primary aggregate
-    // interface (catches `postgis-aggregates::st-extent-threed`,
-    // which has no explicit suffix).
+    // Aggregate: `-aggregate` / `-agg` suffix, OR `-aggregate-` /
+    // `-agg-` infix (#782 — mobilitydb `int-span-aggregate-union`
+    // family), OR primary aggregate interface (catches
+    // `postgis-aggregates::st-extent-threed` — no explicit suffix).
     if f.kebab_name.ends_with("-aggregate")
         || f.kebab_name.ends_with("-agg")
+        || f.kebab_name.contains("-aggregate-")
+        || f.kebab_name.contains("-agg-")
         || is_primary_aggregate_interface(&f.interface)
     {
         return WitFnCategory::Aggregate;
@@ -4499,6 +4509,64 @@ mod wit_fn_category_tests {
             "st-union-aggregate",
             vec![geom_list_param()],
             WitType::Geometry { borrowed: false },
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
+    }
+
+    // #782: `-aggregate-` and `-agg-` INFIX detection.
+    //
+    // mobilitydb's temporal-aggregate-ops surface produces names
+    // like `int-span-aggregate-union`, `int-spanset-aggregate-union`
+    // where `aggregate` sits between two meaningful tokens rather
+    // than at the tail. The tail-only checks (#768) mis-routed the
+    // ~53 fns from #777 as scalars.
+
+    #[test]
+    fn aggregate_infix_int_span_routes_to_aggregate() {
+        // `int-span-aggregate-union` — canonical trigger from #777.
+        let f = make_wit_fn(
+            "temporal-aggregate-ops",
+            "int-span-aggregate-union",
+            vec![geom_list_param()],
+            WitType::Unsupported("int-span".to_string()),
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
+    }
+
+    #[test]
+    fn aggregate_infix_int_spanset_routes_to_aggregate() {
+        // `int-spanset-aggregate-union` — same family.
+        let f = make_wit_fn(
+            "temporal-aggregate-ops",
+            "int-spanset-aggregate-union",
+            vec![geom_list_param()],
+            WitType::Unsupported("int-spanset".to_string()),
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
+    }
+
+    #[test]
+    fn aggregate_infix_general_routes_to_aggregate() {
+        // Interface without `temporal-aggregate-ops` fallback so we
+        // isolate the infix detection from the primary-interface
+        // detection. `foo-bar-aggregate-baz` still classifies.
+        let f = make_wit_fn(
+            "some-other-interface",
+            "foo-bar-aggregate-baz",
+            vec![geom_list_param()],
+            WitType::F64,
+        );
+        assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
+    }
+
+    #[test]
+    fn agg_infix_routes_to_aggregate() {
+        // Short `-agg-` infix form.
+        let f = make_wit_fn(
+            "some-other-interface",
+            "foo-agg-union",
+            vec![geom_list_param()],
+            WitType::F64,
         );
         assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
     }

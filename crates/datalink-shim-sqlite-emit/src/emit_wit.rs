@@ -221,7 +221,18 @@ pub fn render_world(
         .flat_map(|p| p.type_aliases.iter())
         .map(|a| (a.kebab_name.clone(), a.body.clone()))
         .collect();
-    let serde_ops_block = render_serde_ops_interface(records, &alias_map);
+    // #785: build a name → (ns, version, interface) map covering
+    // every cross-interface type identifier a record field might
+    // reference (resources, variants, flags, records, enums). Records
+    // are duplicated locally into serde-ops; identifiers that miss
+    // both the primary-package clone path AND the alias-inline path
+    // (canonical example: `geometry` in `pixel-vec-entry.geom` — a
+    // resource in `postgis-types`, not inlineable) trigger a `use`
+    // directive at the top of the interface so wit-bindgen resolves
+    // the reference.
+    let type_source_map = build_type_source_map(shim_packages);
+    let serde_ops_block =
+        render_serde_ops_interface(records, &alias_map, &type_source_map, primary);
     if !serde_ops_block.is_empty() {
         // Splice the local-enum block into the placeholder. The
         // enums we duplicate are those referenced by any record's
@@ -325,6 +336,8 @@ pub fn render_world(
 fn render_serde_ops_interface(
     records: &[RecordType],
     alias_map: &std::collections::BTreeMap<String, String>,
+    type_source_map: &std::collections::BTreeMap<String, TypeSource>,
+    primary: &str,
 ) -> String {
     if records.is_empty() {
         return String::new();
@@ -342,6 +355,13 @@ fn render_serde_ops_interface(
     s.push_str("/// be exported. Bodies use ciborium against the\n");
     s.push_str("/// wit-bindgen-generated local types (which derive\n");
     s.push_str("/// Serialize+Deserialize via additional_derives).\n");
+    s.push_str("///\n");
+    s.push_str("/// #785: identifiers referenced by a record field that\n");
+    s.push_str("/// resolve to a non-cloneable upstream type (resources\n");
+    s.push_str("/// like `geometry`; variants; flags) trigger a `use`\n");
+    s.push_str("/// directive at the top of this interface. Records\n");
+    s.push_str("/// still declared locally; the `use` covers only the\n");
+    s.push_str("/// referenced-but-uncloneable subset.\n");
     s.push_str("interface serde-ops {\n");
 
     // Collect referenced enums (transitive closure over each
@@ -365,6 +385,23 @@ fn render_serde_ops_interface(
         // For Phase E the actual enum body emission happens in
         // `render_world` via `render_local_enums_block`.
     }
+
+    // #785: emit `use <pkg>/<iface>@<ver>.{<type>};` directives for
+    // every cross-interface identifier referenced by a record field
+    // that ISN'T handled by the local-clone paths (records duplicated
+    // below, primary-package enums cloned via the placeholder,
+    // primary-package aliases inlined by `inline_aliases`). The
+    // canonical trigger is `pixel-vec-entry.geom: geometry` — a
+    // resource in `postgis-types`, uncloneable, so we `use` it. Same
+    // treatment covers variants/flags and any cross-package record
+    // whose owning package isn't inlined into serde-ops.
+    let use_block = render_use_directives(
+        records,
+        alias_map,
+        type_source_map,
+        primary,
+    );
+    s.push_str(&use_block);
 
     // Enum bodies — populated by render_world via a placeholder
     // pass.  Placeholder is just an inline note here; the actual
@@ -418,6 +455,206 @@ fn render_serde_ops_interface(
     }
     s.push_str("}\n");
     s
+}
+
+/// #785: source location of a WIT type identifier — used to emit
+/// `use <ns>:<name>/<interface>@<ver>.{<type>};` at the top of the
+/// bridge's local serde-ops interface for any identifier a record
+/// field references but that the LOCAL clone paths (record dup,
+/// enum clone, alias inline) don't cover.
+#[derive(Debug, Clone)]
+pub(crate) struct TypeSource {
+    pub ns_name: String,
+    pub version: String,
+    pub interface: String,
+    pub kind: TypeKind,
+}
+
+/// #785: WIT declaration kind for an identifier tracked in the type
+/// source map. The kind drives whether the local serde-ops
+/// interface duplicates the type verbatim (Enum, Record) or emits
+/// a `use` directive to pull it in from the upstream interface
+/// (Resource, Variant, Flags). Alias entries let the emitter skip
+/// primary-package aliases (already inlined by `inline_aliases`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypeKind {
+    Resource,
+    Variant,
+    Flags,
+    Record,
+    Enum,
+    Alias,
+}
+
+/// #785: build a map (kebab_name → TypeSource) covering every named
+/// type declared in the discovered shim packages. Resource,
+/// variant, flags, record, enum, and type-alias declarations all
+/// register their kebab_name along with their `TypeKind` so the
+/// downstream `use`-directive emitter can decide per-kind whether
+/// the identifier needs a `use` line or resolves locally.
+///
+/// Collisions (same kebab in two different packages) keep the FIRST
+/// entry seen — good enough for postgis's non-overlapping types.
+/// mobilitydb's `stbox3d` collision is intra-package (two interfaces
+/// in the same package), which the map absorbs without issue: both
+/// entries land under the same kebab, and `render_use_directives`
+/// filters records that are duplicated locally BEFORE consulting
+/// the map so the local-record path always wins.
+pub(crate) fn build_type_source_map(
+    shim_packages: &[wit_parse::WitPackage],
+) -> std::collections::BTreeMap<String, TypeSource> {
+    let mut out: std::collections::BTreeMap<String, TypeSource> =
+        std::collections::BTreeMap::new();
+    for pkg in shim_packages {
+        // Resources — the canonical non-cloneable case (opaque
+        // handles like `geometry`, `raster`, `topology`).
+        for r in &pkg.resources {
+            out.entry(r.kebab_name.clone()).or_insert(TypeSource {
+                ns_name: pkg.ns_name.clone(),
+                version: pkg.version.clone(),
+                interface: r.interface.clone(),
+                kind: TypeKind::Resource,
+            });
+        }
+        for v in &pkg.variants {
+            out.entry(v.kebab_name.clone()).or_insert(TypeSource {
+                ns_name: pkg.ns_name.clone(),
+                version: pkg.version.clone(),
+                interface: v.interface.clone(),
+                kind: TypeKind::Variant,
+            });
+        }
+        for f in &pkg.flags {
+            out.entry(f.kebab_name.clone()).or_insert(TypeSource {
+                ns_name: pkg.ns_name.clone(),
+                version: pkg.version.clone(),
+                interface: f.interface.clone(),
+                kind: TypeKind::Flags,
+            });
+        }
+        for r in &pkg.records {
+            out.entry(r.kebab_name.clone()).or_insert(TypeSource {
+                ns_name: pkg.ns_name.clone(),
+                version: pkg.version.clone(),
+                interface: r.interface.clone(),
+                kind: TypeKind::Record,
+            });
+        }
+        for e in &pkg.enums {
+            out.entry(e.kebab_name.clone()).or_insert(TypeSource {
+                ns_name: pkg.ns_name.clone(),
+                version: pkg.version.clone(),
+                interface: e.interface.clone(),
+                kind: TypeKind::Enum,
+            });
+        }
+        for a in &pkg.type_aliases {
+            out.entry(a.kebab_name.clone()).or_insert(TypeSource {
+                ns_name: pkg.ns_name.clone(),
+                version: pkg.version.clone(),
+                interface: a.interface.clone(),
+                kind: TypeKind::Alias,
+            });
+        }
+    }
+    out
+}
+
+/// #785: emit `use <pkg-ns>/<interface>@<ver>.{<type>};` directives
+/// covering every cross-interface identifier referenced by any
+/// record field, that the LOCAL clone paths don't already cover.
+///
+/// Excluded from the emit (each has its own resolution path):
+///   - WIT primitives / compound wrappers (never need `use`)
+///   - Records duplicated locally in this interface (present in
+///     `records`, distinguished by kebab_name)
+///   - Primary-package enums cloned locally (spliced by
+///     `render_world` via the enum placeholder)
+///   - Primary-package type aliases (inlined by `inline_aliases`
+///     when the field text is rendered)
+///
+/// Everything else — canonically resources like `geometry` — gets
+/// a `use` directive so wit-bindgen resolves the reference.
+///
+/// Grouped by (ns_name, interface, version) so all types from one
+/// upstream interface land in a single `use` line.
+fn render_use_directives(
+    records: &[RecordType],
+    alias_map: &std::collections::BTreeMap<String, String>,
+    type_source_map: &std::collections::BTreeMap<String, TypeSource>,
+    primary: &str,
+) -> String {
+    // Records duplicated locally in serde-ops — never need `use`.
+    let local_record_names: std::collections::BTreeSet<&str> =
+        records.iter().map(|r| r.kebab_name.as_str()).collect();
+    // Collect every non-local identifier referenced in a record
+    // field's (alias-resolved) type text.
+    let mut referenced: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for r in records {
+        for (_fn, ftype) in &r.fields {
+            let resolved = inline_aliases(ftype, alias_map);
+            collect_type_idents(&resolved, &local_record_names, &mut referenced);
+        }
+    }
+    // Group by (ns_name, interface, version).
+    let mut groups: std::collections::BTreeMap<
+        (String, String, String),
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
+    for ident in &referenced {
+        let Some(src) = type_source_map.get(ident) else {
+            // Unresolvable identifier — the enum splicer or a truly
+            // unknown ident. wit-bindgen surfaces the latter as a
+            // diagnostic when it tries to resolve the identifier.
+            continue;
+        };
+        // Kind-based routing.
+        //
+        // Primary-package types have three sub-cases:
+        //   - Alias: inlined by `inline_aliases`. Never reaches
+        //     this loop (the identifier is substituted out at the
+        //     field-render site), but we defensively skip anyway.
+        //   - Enum: cloned locally by the enum splicer in
+        //     `render_world`. No `use` needed.
+        //   - Resource / Variant / Flags / Record: NOT cloned
+        //     locally — resources are opaque handles, variants and
+        //     flags have complex bodies we don't duplicate, and
+        //     any primary-package record NOT in `records` (e.g.
+        //     filtered out by upstream because it's helper-package
+        //     scoped) still needs a `use`.
+        //
+        // Non-primary types always emit `use` — helper-package
+        // resources, records, variants, etc. all resolve through
+        // the imported interface.
+        if package_belongs_to_primary(&src.ns_name, primary) {
+            match src.kind {
+                TypeKind::Alias | TypeKind::Enum | TypeKind::Record => continue,
+                TypeKind::Resource | TypeKind::Variant | TypeKind::Flags => {
+                    // Fall through to emit `use`.
+                }
+            }
+        }
+        groups
+            .entry((src.ns_name.clone(), src.interface.clone(), src.version.clone()))
+            .or_default()
+            .insert(ident.clone());
+    }
+    if groups.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ((ns, iface, ver), names) in &groups {
+        let joined = names
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "    use {ns}/{iface}@{ver}.{{{joined}}};\n"
+        ));
+    }
+    out
 }
 
 /// Walk every record's field type-text and collect the names of any
@@ -687,5 +924,213 @@ fn same_file(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod use_directive_tests {
+    //! #785: `use` directives at the top of the serde-ops interface
+    //! for cross-interface identifiers a record field references
+    //! that the LOCAL clone paths don't cover (resources like
+    //! `geometry`, cross-package variants/flags).
+    use super::*;
+    use datalink_shim_codegen_core::wit_parse::{
+        WitEnumDecl, WitFlagsDecl, WitPackage, WitRecord, WitResourceDecl,
+        WitTypeAlias, WitVariantDecl,
+    };
+
+    fn pkg(ns: &str, ver: &str) -> WitPackage {
+        WitPackage {
+            ns_name: ns.to_string(),
+            version: ver.to_string(),
+            interfaces: vec![],
+            records: vec![],
+            resources: vec![] as Vec<WitResourceDecl>,
+            variants: vec![] as Vec<WitVariantDecl>,
+            enums: vec![] as Vec<WitEnumDecl>,
+            flags: vec![] as Vec<WitFlagsDecl>,
+            type_aliases: vec![] as Vec<WitTypeAlias>,
+        }
+    }
+
+    fn rec_type(
+        pkg_ns: &str,
+        pkg_ver: &str,
+        interface: &str,
+        kebab: &str,
+        fields: &[(&str, &str)],
+    ) -> RecordType {
+        RecordType {
+            package: pkg_ns.to_string(),
+            package_version: pkg_ver.to_string(),
+            interface: interface.to_string(),
+            kebab_name: kebab.to_string(),
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect(),
+            type_id: [0u8; 32],
+            symbolic_name: format!(
+                "{pkg_ns}@{pkg_ver}/{interface}/{kebab}"
+            ),
+            is_copy: false,
+            direct: false,
+            kebab_collides_in_pkg: false,
+        }
+    }
+
+    /// #785 canonical trigger: `pixel-vec-entry.geom: geometry`
+    /// where `geometry` is a resource declared in `postgis-types`.
+    /// The emit MUST include `use postgis:wasm/postgis-types@0.1.0.{geometry};`
+    /// so wit-bindgen resolves the identifier.
+    #[test]
+    fn use_directive_emitted_for_resource_referenced_by_record() {
+        let mut postgis = pkg("postgis:wasm", "0.1.0");
+        postgis.resources.push(WitResourceDecl {
+            interface: "postgis-types".to_string(),
+            kebab_name: "geometry".to_string(),
+        });
+        let records = vec![rec_type(
+            "postgis:wasm",
+            "0.1.0",
+            "postgis-raster-vector",
+            "pixel-vec-entry",
+            &[
+                ("geom", "geometry"),
+                ("val", "f64"),
+                ("x", "u32"),
+                ("y", "u32"),
+            ],
+        )];
+        let alias_map = std::collections::BTreeMap::new();
+        let type_source_map = build_type_source_map(&[postgis]);
+        let out = render_serde_ops_interface(
+            &records,
+            &alias_map,
+            &type_source_map,
+            "postgis",
+        );
+        assert!(
+            out.contains(
+                "use postgis:wasm/postgis-types@0.1.0.{geometry};"
+            ),
+            "expected `use postgis:wasm/postgis-types@0.1.0.{{geometry}};` in \
+             emitted serde-ops interface, got:\n{out}"
+        );
+        // Sanity: record itself still declared locally.
+        assert!(out.contains("record pixel-vec-entry {"));
+        assert!(out.contains("geom: geometry"));
+    }
+
+    /// Multiple cross-interface identifiers from the same upstream
+    /// interface collapse into a single `use` line with a
+    /// comma-separated brace list.
+    #[test]
+    fn use_directive_groups_multiple_types_from_same_interface() {
+        let mut postgis = pkg("postgis:wasm", "0.1.0");
+        postgis.resources.push(WitResourceDecl {
+            interface: "postgis-types".to_string(),
+            kebab_name: "geometry".to_string(),
+        });
+        postgis.resources.push(WitResourceDecl {
+            interface: "postgis-types".to_string(),
+            kebab_name: "geography".to_string(),
+        });
+        let records = vec![rec_type(
+            "postgis:wasm",
+            "0.1.0",
+            "some-iface",
+            "geo-pair",
+            &[("g1", "geometry"), ("g2", "geography")],
+        )];
+        let alias_map = std::collections::BTreeMap::new();
+        let type_source_map = build_type_source_map(&[postgis]);
+        let out = render_serde_ops_interface(
+            &records,
+            &alias_map,
+            &type_source_map,
+            "postgis",
+        );
+        assert!(
+            out.contains(
+                "use postgis:wasm/postgis-types@0.1.0.{geography, geometry};"
+            ),
+            "expected grouped `use` line, got:\n{out}"
+        );
+    }
+
+    /// Primary-package aliases are inlined by `inline_aliases`; they
+    /// must NOT show up in a `use` directive. Regression guard so a
+    /// future change to the alias path doesn't accidentally re-route
+    /// them through the `use` emitter.
+    #[test]
+    fn use_directive_skipped_for_primary_alias_type() {
+        let mut postgis = pkg("postgis:wasm", "0.1.0");
+        postgis.type_aliases.push(WitTypeAlias {
+            interface: "postgis-types".to_string(),
+            kebab_name: "srid".to_string(),
+            body: "s32".to_string(),
+        });
+        let records = vec![rec_type(
+            "postgis:wasm",
+            "0.1.0",
+            "postgis-types",
+            "srid-record",
+            &[("s", "srid")],
+        )];
+        let mut alias_map = std::collections::BTreeMap::new();
+        alias_map.insert("srid".to_string(), "s32".to_string());
+        let type_source_map = build_type_source_map(&[postgis]);
+        let out = render_serde_ops_interface(
+            &records,
+            &alias_map,
+            &type_source_map,
+            "postgis",
+        );
+        assert!(
+            !out.contains("use postgis:wasm/postgis-types@0.1.0.{srid}"),
+            "primary-alias `srid` should not appear in a `use` directive, got:\n{out}"
+        );
+        // Alias was inlined — field text should be `s: s32`.
+        assert!(out.contains("s: s32"), "expected inlined alias, got:\n{out}");
+    }
+
+    /// Records referenced by other records that are duplicated
+    /// locally must NOT emit `use` directives — the referenced
+    /// record lands in the same interface and resolves in-scope.
+    #[test]
+    fn use_directive_skipped_for_locally_duplicated_record() {
+        let postgis = pkg("postgis:wasm", "0.1.0");
+        let records = vec![
+            rec_type(
+                "postgis:wasm",
+                "0.1.0",
+                "postgis-types",
+                "coord",
+                &[("x", "f64"), ("y", "f64")],
+            ),
+            rec_type(
+                "postgis:wasm",
+                "0.1.0",
+                "postgis-types",
+                "extremes",
+                &[
+                    ("x-min-point", "coord"),
+                    ("x-max-point", "coord"),
+                ],
+            ),
+        ];
+        let alias_map = std::collections::BTreeMap::new();
+        let type_source_map = build_type_source_map(&[postgis]);
+        let out = render_serde_ops_interface(
+            &records,
+            &alias_map,
+            &type_source_map,
+            "postgis",
+        );
+        assert!(
+            !out.contains("use postgis:wasm/postgis-types@0.1.0.{coord}"),
+            "locally-duplicated record `coord` should not appear in a `use` directive, got:\n{out}"
+        );
     }
 }
