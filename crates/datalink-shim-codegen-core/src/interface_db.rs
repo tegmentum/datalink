@@ -1374,6 +1374,279 @@ pub fn augment_plan_with_upstream_wit_scalars(
     Ok(())
 }
 
+/// #790: reclassify EXISTING interface-DB entries against
+/// `classify_wit_fn_category`. Complements
+/// `augment_plan_with_upstream_wit_scalars`, which only routes newly-
+/// synthesized WIT fns through the classifier and leaves rows the
+/// datafission adapter already registered in whatever bucket the
+/// interface-DB extractor stamped them under.
+///
+/// Motivation: when the datafission adapter's `list_functions()`
+/// registers a fn as a scalar because the shim historically classed
+/// it that way (e.g. `int_span_aggregate_union` — landed as scalar
+/// pre-#782 because the tail-only aggregate detector missed the
+/// `-aggregate-` infix), the shim-interface extractor writes it into
+/// `scalars` in the interface DB. Re-extraction alone can't fix that
+/// because the extractor mirrors whatever the adapter advertises; and
+/// codegen alone can't fix that because `load_plan` reads the
+/// interface DB as-is. #782 landed the infix classifier but only new
+/// (unwired-in-prior-regen) variants got moved on last regen — the
+/// ~49 aggregates the datafission adapter already knew about were
+/// still stuck as scalars, producing a +4 wire delta instead of ~53.
+///
+/// The fix walks each extension's `scalars` / `aggregates` /
+/// `window_functions` lists, looks up the WIT function by
+/// `snake ← kebab` name, and moves any entry whose classifier verdict
+/// disagrees with its current bucket. Aliases and param signatures
+/// carry over; the aggregate / window-specific fields (support flags,
+/// order-sensitive, config-arg indices) use the same defaults the
+/// synthesis path uses (`supports_grouped = true`, etc.), matching
+/// what a fresh interface-DB row would look like if the adapter
+/// registered the fn under the correct bucket.
+///
+/// This is complementary to `augment_plan_with_upstream_wit_scalars`:
+/// reclassify first (fix wrong buckets), then augment (add new). Both
+/// re-sort their target lists so the SQLite emit's metadata pass sees
+/// a deterministic order across regens.
+pub fn reclassify_plan_categories_against_wit(
+    plan: &mut shim_bridge_codegen_core::BridgePlan,
+    wit_deps_dir: &Path,
+) -> Result<()> {
+    if plan.extensions.is_empty() {
+        return Ok(());
+    }
+
+    // Same two-pass walk as `augment_plan_with_upstream_wit_scalars`
+    // (per-package subdir + single-package fallback), same primary-
+    // namespace filter — the classifier only knows about fns that
+    // are actually reachable on the primary shim's WIT surface.
+    let mut wit_fns = Vec::<wit_parse::WitFunction>::new();
+    if let Ok(rd) = std::fs::read_dir(wit_deps_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let parsed = wit_parse::parse_dir(&p)?;
+            wit_fns.extend(parsed);
+        }
+    }
+    let direct = wit_parse::parse_dir(wit_deps_dir).unwrap_or_default();
+    wit_fns.extend(direct);
+    let aliases = collect_package_aliases(wit_deps_dir);
+    let wit_fns = resolve_function_aliases(wit_fns, &aliases);
+
+    let primary = plan.extensions[0].name.clone();
+    let wit_fns: Vec<wit_parse::WitFunction> = wit_fns
+        .into_iter()
+        .filter(|f| {
+            f.package
+                .split(':')
+                .next()
+                .map(|ns| ns == primary)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // Index by kebab→snake name — that's how interface-DB rows are
+    // keyed, and how `augment_plan_with_upstream_wit_scalars` matches
+    // synthesis candidates against the `seen` set.
+    let mut by_snake: HashMap<String, &wit_parse::WitFunction> = HashMap::new();
+    for f in &wit_fns {
+        // Free-function-shaped rows only — resource methods surface
+        // under `<resource>_<method>` names and are dispatched via a
+        // separate index; reclassifying them here would rename them.
+        if f.resource.is_some() && !f.is_constructor {
+            continue;
+        }
+        let snake = wit_parse::kebab_to_snake(&f.kebab_name);
+        by_snake.entry(snake).or_insert(f);
+    }
+
+    // For each plan bucket, collect the entries that belong in a
+    // different bucket, then move them in a second pass.
+    #[derive(Default)]
+    struct Moves {
+        scalars_out: Vec<usize>,
+        aggregates_out: Vec<usize>,
+        windows_out: Vec<usize>,
+        new_scalars: Vec<shim_bridge_codegen_core::ScalarFn>,
+        new_aggregates: Vec<shim_bridge_codegen_core::AggregateFn>,
+        new_windows: Vec<shim_bridge_codegen_core::WindowFn>,
+    }
+
+    let ext = &mut plan.extensions[0];
+    let mut moves = Moves::default();
+
+    // Helper: default AggregateFn / WindowFn shapes when converting
+    // FROM a scalar / into a new bucket. Mirrors the defaults used
+    // by `augment_plan_with_upstream_wit_scalars` for synthesized
+    // rows (support flags true, order-insensitive, no config args).
+    let to_aggregate = |name: String, aliases: Vec<String>, sigs: Vec<Vec<shim_bridge_codegen_core::TypeName>>| shim_bridge_codegen_core::AggregateFn {
+        canonical_name: name,
+        aliases,
+        param_signatures: sigs,
+        supports_grouped: true,
+        supports_partial: true,
+        is_order_sensitive: false,
+        accepts_config: false,
+        config_arg_indices: Vec::new(),
+    };
+    let to_window = |name: String, aliases: Vec<String>, sigs: Vec<Vec<shim_bridge_codegen_core::TypeName>>| shim_bridge_codegen_core::WindowFn {
+        canonical_name: name,
+        aliases,
+        param_signatures: sigs,
+    };
+    let to_scalar =
+        |name: String, aliases: Vec<String>, sigs: Vec<Vec<shim_bridge_codegen_core::TypeName>>| shim_bridge_codegen_core::ScalarFn {
+            canonical_name: name,
+            aliases,
+            param_signatures: sigs,
+            // Placeholder return + flags mirror the synthesised
+            // scalar defaults (`augment_plan_with_upstream_wit_scalars`).
+            // The dispatch matcher re-classifies against the WIT sig
+            // downstream and never reads these on the reclassified path.
+            return_type: "binary".to_string(),
+            is_deterministic: true,
+            propagates_null: true,
+        };
+
+    // Walk scalars — anything WIT-classified as Aggregate or Window
+    // moves out.
+    for (i, sc) in ext.scalars.iter().enumerate() {
+        if let Some(f) = by_snake.get(sc.canonical_name.as_str()) {
+            match classify_wit_fn_category(f) {
+                WitFnCategory::Scalar => {}
+                WitFnCategory::Aggregate => {
+                    moves.scalars_out.push(i);
+                    moves.new_aggregates.push(to_aggregate(
+                        sc.canonical_name.clone(),
+                        sc.aliases.clone(),
+                        sc.param_signatures.clone(),
+                    ));
+                }
+                WitFnCategory::Window => {
+                    moves.scalars_out.push(i);
+                    moves.new_windows.push(to_window(
+                        sc.canonical_name.clone(),
+                        sc.aliases.clone(),
+                        sc.param_signatures.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    // Walk aggregates — anything WIT-classified as Scalar or Window
+    // moves out. (Scalar case is exceedingly rare — an -aggregate
+    // suffix that isn't actually an aggregate — but the classifier
+    // is the source of truth.)
+    for (i, ag) in ext.aggregates.iter().enumerate() {
+        if let Some(f) = by_snake.get(ag.canonical_name.as_str()) {
+            match classify_wit_fn_category(f) {
+                WitFnCategory::Aggregate => {}
+                WitFnCategory::Scalar => {
+                    moves.aggregates_out.push(i);
+                    moves.new_scalars.push(to_scalar(
+                        ag.canonical_name.clone(),
+                        ag.aliases.clone(),
+                        ag.param_signatures.clone(),
+                    ));
+                }
+                WitFnCategory::Window => {
+                    moves.aggregates_out.push(i);
+                    moves.new_windows.push(to_window(
+                        ag.canonical_name.clone(),
+                        ag.aliases.clone(),
+                        ag.param_signatures.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    // Walk window fns — anything WIT-classified as Scalar or
+    // Aggregate moves out.
+    for (i, w) in ext.window_functions.iter().enumerate() {
+        if let Some(f) = by_snake.get(w.canonical_name.as_str()) {
+            match classify_wit_fn_category(f) {
+                WitFnCategory::Window => {}
+                WitFnCategory::Scalar => {
+                    moves.windows_out.push(i);
+                    moves.new_scalars.push(to_scalar(
+                        w.canonical_name.clone(),
+                        w.aliases.clone(),
+                        w.param_signatures.clone(),
+                    ));
+                }
+                WitFnCategory::Aggregate => {
+                    moves.windows_out.push(i);
+                    moves.new_aggregates.push(to_aggregate(
+                        w.canonical_name.clone(),
+                        w.aliases.clone(),
+                        w.param_signatures.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    let moved_count = moves.new_scalars.len()
+        + moves.new_aggregates.len()
+        + moves.new_windows.len();
+    if moved_count == 0 {
+        return Ok(());
+    }
+
+    // Remove-in-reverse so earlier indices stay valid.
+    for i in moves.scalars_out.into_iter().rev() {
+        ext.scalars.remove(i);
+    }
+    for i in moves.aggregates_out.into_iter().rev() {
+        ext.aggregates.remove(i);
+    }
+    for i in moves.windows_out.into_iter().rev() {
+        ext.window_functions.remove(i);
+    }
+
+    if !moves.new_aggregates.is_empty() {
+        eprintln!(
+            "[codegen] reclassify-plan: moved {} entry(ies) into aggregates (#790)",
+            moves.new_aggregates.len(),
+        );
+        for a in &moves.new_aggregates {
+            eprintln!("  * {}", a.canonical_name);
+        }
+        ext.aggregates.extend(moves.new_aggregates);
+        ext.aggregates
+            .sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    }
+    if !moves.new_windows.is_empty() {
+        eprintln!(
+            "[codegen] reclassify-plan: moved {} entry(ies) into window_functions (#790)",
+            moves.new_windows.len(),
+        );
+        for w in &moves.new_windows {
+            eprintln!("  * {}", w.canonical_name);
+        }
+        ext.window_functions.extend(moves.new_windows);
+        ext.window_functions
+            .sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    }
+    if !moves.new_scalars.is_empty() {
+        eprintln!(
+            "[codegen] reclassify-plan: moved {} entry(ies) into scalars (#790)",
+            moves.new_scalars.len(),
+        );
+        for s in &moves.new_scalars {
+            eprintln!("  * {}", s.canonical_name);
+        }
+        ext.scalars.extend(moves.new_scalars);
+        ext.scalars
+            .sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    }
+
+    Ok(())
+}
+
 /// #768: routing category the WIT-scalar auto-synthesiser assigns to
 /// each upstream WIT function it visits. Detection is cheap and
 /// conservative (name-suffix + interface-name + window-shape signature);
@@ -4626,6 +4899,196 @@ mod wit_fn_category_tests {
             WitType::F64,
         );
         assert_eq!(classify_wit_fn_category(&f), WitFnCategory::Aggregate);
+    }
+
+    /// #790: end-to-end coverage of `reclassify_plan_categories_against_wit`
+    /// on an existing interface-DB row.
+    ///
+    /// Before #790 the datafission adapter registered
+    /// `int_span_aggregate_union` as a scalar because the pre-#782
+    /// classifier only checked the `-aggregate` / `-agg` TAIL.
+    /// Re-extraction can't fix that (extractor mirrors the adapter);
+    /// codegen alone can't either (load_plan reads the DB as-is).
+    /// This test builds a plan with the stale scalar row + a
+    /// matching WIT file, calls the reclassifier, and asserts the
+    /// row moved into `aggregates`.
+    #[test]
+    fn reclassify_moves_stale_interface_db_scalar_to_aggregate_790() {
+        let tmp = std::env::temp_dir().join(format!(
+            "datalink-790-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // Mimic the wit_deps layout: one subdir per package.
+        let pkg_dir = tmp.join("mobilitydb-temporal");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg");
+        std::fs::write(
+            pkg_dir.join("aggregates.wit"),
+            "package mobilitydb:temporal@0.1.0;\n\
+             interface temporal-aggregate-ops {\n  \
+                 int-span-aggregate-union: func(xs: list<u32>) -> u32;\n\
+             }\n\
+             interface temporal-ops {\n  \
+                 st-area: func(xs: list<u32>) -> u32;\n\
+             }\n",
+        )
+        .expect("write aggregates.wit");
+
+        // Stale interface-DB shape: aggregate registered as scalar,
+        // plus a control scalar that must NOT move.
+        let mut plan = shim_bridge_codegen_core::BridgePlan {
+            extensions: vec![shim_bridge_codegen_core::Extension {
+                name: "mobilitydb".to_string(),
+                version: "0.1.0".to_string(),
+                api_version: None,
+                wasm_path: "unused".to_string(),
+                wasm_blake3: "unused".to_string(),
+                extracted_at: "unused".to_string(),
+                scalars: vec![
+                    shim_bridge_codegen_core::ScalarFn {
+                        canonical_name: "int_span_aggregate_union".to_string(),
+                        aliases: vec!["intspan_union".to_string()],
+                        param_signatures: vec![vec!["binary".to_string()]],
+                        return_type: "binary".to_string(),
+                        is_deterministic: true,
+                        propagates_null: true,
+                    },
+                    shim_bridge_codegen_core::ScalarFn {
+                        canonical_name: "st_area".to_string(),
+                        aliases: vec![],
+                        param_signatures: vec![vec!["binary".to_string()]],
+                        return_type: "binary".to_string(),
+                        is_deterministic: true,
+                        propagates_null: true,
+                    },
+                ],
+                aggregates: vec![],
+                table_functions: vec![],
+                window_functions: vec![],
+                column_types: vec![],
+                operators: vec![],
+                cast_rewrites: vec![],
+                preprocessor_patterns: vec![],
+                system_catalog_tables: vec![],
+                spatial_indexes: vec![],
+            }],
+        };
+
+        reclassify_plan_categories_against_wit(&mut plan, &tmp)
+            .expect("reclassify");
+
+        // Aggregate moved out of scalars.
+        let ext = &plan.extensions[0];
+        assert!(
+            !ext.scalars.iter().any(|s| s.canonical_name == "int_span_aggregate_union"),
+            "int_span_aggregate_union must leave scalars"
+        );
+        // ... and landed in aggregates, preserving aliases + param sigs.
+        let ag = ext
+            .aggregates
+            .iter()
+            .find(|a| a.canonical_name == "int_span_aggregate_union")
+            .expect("int_span_aggregate_union in aggregates");
+        assert_eq!(ag.aliases, vec!["intspan_union".to_string()]);
+        assert_eq!(ag.param_signatures, vec![vec!["binary".to_string()]]);
+        // Aggregate defaults mirror the synthesis path.
+        assert!(ag.supports_grouped);
+        assert!(ag.supports_partial);
+        assert!(!ag.is_order_sensitive);
+        assert!(!ag.accepts_config);
+
+        // Control scalar stays put — WIT classifies `st-area` as
+        // scalar (no aggregate suffix, no window-shape sig).
+        assert!(
+            ext.scalars.iter().any(|s| s.canonical_name == "st_area"),
+            "st_area must remain a scalar; got scalars={:?}",
+            ext.scalars.iter().map(|s| &s.canonical_name).collect::<Vec<_>>(),
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #790: augment still sees newly-synthesized fns after the
+    /// reclassifier runs. Guards against a regression where the
+    /// reclassifier could accidentally consume rows the augment
+    /// path was going to synthesize (they arrive in different
+    /// buckets and via different codepaths, so the flows are
+    /// orthogonal — this pins that guarantee).
+    #[test]
+    fn reclassify_and_new_synthesis_coexist_790() {
+        let tmp = std::env::temp_dir().join(format!(
+            "datalink-790-newfn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let pkg_dir = tmp.join("mobilitydb-temporal");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg");
+        // WIT declares a fn that has NEVER been registered in the
+        // interface DB yet — the augment path should synthesize it,
+        // and reclassify should be a no-op wrt this row.
+        std::fs::write(
+            pkg_dir.join("aggregates.wit"),
+            "package mobilitydb:temporal@0.1.0;\n\
+             interface temporal-aggregate-ops {\n  \
+                 brand-new-aggregate: func(xs: list<u32>) -> u32;\n\
+             }\n",
+        )
+        .expect("write aggregates.wit");
+
+        let mut plan = shim_bridge_codegen_core::BridgePlan {
+            extensions: vec![shim_bridge_codegen_core::Extension {
+                name: "mobilitydb".to_string(),
+                version: "0.1.0".to_string(),
+                api_version: None,
+                wasm_path: "unused".to_string(),
+                wasm_blake3: "unused".to_string(),
+                extracted_at: "unused".to_string(),
+                // Empty across all buckets — the augment path will
+                // populate aggregates.
+                scalars: vec![],
+                aggregates: vec![],
+                table_functions: vec![],
+                window_functions: vec![],
+                column_types: vec![],
+                operators: vec![],
+                cast_rewrites: vec![],
+                preprocessor_patterns: vec![],
+                system_catalog_tables: vec![],
+                spatial_indexes: vec![],
+            }],
+        };
+
+        // Reclassify — no-op because plan has no entries.
+        reclassify_plan_categories_against_wit(&mut plan, &tmp)
+            .expect("reclassify no-op");
+        // Augment — synthesizes `brand_new_aggregate` and routes it
+        // into aggregates.
+        augment_plan_with_upstream_wit_scalars(&mut plan, &tmp)
+            .expect("augment");
+        let ext = &plan.extensions[0];
+        assert!(
+            ext.aggregates.iter().any(|a| a.canonical_name == "brand_new_aggregate"),
+            "augment must synthesize brand_new_aggregate as an aggregate; got aggregates={:?}",
+            ext.aggregates.iter().map(|a| &a.canonical_name).collect::<Vec<_>>(),
+        );
+        assert!(
+            !ext.scalars.iter().any(|s| s.canonical_name == "brand_new_aggregate"),
+            "brand_new_aggregate must NOT land in scalars"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
