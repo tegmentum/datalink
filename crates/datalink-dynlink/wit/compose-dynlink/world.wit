@@ -25,3 +25,19 @@ world dynlink-provider {
 world endpoint-consumer {
   import endpoint;
 }
+
+/// A dynlink provider whose plugged extension is a STREAMING dot-command:
+/// it emits output through the `sqlite:extension/cli-stdout` host import
+/// rather than returning it in `invoke-result.text`. `wac plug` cannot
+/// wire that import to the provider's own cli-stdout export (the cycle
+/// provider-provides-cli-stdout AND consumes-dot-command), so the import
+/// is left dangling and the HOST supplies it — exactly as the bespoke
+/// CLI loader owns the streams. This world is the host's bindgen target:
+/// it exports `endpoint` (the dynlink surface) and imports the CLI stream
+/// interfaces the host implements and captures.
+world dynlink-provider-cli {
+  export endpoint;
+  import sqlite:extension/cli-stdout@1.0.0;
+  import sqlite:extension/cli-stderr@1.0.0;
+  import sqlite:extension/cli-state@1.0.0;
+}

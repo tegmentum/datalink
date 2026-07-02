@@ -42,6 +42,12 @@ use wasmtime_wasi::{
     WasiView,
 };
 
+/// Async, deep-reentrant + streaming `compose:dynlink` host (ports #221 deep
+/// reentrancy, #223 CLI streaming, and the engine-as-provider path from the
+/// reference sync host into the async crate). This is the surface #226
+/// rewires sqlink's bespoke extension-loader onto.
+pub mod reentrant;
+
 /// Generated bindings for the guest-facing `compose:dynlink/linker` import.
 /// We need the host (import) side: the `linker` interface + the `instance`
 /// resource (mapped to a host backing type by the consumer's store).
