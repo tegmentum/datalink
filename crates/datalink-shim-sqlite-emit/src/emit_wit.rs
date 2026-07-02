@@ -85,42 +85,69 @@ pub fn filter_serde_ops_records(
     shim_packages: &[wit_parse::WitPackage],
     primary: &str,
 ) -> Vec<RecordType> {
-    let type_source_map = build_type_source_map(shim_packages);
+    // Build a set of ALL resource kebab names across every discovered
+    // package. `build_type_source_map` collapses colliding kebabs to
+    // the first-seen (alphabetical) package — postgis's `geometry`
+    // resource is masked by flatgeobuf's `geometry` record — so it
+    // can't be used to detect resource-typed fields. Walk resources
+    // directly instead.
+    let resource_names: std::collections::BTreeSet<String> = shim_packages
+        .iter()
+        .flat_map(|p| p.resources.iter().map(|r| r.kebab_name.clone()))
+        .collect();
     let alias_map: std::collections::BTreeMap<String, String> = shim_packages
         .iter()
         .filter(|p| package_belongs_to_primary(&p.ns_name, primary))
         .flat_map(|p| p.type_aliases.iter())
         .map(|a| (a.kebab_name.clone(), a.body.clone()))
         .collect();
+    // Fix-point walk: a record is filtered if any field references
+    // a resource kebab OR a record kebab that's already been marked
+    // for filtering (N-hop transitive: `outer { inner: some-rec }`
+    // where `some-rec` has a resource field).
+    let mut filtered_out: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    loop {
+        let mut added = false;
+        for r in records {
+            if filtered_out.contains(&r.kebab_name) {
+                continue;
+            }
+            if record_has_blocked_field(r, &alias_map, &resource_names, &filtered_out) {
+                filtered_out.insert(r.kebab_name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
     records
         .iter()
-        .filter(|r| !record_has_resource_field(r, &alias_map, &type_source_map))
+        .filter(|r| !filtered_out.contains(&r.kebab_name))
         .cloned()
         .collect()
 }
 
 /// #794: true when any of the record's field types (after alias
-/// resolution) references an identifier whose `TypeKind` is
-/// `Resource`. Resources in wit-bindgen materialise as opaque
-/// handles without Serialize / Deserialize impls, so a record with
-/// a resource field can't take part in the ciborium codec surface.
-fn record_has_resource_field(
+/// resolution) references either (a) a kebab name in `resource_names`
+/// or (b) a kebab name already marked as filtered-out (transitive).
+fn record_has_blocked_field(
     record: &RecordType,
     alias_map: &std::collections::BTreeMap<String, String>,
-    type_source_map: &std::collections::BTreeMap<String, TypeSource>,
+    resource_names: &std::collections::BTreeSet<String>,
+    filtered_out: &std::collections::BTreeSet<String>,
 ) -> bool {
     for (_fname, ftype) in &record.fields {
         let resolved = inline_aliases(ftype, alias_map);
         let mut idents: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
-        let local_record_names: std::collections::BTreeSet<&str> =
+        let empty: std::collections::BTreeSet<&str> =
             std::collections::BTreeSet::new();
-        collect_type_idents(&resolved, &local_record_names, &mut idents);
+        collect_type_idents(&resolved, &empty, &mut idents);
         for ident in &idents {
-            if let Some(src) = type_source_map.get(ident) {
-                if matches!(src.kind, TypeKind::Resource) {
-                    return true;
-                }
+            if resource_names.contains(ident) || filtered_out.contains(ident) {
+                return true;
             }
         }
     }
