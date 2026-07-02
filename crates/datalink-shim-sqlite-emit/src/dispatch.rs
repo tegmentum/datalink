@@ -969,9 +969,20 @@ pub fn emit_aggregate_step_body(
         AccKind::Record { .. }
             | AccKind::RecordToScalar { .. }
             | AccKind::RecordToTuple { .. }
-            | AccKind::RecordSetToRecordSet { .. }
     ) {
         return emit_aggregate_step_body_record(shape, sql_name, arm_indent);
+    }
+    // #802 Group B: RecordSetToRecordSet — each row streams a full
+    // `list<record>` (a spanset) as a JSON-text SQL arg. Latch the
+    // raw JSON bytes into the existing per-context blob state so
+    // finalize can re-parse each row into `Vec<UPSTREAM>` via the
+    // per-record `parse_json_list_record_<in_snake>` helper before
+    // handing the full `Vec<Vec<UPSTREAM>>` to the upstream aggregator.
+    if matches!(
+        &shape.accumulator_kind,
+        AccKind::RecordSetToRecordSet { .. }
+    ) {
+        return emit_aggregate_step_body_record_set(shape, sql_name, arm_indent);
     }
     // #548 (W3.2): the push helper varies by accumulator kind.
     // Both per-kind state maps live in the bridge's lib.rs prelude.
@@ -1042,6 +1053,41 @@ fn emit_aggregate_step_body_record(
     }
 }
 
+/// #802 Group B: aggregate step body for
+/// `AccKind::RecordSetToRecordSet` — mobilitydb `span-union-ops`'s
+/// four `<int|float|date|tstz>-spanset-aggregate-union` fns. Each
+/// row's arg 0 is a JSON-text `list<record>` (a full spanset). We
+/// latch the raw bytes into the existing per-context geom-state
+/// map (reused as an opaque byte buffer) so finalize can re-parse
+/// each row into `Vec<UPSTREAM>` via the per-record
+/// `parse_json_list_record_<in_snake>` helper.
+///
+/// Extras are not supported on this surface today (the four
+/// spanset-union fns take no constant args); the finalize emitter
+/// bails clearly if any materialise.
+fn emit_aggregate_step_body_record_set(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let extract = format!(
+        "{i}let bytes = arg_blob(&args, 0, \"{sql_name}\")?;\n\
+         {i}push_geom_state(context_id, bytes.to_vec());\n",
+    );
+    if shape.extra_args.is_empty() {
+        format!("{extract}{i}Ok(())")
+    } else {
+        format!(
+            "{extract}\
+             {i}// Round 2: latch extra constant args (1..) on first step.\n\
+             {i}let extras: Vec<SqlValue> = args[1..].to_vec();\n\
+             {i}set_or_validate_extras(context_id, extras, \"{sql_name}\")?;\n\
+             {i}Ok(())"
+        )
+    }
+}
+
 /// Emit the body of an aggregate `finalize` call. Materialises
 /// the accumulated geometries, calls the WIT aggregate function,
 /// returns the WKB-encoded result.
@@ -1081,15 +1127,15 @@ pub fn emit_aggregate_finalize_body(
             shape, sql_name, arm_indent,
         );
     }
-    // #799: RecordSetToRecordSet — nested-list aggregate. Full
-    // emit-path wiring (list-of-list step decode + finalize JSON
-    // encode) lives in a follow-up; classifier + force-link land
-    // now so the four `<int|float|date|tstz>-spanset-aggregate-
-    // union` fns register and surface a clear diagnostic instead
-    // of the codegen-fail path.
+    // #802 Group B: RecordSetToRecordSet — nested-list aggregate
+    // (`<int|float|date|tstz>-spanset-aggregate-union`). Route to a
+    // dedicated emitter: drain each row's JSON-text spanset via the
+    // per-record `parse_json_list_record_<in_snake>` helper, hand
+    // the collected `Vec<Vec<UPSTREAM>>` to the upstream aggregator,
+    // JSON-encode the returned `list<record>` as SqlValue::Text.
     if let AccKind::RecordSetToRecordSet { .. } = &shape.accumulator_kind {
-        return format!(
-            "{arm_indent}Err(format!(\"{sql_name}: AccKind::RecordSetToRecordSet finalize not yet wired\"))",
+        return emit_aggregate_finalize_body_record_set(
+            shape, sql_name, arm_indent,
         );
     }
     let mut s = String::new();
@@ -1785,6 +1831,82 @@ fn emit_aggregate_finalize_body_record_to_tuple(
     s
 }
 
+/// #802 Group B: aggregate finalize body for
+/// `AccKind::RecordSetToRecordSet` — mobilitydb `span-union-ops`'s
+/// four `<int|float|date|tstz>-spanset-aggregate-union` fns.
+///
+/// Pattern:
+///   1. Drain the per-context accumulator (holding each row's
+///      JSON-text spanset as raw bytes; step latched them there).
+///   2. For each row, synthesise a one-element `[SqlValue::Text(...)]`
+///      slice and call the per-input-record
+///      `parse_json_list_record_<in_snake>` helper — the same helper
+///      the scalar `ParamShape::ListRecord` path uses — to decode
+///      into `Vec<UPSTREAM>`. Collect into `Vec<Vec<UPSTREAM>>`.
+///   3. Invoke the upstream aggregator with `&sets` (coerces to
+///      `&[Vec<UPSTREAM>]`, wit-bindgen's binding for
+///      `list<list<record>>`).
+///   4. Serialise the returned `Vec<UPSTREAM_OUT>` to JSON via
+///      `serde_json::to_string` — records derive `serde::Serialize`
+///      through wit-bindgen's `additional_derives`. Wrap in
+///      `SqlValue::Text` so downstream `json_each` walks it.
+///
+/// Extras aren't wired here: today's four spanset-union fns take
+/// no constant args. If a future variant needs them, add the same
+/// `set_or_validate_extras` / `take_extras_state` block used by
+/// the Geom/Raster paths.
+fn emit_aggregate_finalize_body_record_set(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::RecordSetToRecordSet { input, output: _ } =
+        &shape.accumulator_kind
+    else {
+        unreachable!("invariant: caller checks AccKind::RecordSetToRecordSet");
+    };
+    let in_snake = &input.helper_snake;
+
+    let mut s = String::new();
+    // Drain the per-context blob state (reused from the Geom path
+    // as an opaque byte buffer — step wrote raw JSON bytes).
+    s.push_str(&format!(
+        "{i}let raw_rows = take_geom_state(context_id);\n\
+         {i}let mut sets: Vec<Vec<_>> = Vec::with_capacity(raw_rows.len());\n\
+         {i}for r in raw_rows {{\n\
+         {i}    // Recover the row's JSON text and reuse the per-record\n\
+         {i}    // ListRecord decoder to produce `Vec<UPSTREAM>` in one\n\
+         {i}    // shot. `SqlValue::Text` construction is cheap; the\n\
+         {i}    // decoder itself validates the JSON shape.\n\
+         {i}    let __json = String::from_utf8(r)\n\
+         {i}        .map_err(|e| format!(\"{sql_name}: row is not valid UTF-8: {{}}\", e))?;\n\
+         {i}    let __args = [SqlValue::Text(__json)];\n\
+         {i}    sets.push(parse_json_list_record_{in_snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}}}\n",
+    ));
+
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}return Err(format!(\"{sql_name}: AccKind::RecordSetToRecordSet aggregate with extra args not yet wired\"));\n",
+        ));
+        return s;
+    }
+
+    // Non-fallible upstream: today's four spanset-union fns return
+    // `list<record>` directly (no `result<...>` wrap). If a future
+    // fallible variant lands, extend with `.map_err(...)?`.
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}(&sets);\n\
+         {i}let __json = serde_json::to_string(&__r)\n\
+         {i}    .map_err(|e| format!(\"{sql_name}: encode JSON: {{}}\", e))?;\n\
+         {i}Ok(SqlValue::Text(__json))",
+    ));
+    s
+}
+
 /// W3.3 (#543): kebab-case → PascalCase for enum-type and -case
 /// names. wit-bindgen's generator does the same conversion when
 /// emitting Rust enum idents, so the dispatch arm references
@@ -1808,5 +1930,102 @@ fn kebab_to_pascal(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod record_set_aggregate_tests {
+    //! #802 Group B: emit-body coverage for the
+    //! `AccKind::RecordSetToRecordSet` step + finalize paths that
+    //! wire mobilitydb's four `<int|float|date|tstz>-spanset-
+    //! aggregate-union` fns. The classifier arm is tested inside
+    //! `interface_db.rs`; these two check the generated Rust source
+    //! is what dispatch.rs expects at runtime.
+    use super::*;
+
+    fn make_shape() -> AggregateShape {
+        AggregateShape {
+            wit_module: "span_union_ops".to_string(),
+            wit_package: "mobilitydb:temporal".to_string(),
+            wit_func: "int_spanset_aggregate_union".to_string(),
+            extra_args: vec![],
+            // The finalize emitter for RecordSetToRecordSet ignores
+            // `shape.ret` (it always JSON-encodes via
+            // `serde_json::to_string`), so any RetShape is fine here.
+            // Use `Text` — the simplest variant that satisfies the
+            // struct-literal requirement.
+            ret: RetShape::Text,
+            accumulator_kind: AccKind::RecordSetToRecordSet {
+                input: RecordSpec {
+                    kebab_name: "int-span".to_string(),
+                    wit_interface: "spans-ops".to_string(),
+                    wit_package: "mobilitydb:temporal".to_string(),
+                    wit_package_version: "0.1.0".to_string(),
+                    symbolic_name: "mobilitydb:temporal@0.1.0/spans-ops/int-span"
+                        .to_string(),
+                    type_id_hex: "00".to_string(),
+                    helper_snake: "int_span".to_string(),
+                },
+                output: RecordSpec {
+                    kebab_name: "int-span".to_string(),
+                    wit_interface: "spans-ops".to_string(),
+                    wit_package: "mobilitydb:temporal".to_string(),
+                    wit_package_version: "0.1.0".to_string(),
+                    symbolic_name: "mobilitydb:temporal@0.1.0/spans-ops/int-span"
+                        .to_string(),
+                    type_id_hex: "00".to_string(),
+                    helper_snake: "int_span".to_string(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn step_body_latches_row_bytes_into_geom_state() {
+        let shape = make_shape();
+        let body = emit_aggregate_step_body(
+            &shape,
+            "int_spanset_aggregate_union",
+            "                ",
+        );
+        // Row arg is JSON text; arg_blob accepts SqlValue::Text via
+        // s.as_bytes(). Confirm we latch into the reused per-context
+        // blob state — not the wit-value state (which the flat
+        // `list<record>` Group A path uses).
+        assert!(body.contains("arg_blob(&args, 0"), "body:\n{body}");
+        assert!(body.contains("push_geom_state(context_id"), "body:\n{body}");
+        assert!(!body.contains("push_witvalue_state"), "body:\n{body}");
+    }
+
+    #[test]
+    fn finalize_body_decodes_rows_and_encodes_result_json() {
+        let shape = make_shape();
+        let body = emit_aggregate_finalize_body(
+            &shape,
+            "int_spanset_aggregate_union",
+            "                ",
+        );
+        // Drain the per-context blob state and re-parse each row's
+        // JSON via the per-record `parse_json_list_record_<snake>`
+        // helper — the same one ParamShape::ListRecord uses.
+        assert!(body.contains("take_geom_state(context_id)"), "body:\n{body}");
+        assert!(
+            body.contains("parse_json_list_record_int_span"),
+            "body:\n{body}"
+        );
+        // Upstream aggregator call + JSON-encoded Text return.
+        assert!(
+            body.contains(
+                "span_union_ops::int_spanset_aggregate_union(&sets)"
+            ),
+            "body:\n{body}"
+        );
+        assert!(body.contains("serde_json::to_string(&__r)"), "body:\n{body}");
+        assert!(body.contains("SqlValue::Text(__json)"), "body:\n{body}");
+        // Must NOT still emit the pre-#802 "not yet wired" stub.
+        assert!(
+            !body.contains("finalize not yet wired"),
+            "body should no longer be the placeholder stub:\n{body}"
+        );
+    }
 }
 

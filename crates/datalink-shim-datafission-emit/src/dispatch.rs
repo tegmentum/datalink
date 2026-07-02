@@ -1018,14 +1018,16 @@ pub fn emit_aggregate_finalize_body(
             shape, sql_name, arm_indent,
         );
     }
-    // #799: RecordSetToRecordSet — nested-list aggregate
-    // (`<int|float|date|tstz>-spanset-aggregate-union`). Full
-    // datafission emit-path wiring lives in a follow-up; landing
-    // the classifier + force-link now surfaces a clear runtime
-    // diagnostic instead of the codegen-fail path.
+    // #802 Group B: RecordSetToRecordSet — nested-list aggregate
+    // (`<int|float|date|tstz>-spanset-aggregate-union`). Route to a
+    // dedicated emitter: decode each accumulated blob (JSON-text
+    // spanset that `accumulate` pushed via `ScalarValue::Utf8 →
+    // into_bytes`) through the per-record ListRecord decoder, hand
+    // the collected `Vec<Vec<UPSTREAM>>` to the upstream aggregator,
+    // JSON-encode the returned `list<record>` as `ScalarValue::Utf8`.
     if let AccKind::RecordSetToRecordSet { .. } = &shape.accumulator_kind {
-        return format!(
-            "{i}Err(ftypes::FunctionError::ExecutionError(format!(\"{sql_name}: AccKind::RecordSetToRecordSet aggregate not yet wired\")))\n",
+        return emit_aggregate_finalize_body_record_set(
+            shape, sql_name, arm_indent,
         );
     }
 
@@ -1710,6 +1712,82 @@ fn emit_aggregate_finalize_body_record_to_tuple(
     s.push_str(&format!(
         "{i}let __r = {module}::{func}({call_args});\n\
          {i}{body}\n",
+    ));
+    s
+}
+
+/// #802 Group B: Datafission-target aggregate finalize body for
+/// `AccKind::RecordSetToRecordSet` — mobilitydb `span-union-ops`'s
+/// four `<int|float|date|tstz>-spanset-aggregate-union` fns.
+///
+/// Pattern:
+///   1. `st.blobs` holds each row's spanset as raw JSON bytes
+///      (`accumulate` converts `ScalarValue::Utf8` into bytes and
+///      pushes; `ScalarValue::Binary` passes through verbatim). We
+///      re-materialise a `ScalarValue::Utf8(String)` per row so the
+///      per-record `parse_json_list_record_<in_snake>` helper — the
+///      same one the scalar `ParamShape::ListRecord` path uses —
+///      can decode into `Vec<UPSTREAM>`.
+///   2. Collect all rows into `Vec<Vec<UPSTREAM>>` and call the
+///      upstream aggregator with `&sets` (wit-bindgen binds
+///      `list<list<record>>` as `&[Vec<UPSTREAM>]`).
+///   3. Serialise the returned `Vec<UPSTREAM_OUT>` via
+///      `serde_json::to_string` (records derive `serde::Serialize`
+///      through wit-bindgen's `additional_derives`) and wrap in
+///      `ScalarValue::Utf8` so `json_each` / DuckDB `json_extract`
+///      can walk the result.
+///
+/// Extras aren't wired: the four spanset-union fns take no
+/// constant args. Follow the Geom/Raster extras block if a future
+/// variant needs them.
+fn emit_aggregate_finalize_body_record_set(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::RecordSetToRecordSet { input, output: _ } =
+        &shape.accumulator_kind
+    else {
+        unreachable!("invariant: caller checks AccKind::RecordSetToRecordSet");
+    };
+    let in_snake = &input.helper_snake;
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "{i}let mut sets: Vec<Vec<_>> = Vec::with_capacity(st.blobs.len());\n\
+         {i}for b in &st.blobs {{\n\
+         {i}    // Recover the row's JSON text (accumulate serialised\n\
+         {i}    // Utf8 → into_bytes; Binary passed through). Reuse the\n\
+         {i}    // per-record ListRecord decoder — same helper the\n\
+         {i}    // ParamShape::ListRecord scalar path uses — to produce\n\
+         {i}    // `Vec<UPSTREAM>` in one shot.\n\
+         {i}    let __text = String::from_utf8(b.clone())\n\
+         {i}        .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+         {i}            format!(\"{sql_name}: row is not valid UTF-8: {{}}\", e)))?;\n\
+         {i}    let __args = [ftypes::ScalarValue::Utf8(__text)];\n\
+         {i}    sets.push(parse_json_list_record_{in_snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}}}\n",
+    ));
+
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}return Err(ftypes::FunctionError::ExecutionError(\n\
+             {i}    format!(\"{sql_name}: AccKind::RecordSetToRecordSet aggregate with extra args not yet wired\")));\n",
+        ));
+        return s;
+    }
+
+    // Non-fallible upstream: today's four spanset-union fns return
+    // `list<record>` directly (no `result<...>` wrap).
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}(&sets);\n\
+         {i}let __json = serde_json::to_string(&__r)\n\
+         {i}    .map_err(|e| ftypes::FunctionError::ExecutionError(\n\
+         {i}        format!(\"{sql_name}: encode JSON: {{}}\", e)))?;\n\
+         {i}Ok(ftypes::ScalarValue::Utf8(__json))\n",
     ));
     s
 }
