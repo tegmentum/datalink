@@ -494,7 +494,8 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         // encoder (the output is a primitive scalar wrap (#614) or
         // a JSON-encoded primitive tuple (#640)).
         match &entry.shape.accumulator_kind {
-            interface_db::AccKind::Record { input, output } => {
+            interface_db::AccKind::Record { input, output }
+            | interface_db::AccKind::RecordSetToRecordSet { input, output } => {
                 referenced_records
                     .insert((input.wit_interface.clone(), input.kebab_name.clone()));
                 referenced_records

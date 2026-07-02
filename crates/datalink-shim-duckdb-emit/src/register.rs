@@ -389,7 +389,13 @@ pub fn render_aggregates(
                 // matches the pre-#611 pattern for AccKind::Record).
                 AccKind::Record { .. }
                 | AccKind::RecordToScalar { .. }
-                | AccKind::RecordToTuple { .. } => continue,
+                | AccKind::RecordToTuple { .. }
+                // #799: RecordSetToRecordSet — nested-list aggregate
+                // (`<int|float|date|tstz>-spanset-aggregate-union`).
+                // Full DuckDB runtime wiring lives in a follow-up;
+                // skip registration here for the same reason as the
+                // Record family above.
+                | AccKind::RecordSetToRecordSet { .. } => continue,
             };
             args_block.push_str(&format!(
                 "            runtime::Funcarg {{\n\

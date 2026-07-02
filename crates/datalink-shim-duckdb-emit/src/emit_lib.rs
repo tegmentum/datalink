@@ -1912,7 +1912,8 @@ fn collect_referenced_records(
     // (#640), not a record codec call.
     for entry in aggregate_entries {
         match &entry.shape.accumulator_kind {
-            interface_db::AccKind::Record { input, output } => {
+            interface_db::AccKind::Record { input, output }
+            | interface_db::AccKind::RecordSetToRecordSet { input, output } => {
                 out.insert(input.kebab_name.clone());
                 out.insert(output.kebab_name.clone());
             }

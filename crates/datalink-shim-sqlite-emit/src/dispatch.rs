@@ -854,6 +854,7 @@ pub fn emit_arm_body(
             // `serde_json::to_string`, and the only difference is the
             // upstream Rust shape that serde renders.
             JsonRetKind::OptionListPrimRecord(_)
+            | JsonRetKind::OptionListRecord(_)
             | JsonRetKind::OptionListPrim(_)
             | JsonRetKind::OptionListTuplePrim(_)
             | JsonRetKind::OptionTuplePrimOrOptPrim(_) => format!(
@@ -968,6 +969,7 @@ pub fn emit_aggregate_step_body(
         AccKind::Record { .. }
             | AccKind::RecordToScalar { .. }
             | AccKind::RecordToTuple { .. }
+            | AccKind::RecordSetToRecordSet { .. }
     ) {
         return emit_aggregate_step_body_record(shape, sql_name, arm_indent);
     }
@@ -978,7 +980,8 @@ pub fn emit_aggregate_step_body(
         AccKind::Raster => "push_raster_state",
         AccKind::Record { .. }
         | AccKind::RecordToScalar { .. }
-        | AccKind::RecordToTuple { .. } => {
+        | AccKind::RecordToTuple { .. }
+        | AccKind::RecordSetToRecordSet { .. } => {
             unreachable!("handled above")
         }
     };
@@ -1078,6 +1081,17 @@ pub fn emit_aggregate_finalize_body(
             shape, sql_name, arm_indent,
         );
     }
+    // #799: RecordSetToRecordSet — nested-list aggregate. Full
+    // emit-path wiring (list-of-list step decode + finalize JSON
+    // encode) lives in a follow-up; classifier + force-link land
+    // now so the four `<int|float|date|tstz>-spanset-aggregate-
+    // union` fns register and surface a clear diagnostic instead
+    // of the codegen-fail path.
+    if let AccKind::RecordSetToRecordSet { .. } = &shape.accumulator_kind {
+        return format!(
+            "{arm_indent}Err(format!(\"{sql_name}: AccKind::RecordSetToRecordSet finalize not yet wired\"))",
+        );
+    }
     let mut s = String::new();
     // #548 (W3.2): per-kind accumulator take + decode. Both paths
     // materialise `refs: Vec<&Resource>` so the downstream
@@ -1104,7 +1118,8 @@ pub fn emit_aggregate_finalize_body(
         }
         AccKind::Record { .. }
         | AccKind::RecordToScalar { .. }
-        | AccKind::RecordToTuple { .. } => {
+        | AccKind::RecordToTuple { .. }
+        | AccKind::RecordSetToRecordSet { .. } => {
             unreachable!("handled above")
         }
     }

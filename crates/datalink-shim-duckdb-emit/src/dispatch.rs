@@ -660,6 +660,7 @@ fn render_return_expr(
             // `OptionTuplePrimOrOptPrim` (tuple with `Option<X>` fields
             // — serde renders `None` as JSON `null`).
             JsonRetKind::OptionListPrimRecord(_)
+            | JsonRetKind::OptionListRecord(_)
             | JsonRetKind::OptionListPrim(_)
             | JsonRetKind::OptionListTuplePrim(_)
             | JsonRetKind::OptionTuplePrimOrOptPrim(_) => format!(
@@ -856,6 +857,16 @@ pub fn emit_aggregate_arm_body(
             shape, sql_name, arm_indent,
         );
     }
+    // #799: RecordSetToRecordSet — nested-list aggregate
+    // (`<int|float|date|tstz>-spanset-aggregate-union`). Full
+    // emit-path wiring lives in a follow-up; landing the
+    // classifier + force-link now surfaces a clear runtime
+    // diagnostic instead of the codegen-fail path.
+    if matches!(&shape.accumulator_kind, AccKind::RecordSetToRecordSet { .. }) {
+        return format!(
+            "{i}Err(types::Duckerror::Invalidargument(format!(\"{sql_name}: AccKind::RecordSetToRecordSet aggregate not yet wired\")))",
+        );
+    }
 
     // Accumulator iteration: walk `rows`, skip rows whose
     // streaming arg is NULL, collect raw blobs. Mirrors
@@ -876,6 +887,7 @@ pub fn emit_aggregate_arm_body(
         AccKind::Record { .. } => unreachable!("handled above"),
         AccKind::RecordToScalar { .. } => unreachable!("handled above"),
         AccKind::RecordToTuple { .. } => unreachable!("handled above"),
+        AccKind::RecordSetToRecordSet { .. } => unreachable!("handled above"),
     };
     let decode_call = decode_call.replace("AGG_NAME", sql_name);
 
@@ -948,6 +960,9 @@ pub fn emit_aggregate_arm_body(
         }
         AccKind::RecordToTuple { .. } => {
             unreachable!("handled by emit_aggregate_arm_body_record_to_tuple above")
+        }
+        AccKind::RecordSetToRecordSet { .. } => {
+            unreachable!("handled above (short-circuit stub)")
         }
     }
 

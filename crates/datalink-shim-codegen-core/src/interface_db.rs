@@ -700,6 +700,25 @@ pub enum JsonRetKind {
     /// these constructors and previously deferred because no scalar
     /// arm existed.
     OptionListPrimRecord(String),
+    /// #799: `option<list<R>>` where `R` is a same-package record
+    /// with nested compound fields (e.g. `list<record>`, which does
+    /// not fit `OptionListPrimRecord`'s "record-of-primitives"
+    /// constraint). The upstream Rust `Vec<R>` still serialises via
+    /// serde — wit-bindgen's `additional_derives` supplies
+    /// `Serialize` on every record (including transitively-nested
+    /// ones) — so the emit template is byte-identical to
+    /// `OptionListPrimRecord`; the split lets diagnostics /
+    /// downstream tooling distinguish "flat rows" from "records
+    /// with nested lists" without a structural walk.
+    ///
+    /// Today's surface (mobilitydb temporal-append-ops): the eight
+    /// `t*-append-sequence(sset: list<t*-sequence>, seq: t*-sequence)
+    ///   -> option<list<t*-sequence>>`
+    /// signatures, where `t*-sequence` carries an `instants:
+    /// list<t*-instant>` field (nested `list<record>`). SQL callers
+    /// consume the JSON array of nested objects via SQLite's JSON1
+    /// ops / DuckDB's `json_extract`.
+    OptionListRecord(String),
     /// #716: `option<list<X>>` for primitive X — Some(vec) →
     /// `serde_json::to_string` on the inner `Vec<X>`; None → SQL NULL.
     /// Today's surface (mobilitydb): the four `*-set-from-text`
@@ -810,7 +829,18 @@ pub fn build_aggregate_registry(
     fn is_primary_agg_interface(iface: &str) -> bool {
         matches!(
             iface,
-            "postgis-aggregates" | "postgis-raster-aggregates" | "temporal-aggregate-ops"
+            "postgis-aggregates"
+                | "postgis-raster-aggregates"
+                | "temporal-aggregate-ops"
+                // #799: mobilitydb's span-union-ops carries both the
+                // 4 flat `list<X-span>` union aggs (already wired via
+                // AccKind::Record) and the 4 nested
+                // `list<list<X-span>> -> list<X-span>` spanset union
+                // aggs (this issue: `<int|float|date|tstz>-spanset-
+                // aggregate-union`). Both fit the aggregate model; the
+                // classifier picks the `RecordSetToRecordSet` branch
+                // for the nested shape.
+                | "span-union-ops"
         )
     }
     let mut agg_index: HashMap<String, &WitFunction> = HashMap::new();
@@ -832,7 +862,20 @@ pub fn build_aggregate_registry(
                 // #607 Phase 0: list<X> owned where X is unsupported
                 // (i.e. a kebab — record candidate). The classifier
                 // will validate the kebab against the record registry.
-                WitType::List(inner) => matches!(inner.as_ref(), WitType::Unsupported(_)),
+                //
+                // #799: also accept list<list<X>> where X is a record
+                // kebab — the `<int|float|date|tstz>-spanset-
+                // aggregate-union` shape. `span-union-ops` is on the
+                // primary allowlist, but the fallback index catches
+                // any future interface that uses the same nested
+                // shape without needing another allowlist patch.
+                WitType::List(inner) => match inner.as_ref() {
+                    WitType::Unsupported(_) => true,
+                    WitType::List(inner2) => {
+                        matches!(inner2.as_ref(), WitType::Unsupported(_))
+                    }
+                    _ => false,
+                },
                 _ => false,
             })
             .unwrap_or(false);
@@ -1903,6 +1946,29 @@ pub enum AccKind {
         output: Vec<ScalarReturnKind>,
         optional: bool,
     },
+    /// #799: nested-list-of-record input, list-of-record output.
+    ///
+    /// Each row streams a full spanset — a `list<record>` — and the
+    /// finalize call takes `list<list<record>>`, returning a unified
+    /// `list<record>` (bare, no `option<>` wrapper). Distinct from
+    /// `Record` on both sides:
+    ///   - Step body pushes ONE `Vec<UPSTREAM>` (serialized per row)
+    ///     onto the accumulator state rather than a single UPSTREAM
+    ///     payload — the input is a set, not a single element.
+    ///   - Finalize decodes the accumulator into `Vec<Vec<UPSTREAM>>`
+    ///     and hands it to the upstream aggregator as `&[Vec<R>]`.
+    ///   - Output side wraps the full `Vec<R>` back into a JSON-array
+    ///     text — SQL callers unpack via `json_each` / DuckDB's
+    ///     `json_extract`. This preserves the whole unified spanset
+    ///     rather than the FirstWitValueRecord "first element only"
+    ///     collapse used elsewhere.
+    ///
+    /// Today's surface (mobilitydb `span-union-ops`): the four
+    /// `<int|float|date|tstz>-spanset-aggregate-union` fns.
+    RecordSetToRecordSet {
+        input: RecordSpec,
+        output: RecordSpec,
+    },
 }
 
 /// #614: primitive scalar return for `AccKind::RecordToScalar`.
@@ -2349,6 +2415,14 @@ pub fn classify_aggregate_shape(
     // carries both halves of a possibly-asymmetric in/out pair
     // (`tgeompoint-st-extent` returns `option<stbox>`; the six
     // `t*-temporal-count` aggregates return `option<tint-sequence>`).
+    // #799: `input_is_nested` distinguishes the flat `list<record>`
+    // shape (Phase 1 pilot: mobilitydb temporal-type aggregates —
+    // input rows carry one record each) from the nested
+    // `list<list<record>>` shape (`<int|float|date|tstz>-spanset-
+    // aggregate-union` — input rows carry a spanset = list of
+    // records). The nested shape drives the new
+    // `AccKind::RecordSetToRecordSet` variant below.
+    let mut input_is_nested = false;
     let input_spec: Option<RecordSpec> = match first {
         WitType::List(inner) => match inner.as_ref() {
             WitType::Unsupported(name) => {
@@ -2371,9 +2445,44 @@ pub fn classify_aggregate_shape(
                     ));
                 }
             }
+            // #799: `list<list<record>>` — nested aggregate input.
+            // Each row streams a full spanset (list<X-span>); the
+            // finalize call takes `list<list<X-span>>` and returns a
+            // unified spanset. Today's surface: mobilitydb
+            // `span-union-ops`'s four `<int|float|date|tstz>-spanset-
+            // aggregate-union` fns.
+            WitType::List(inner2) => match inner2.as_ref() {
+                WitType::Unsupported(name) => {
+                    if let Some(rec) = find_record(records, name, &f.interface) {
+                        let type_id_hex: String =
+                            rec.type_id.iter().map(|b| format!("{:02x}", b)).collect();
+                        input_is_nested = true;
+                        Some(RecordSpec {
+                            kebab_name: rec.kebab_name.clone(),
+                            wit_interface: rec.interface.clone(),
+                            wit_package: rec.package.clone(),
+                            wit_package_version: rec.package_version.clone(),
+                            symbolic_name: rec.symbolic_name.clone(),
+                            type_id_hex,
+                            helper_snake: rec.helper_snake(),
+                        })
+                    } else {
+                        return Err(format!(
+                            "first aggregate param `list<list<{}>>` has no matching record in the bridge registry",
+                            name,
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "first aggregate param must be list<borrow<geometry>>, list<borrow<raster>>, list<record>, or list<list<record>>; got list<list<{:?}>>",
+                        inner2,
+                    ));
+                }
+            },
             _ => {
                 return Err(format!(
-                    "first aggregate param must be list<borrow<geometry>>, list<borrow<raster>>, or list<record>; got list<{:?}>",
+                    "first aggregate param must be list<borrow<geometry>>, list<borrow<raster>>, list<record>, or list<list<record>>; got list<{:?}>",
                     inner,
                 ));
             }
@@ -2381,7 +2490,7 @@ pub fn classify_aggregate_shape(
         WitType::ListGeomBorrow | WitType::ListRasterBorrow => None,
         other => {
             return Err(format!(
-                "first aggregate param must be list<borrow<geometry>>, list<borrow<raster>>, or list<record>; got {:?}",
+                "first aggregate param must be list<borrow<geometry>>, list<borrow<raster>>, list<record>, or list<list<record>>; got {:?}",
                 other,
             ));
         }
@@ -2453,7 +2562,16 @@ pub fn classify_aggregate_shape(
                         out_kebab,
                     ));
                 };
-                AccKind::Record { input, output }
+                // #799: nested-list input (`list<list<record>>`) + a
+                // record-shaped return picks the RecordSetToRecordSet
+                // variant so the finalize path preserves the whole
+                // output list rather than collapsing to a first-
+                // element projection.
+                if input_is_nested {
+                    AccKind::RecordSetToRecordSet { input, output }
+                } else {
+                    AccKind::Record { input, output }
+                }
             } else if let Some(scalar_out) = scalar_return_kind(&f.ret.inner) {
                 // #614: list<record> → primitive scalar shape.
                 // RetShape collapses integer widths (every
@@ -3293,10 +3411,27 @@ pub fn classify_return(
                                 ),
                             });
                         }
+                        // #799: record with nested compound fields
+                        // (e.g. `list<record>` — mobilitydb
+                        // `t*-append-sequence` returns
+                        // `option<list<t*-sequence>>` where
+                        // `t*-sequence` carries `instants:
+                        // list<t*-instant>`). Emits the same
+                        // `serde_json::to_string(&Vec<R>)` template
+                        // as `OptionListPrimRecord` — wit-bindgen's
+                        // `additional_derives` supplies `Serialize`
+                        // on every record (transitively), so nested
+                        // record fields render as nested JSON
+                        // objects.
+                        return Ok(RetShape::JsonText {
+                            kind: JsonRetKind::OptionListRecord(
+                                rec.kebab_name.clone(),
+                            ),
+                        });
                     }
                 }
                 return Err(format!(
-                    "return type not in dispatcher alphabet: option<list<{}>> (inner not a primitive-only record)",
+                    "return type not in dispatcher alphabet: option<list<{}>> (inner not a matching record)",
                     type_label_dbg(inner_list)
                 ));
             }
@@ -5198,6 +5333,271 @@ mod list_list_record_tests {
         assert!(
             matches!(shape, ParamShape::ListListU8),
             "expected ListListU8, got {shape:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod option_list_record_tests {
+    //! #799 coverage — two shape families identified in the not-wired
+    //! mdb-fn audit:
+    //!
+    //! * `option<list<R>>` return where R has a nested `list<record>`
+    //!   field (`t*-append-sequence` — 8 fns): routes through a new
+    //!   `JsonRetKind::OptionListRecord` variant. Same serde-based
+    //!   emit template as `OptionListPrimRecord`; the split lets
+    //!   downstream tooling distinguish "flat rows" from "records
+    //!   with nested lists" without a structural walk.
+    //!
+    //! * `list<list<record>> -> list<record>` aggregate shape
+    //!   (`<int|float|date|tstz>-spanset-aggregate-union` — 4 fns):
+    //!   routes through a new `AccKind::RecordSetToRecordSet` variant.
+    //!   Full emit-path wiring (list-of-list step decode + finalize
+    //!   JSON encode) lives in a follow-up; the classifier + force-
+    //!   link land here so the four fns register instead of falling
+    //!   through the unwired-scalar diagnostic.
+    use super::*;
+    use crate::record_registry::RecordType;
+    use crate::wit_parse::{WitRet, WitType};
+
+    fn make_tint_instant_record() -> RecordType {
+        RecordType {
+            package: "mobilitydb:temporal".to_string(),
+            package_version: "0.1.0".to_string(),
+            interface: "types".to_string(),
+            kebab_name: "tint-instant".to_string(),
+            fields: vec![
+                ("timestamp".to_string(), "s64".to_string()),
+                ("value".to_string(), "s64".to_string()),
+            ],
+            type_id: [0u8; 32],
+            symbolic_name: "mobilitydb:temporal@0.1.0/types/tint-instant".to_string(),
+            is_copy: true,
+            direct: true,
+            kebab_collides_in_pkg: false,
+        }
+    }
+
+    fn make_tint_sequence_record() -> RecordType {
+        // Nested `list<tint-instant>` — the field that trips the
+        // all-primitive guard on `OptionListPrimRecord`.
+        RecordType {
+            package: "mobilitydb:temporal".to_string(),
+            package_version: "0.1.0".to_string(),
+            interface: "types".to_string(),
+            kebab_name: "tint-sequence".to_string(),
+            fields: vec![
+                ("instants".to_string(), "list<tint-instant>".to_string()),
+                ("interpolation".to_string(), "interpolation".to_string()),
+                ("lower-inclusive".to_string(), "bool".to_string()),
+                ("upper-inclusive".to_string(), "bool".to_string()),
+            ],
+            type_id: [0u8; 32],
+            symbolic_name: "mobilitydb:temporal@0.1.0/types/tint-sequence".to_string(),
+            is_copy: false,
+            direct: true,
+            kebab_collides_in_pkg: false,
+        }
+    }
+
+    #[test]
+    fn return_option_list_record_with_nested_list_record_routes_to_option_list_record() {
+        // The `t*-append-sequence` return shape:
+        // `option<list<tint-sequence>>`. `tint-sequence` has a
+        // `list<tint-instant>` field so `record_fields_all_primitive`
+        // returns false; the fallback branch must route through
+        // `OptionListRecord`.
+        let records = vec![make_tint_instant_record(), make_tint_sequence_record()];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let r = WitRet {
+            inner: WitType::Option(Box::new(WitType::List(Box::new(
+                WitType::Unsupported("tint-sequence".to_string()),
+            )))),
+            fallible: false,
+            error_ty: None,
+        };
+        let shape = classify_return(&r, &records, &enums, "temporal-append-ops").unwrap();
+        match shape {
+            RetShape::JsonText { kind } => match kind {
+                JsonRetKind::OptionListRecord(name) => {
+                    assert_eq!(name, "tint-sequence");
+                }
+                other => panic!("expected OptionListRecord, got {other:?}"),
+            },
+            other => panic!("expected JsonText/OptionListRecord, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_option_list_prim_record_still_prefers_prim_record_variant() {
+        // Regression: an all-primitive record like `int-span` must
+        // still route to `OptionListPrimRecord` — the two variants
+        // exist so downstream tooling can distinguish "flat rows"
+        // from "records with nested lists" without a structural walk.
+        let int_span = RecordType {
+            package: "mobilitydb:temporal".to_string(),
+            package_version: "0.1.0".to_string(),
+            interface: "spans-ops".to_string(),
+            kebab_name: "int-span".to_string(),
+            fields: vec![
+                ("lower".to_string(), "s32".to_string()),
+                ("upper".to_string(), "s32".to_string()),
+                ("lower-inc".to_string(), "bool".to_string()),
+                ("upper-inc".to_string(), "bool".to_string()),
+            ],
+            type_id: [0u8; 32],
+            symbolic_name: "mobilitydb:temporal@0.1.0/spans-ops/int-span".to_string(),
+            is_copy: true,
+            direct: true,
+            kebab_collides_in_pkg: false,
+        };
+        let records = vec![int_span];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let r = WitRet {
+            inner: WitType::Option(Box::new(WitType::List(Box::new(
+                WitType::Unsupported("int-span".to_string()),
+            )))),
+            fallible: false,
+            error_ty: None,
+        };
+        let shape = classify_return(&r, &records, &enums, "spanset-constructor-ops").unwrap();
+        match shape {
+            RetShape::JsonText { kind } => match kind {
+                JsonRetKind::OptionListPrimRecord(name) => {
+                    assert_eq!(name, "int-span");
+                }
+                other => panic!("expected OptionListPrimRecord, got {other:?}"),
+            },
+            other => panic!("expected JsonText/OptionListPrimRecord, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_list_list_record_routes_to_record_set_to_record_set() {
+        // #799: `int-spanset-aggregate-union` shape:
+        //   `func(sets: list<list<int-span>>) -> list<int-span>`.
+        // The input is `list<list<record>>` (each row streams a
+        // spanset) and the output is `list<record>` (unified
+        // spanset). Classifier should build the new
+        // `AccKind::RecordSetToRecordSet` variant.
+        use crate::wit_parse::{WitFunction, WitParam, WitRet};
+        let int_span = RecordType {
+            package: "mobilitydb:temporal".to_string(),
+            package_version: "0.1.0".to_string(),
+            interface: "spans-ops".to_string(),
+            kebab_name: "int-span".to_string(),
+            fields: vec![
+                ("lower".to_string(), "s32".to_string()),
+                ("upper".to_string(), "s32".to_string()),
+                ("lower-inc".to_string(), "bool".to_string()),
+                ("upper-inc".to_string(), "bool".to_string()),
+            ],
+            type_id: [0u8; 32],
+            symbolic_name: "mobilitydb:temporal@0.1.0/spans-ops/int-span".to_string(),
+            is_copy: true,
+            direct: true,
+            kebab_collides_in_pkg: false,
+        };
+        let records = vec![int_span];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let f = WitFunction {
+            interface: "span-union-ops".to_string(),
+            package: "mobilitydb:temporal".to_string(),
+            kebab_name: "int-spanset-aggregate-union".to_string(),
+            params: vec![WitParam {
+                name: "sets".to_string(),
+                ty: WitType::List(Box::new(WitType::List(Box::new(
+                    WitType::Unsupported("int-span".to_string()),
+                )))),
+            }],
+            ret: WitRet {
+                inner: WitType::List(Box::new(WitType::Unsupported("int-span".to_string()))),
+                fallible: false,
+                error_ty: None,
+            },
+            package_version: "0.1.0".to_string(),
+            resource: None,
+            is_constructor: false,
+        };
+        let shape = classify_aggregate_shape(&f, &records, &enums).unwrap();
+        match shape.accumulator_kind {
+            AccKind::RecordSetToRecordSet { input, output } => {
+                assert_eq!(input.kebab_name, "int-span");
+                assert_eq!(output.kebab_name, "int-span");
+            }
+            other => panic!("expected RecordSetToRecordSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_flat_list_record_still_routes_to_record() {
+        // Regression: adding the nested-list arm must not steal the
+        // pre-existing flat `list<record>` shape used by mobilitydb's
+        // `<int|float|date|tstz>-span-aggregate-union` fns (which
+        // share the same span-union-ops interface).
+        use crate::wit_parse::{WitFunction, WitParam, WitRet};
+        let int_span = RecordType {
+            package: "mobilitydb:temporal".to_string(),
+            package_version: "0.1.0".to_string(),
+            interface: "spans-ops".to_string(),
+            kebab_name: "int-span".to_string(),
+            fields: vec![
+                ("lower".to_string(), "s32".to_string()),
+                ("upper".to_string(), "s32".to_string()),
+                ("lower-inc".to_string(), "bool".to_string()),
+                ("upper-inc".to_string(), "bool".to_string()),
+            ],
+            type_id: [0u8; 32],
+            symbolic_name: "mobilitydb:temporal@0.1.0/spans-ops/int-span".to_string(),
+            is_copy: true,
+            direct: true,
+            kebab_collides_in_pkg: false,
+        };
+        let records = vec![int_span];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let f = WitFunction {
+            interface: "span-union-ops".to_string(),
+            package: "mobilitydb:temporal".to_string(),
+            kebab_name: "int-span-aggregate-union".to_string(),
+            params: vec![WitParam {
+                name: "spans".to_string(),
+                ty: WitType::List(Box::new(WitType::Unsupported("int-span".to_string()))),
+            }],
+            ret: WitRet {
+                inner: WitType::List(Box::new(WitType::Unsupported("int-span".to_string()))),
+                fallible: false,
+                error_ty: None,
+            },
+            package_version: "0.1.0".to_string(),
+            resource: None,
+            is_constructor: false,
+        };
+        let shape = classify_aggregate_shape(&f, &records, &enums).unwrap();
+        assert!(
+            matches!(shape.accumulator_kind, AccKind::Record { .. }),
+            "expected flat list<record> to stay on AccKind::Record, got {:?}",
+            shape.accumulator_kind,
+        );
+    }
+
+    #[test]
+    fn return_option_list_record_missing_registry_errors_cleanly() {
+        // If the record isn't in the registry, the classifier still
+        // reports a named diagnostic naming the missing record so
+        // the codegen's unwired-scalar reason surfaces the gap.
+        let records: Vec<RecordType> = vec![];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let r = WitRet {
+            inner: WitType::Option(Box::new(WitType::List(Box::new(
+                WitType::Unsupported("mystery-sequence".to_string()),
+            )))),
+            fallible: false,
+            error_ty: None,
+        };
+        let err = classify_return(&r, &records, &enums, "temporal-append-ops").unwrap_err();
+        assert!(
+            err.contains("not in dispatcher alphabet"),
+            "expected alphabet-diagnostic, got {err}",
         );
     }
 }

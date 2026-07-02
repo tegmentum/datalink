@@ -710,6 +710,7 @@ fn render_ret_to_scalarvalue(
             // `OptionTuplePrimOrOptPrim` (tuple with `Option<X>` fields
             // — serde renders `None` as JSON `null`).
             JsonRetKind::OptionListPrimRecord(_)
+            | JsonRetKind::OptionListRecord(_)
             | JsonRetKind::OptionListPrim(_)
             | JsonRetKind::OptionListTuplePrim(_)
             | JsonRetKind::OptionTuplePrimOrOptPrim(_) => format!(
@@ -1017,6 +1018,16 @@ pub fn emit_aggregate_finalize_body(
             shape, sql_name, arm_indent,
         );
     }
+    // #799: RecordSetToRecordSet — nested-list aggregate
+    // (`<int|float|date|tstz>-spanset-aggregate-union`). Full
+    // datafission emit-path wiring lives in a follow-up; landing
+    // the classifier + force-link now surfaces a clear runtime
+    // diagnostic instead of the codegen-fail path.
+    if let AccKind::RecordSetToRecordSet { .. } = &shape.accumulator_kind {
+        return format!(
+            "{i}Err(ftypes::FunctionError::ExecutionError(format!(\"{sql_name}: AccKind::RecordSetToRecordSet aggregate not yet wired\")))\n",
+        );
+    }
 
     // Decode accumulated blobs into a typed Vec<Resource>; build
     // refs slice for the upstream call.
@@ -1047,6 +1058,9 @@ pub fn emit_aggregate_finalize_body(
         }
         AccKind::RecordToTuple { .. } => {
             unreachable!("handled by #640 RecordToTuple stub above")
+        }
+        AccKind::RecordSetToRecordSet { .. } => {
+            unreachable!("handled by #799 RecordSetToRecordSet stub above")
         }
     }
 

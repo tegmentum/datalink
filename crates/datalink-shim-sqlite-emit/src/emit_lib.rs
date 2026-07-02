@@ -684,6 +684,7 @@ use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
             dispatch::AccKind::Record { .. }
                 | dispatch::AccKind::RecordToScalar { .. }
                 | dispatch::AccKind::RecordToTuple { .. }
+                | dispatch::AccKind::RecordSetToRecordSet { .. }
         )
     });
     // #616 Phase 1: only emit window-function state machinery
@@ -2798,7 +2799,8 @@ fn collect_referenced_records(
         // output is a primitive scalar wrap (#614) or a JSON-encoded
         // primitive tuple (#640), not a record codec call.
         match &entry.shape.accumulator_kind {
-            dispatch::AccKind::Record { input, output } => {
+            dispatch::AccKind::Record { input, output }
+            | dispatch::AccKind::RecordSetToRecordSet { input, output } => {
                 out.insert((input.wit_interface.clone(), input.kebab_name.clone()));
                 out.insert((output.wit_interface.clone(), output.kebab_name.clone()));
             }
