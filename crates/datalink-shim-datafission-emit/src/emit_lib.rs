@@ -608,7 +608,6 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         .filter(|r| {
             referenced_records
                 .contains(&(r.interface.clone(), r.kebab_name.clone()))
-                && !record_skip.contains(&r.kebab_name)
         })
         .cloned()
         .collect();
@@ -1075,7 +1074,7 @@ use bindings::datafission::function_plugin::types as types;
     s.push_str(&render_tuple_list_helpers(&tuple_sigs));
     s.push_str(&render_tuple_list_mixed_helpers(&tuple_mixed_sigs));
     if !helper_records.is_empty() {
-        s.push_str(&emit_wit_value_helpers(&helper_records));
+        s.push_str(&emit_wit_value_helpers(&helper_records, &record_skip));
     }
 
     s.push_str("struct Component;\n\n");
@@ -3253,7 +3252,10 @@ fn render_tuple_list_mixed_helpers(
 ///     `additional_derives: [serde::Deserialize]` makes UPSTREAM
 ///     deserialisable directly, so no LOCAL→UPSTREAM ciborium
 ///     round-trip is needed.
-fn emit_wit_value_helpers(records: &[RecordType]) -> String {
+fn emit_wit_value_helpers(
+    records: &[RecordType],
+    skip_serde: &std::collections::BTreeSet<String>,
+) -> String {
     let mut s = String::new();
     s.push_str("\n// ─── WIT-value record marshaling helpers ───\n");
     s.push_str("// Per-record `arg_witvalue_<snake>` / `ret_to_witvalue_<snake>`\n");
@@ -3295,6 +3297,52 @@ fn emit_wit_value_helpers(records: &[RecordType]) -> String {
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join("");
+        // #794: records with resource-typed fields (canonical trigger:
+        // `pixel-vec-entry.geom: geometry`) can't derive Serialize +
+        // Deserialize. Emit stubs so the dispatch arms still compile
+        // — the calls report a codegen-time deferral at call time
+        // rather than yielding wrong bytes silently.
+        if skip_serde.contains(&r.kebab_name) {
+            let _ = &type_id_lits;
+            let _ = &expected_hex;
+            s.push_str(&format!(
+                "#[allow(dead_code)]\n\
+                 fn arg_witvalue_{snake}(\n\
+                 \x20   _args: &[ftypes::ScalarValue],\n\
+                 \x20   _idx: usize,\n\
+                 \x20   name: &str,\n\
+                 ) -> Result<{upstream_path}, types::FunctionError> {{\n\
+                 \x20   Err(types::FunctionError::ExecutionError(format!(\n\
+                 \x20       \"{{name}}: wit-value record {snake} has a resource-typed field (no serde codec)\")))\n\
+                 }}\n\n\
+                 #[allow(dead_code)]\n\
+                 fn parse_json_list_record_{snake}(\n\
+                 \x20   _args: &[ftypes::ScalarValue],\n\
+                 \x20   _idx: usize,\n\
+                 \x20   name: &str,\n\
+                 ) -> Result<Vec<{upstream_path}>, types::FunctionError> {{\n\
+                 \x20   Err(types::FunctionError::ExecutionError(format!(\n\
+                 \x20       \"{{name}}: wit-value record {snake} has a resource-typed field (no serde codec)\")))\n\
+                 }}\n\n\
+                 #[allow(dead_code)]\n\
+                 fn parse_json_list_list_record_{snake}(\n\
+                 \x20   _args: &[ftypes::ScalarValue],\n\
+                 \x20   _idx: usize,\n\
+                 \x20   name: &str,\n\
+                 ) -> Result<Vec<Vec<{upstream_path}>>, types::FunctionError> {{\n\
+                 \x20   Err(types::FunctionError::ExecutionError(format!(\n\
+                 \x20       \"{{name}}: wit-value record {snake} has a resource-typed field (no serde codec)\")))\n\
+                 }}\n\n\
+                 #[allow(dead_code)]\n\
+                 fn ret_to_witvalue_{snake}(\n\
+                 \x20   _upstream: {upstream_path},\n\
+                 ) -> Result<ftypes::ScalarValue, types::FunctionError> {{\n\
+                 \x20   Err(types::FunctionError::ExecutionError(\n\
+                 \x20       \"wit-value record {snake} has a resource-typed field (no serde codec)\".to_string()))\n\
+                 }}\n\n",
+            ));
+            continue;
+        }
 
         if r.direct {
             s.push_str(&format!(
