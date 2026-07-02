@@ -507,18 +507,55 @@ fn scan_package_decls(text: &str) -> PackageDecls {
         if let Some((iface_name, fields)) = pending_record.as_mut() {
             // Adjust record-depth tracking first.
             record_depth += opens - closes;
-            // Fields look like `field-name: type-expr,` (or without trailing comma on last).
-            // Parse only when we're at depth 1 (the open brace was counted).
-            // Skip the line that closes the record.
+            // #789: a line that closes the record may still carry
+            // trailing fields ahead of `}`, e.g.
+            //   `record foo { a: u32,`  (fields on the opener)
+            //   `             b: u32,`
+            //   `             c: u32 }` (field on the closer)
+            // The pre-#789 flush path short-circuited on
+            // `record_depth <= 0` and dropped `c: u32`. Strip the
+            // closing brace (and anything past it — WIT records only
+            // permit whitespace after `}` on the same line, but be
+            // defensive) and let the shared field parser below fold
+            // whatever remains into `fields` before we flush.
+            let field_body = if record_depth <= 0 {
+                if let Some(close_idx) = line.rfind('}') {
+                    line[..close_idx].trim()
+                } else {
+                    line
+                }
+            } else {
+                line
+            };
+            let field_body = field_body.trim_end_matches(',').trim();
+            // Otherwise (or ahead of the closing `}`), this line
+            // might be one or more field declarations. Some upstream
+            // WIT files squash multiple primitive fields onto a
+            // single line, e.g.
+            //   `xmin: f64, ymin: f64, xmax: f64, ymax: f64,`
+            // Split on top-level commas (depth-0 wrt angle brackets
+            // so that generic types like `list<u8>` and `tuple<f64,
+            // f64>` aren't shredded), then parse each segment as a
+            // `field: type` pair. Task #523: this matters because
+            // the structural-identity check needs the parsed
+            // type-text to be a recognised primitive/ident in order
+            // to flag the record as `direct`.
+            for seg in split_top_level_comma(field_body) {
+                let seg = seg.trim();
+                if seg.is_empty() {
+                    continue;
+                }
+                if let Some(colon) = seg.find(':') {
+                    let fname = seg[..colon].trim();
+                    let ftype = seg[colon + 1..].trim();
+                    if !fname.is_empty() && is_kebab_ident(fname) {
+                        fields.push((fname.to_string(), ftype.to_string()));
+                    }
+                }
+            }
+            // Now flush the record if this line closes it.
             if record_depth <= 0 {
-                // Flush the record.
-                let rec = WitRecord {
-                    interface: iface_name.clone(),
-                    kebab_name: fields[0].0.clone(),
-                    fields: fields[1..].to_vec(),
-                };
-                let _ = rec; // placeholder; constructed below
-                // Reconstruct correctly: kebab_name was stashed in fields[0].0
+                // Reconstruct correctly: kebab_name was stashed in fields[0].0.
                 let kebab = fields.remove(0).0;
                 let rec = WitRecord {
                     interface: iface_name.clone(),
@@ -534,32 +571,6 @@ fn scan_package_decls(text: &str) -> PackageDecls {
                     if depth_in_iface <= 0 {
                         cur_interface = None;
                         depth_in_iface = 0;
-                    }
-                }
-                continue;
-            }
-            // Otherwise, this line might be one or more field
-            // declarations. Some upstream WIT files squash multiple
-            // primitive fields onto a single line, e.g.
-            //   `xmin: f64, ymin: f64, xmax: f64, ymax: f64,`
-            // Split on top-level commas (depth-0 wrt angle brackets
-            // so that generic types like `list<u8>` and `tuple<f64,
-            // f64>` aren't shredded), then parse each segment as a
-            // `field: type` pair. Task #523: this matters because
-            // the structural-identity check needs the parsed
-            // type-text to be a recognised primitive/ident in order
-            // to flag the record as `direct`.
-            let body = line.trim_end_matches(',').trim();
-            for seg in split_top_level_comma(body) {
-                let seg = seg.trim();
-                if seg.is_empty() {
-                    continue;
-                }
-                if let Some(colon) = seg.find(':') {
-                    let fname = seg[..colon].trim();
-                    let ftype = seg[colon + 1..].trim();
-                    if !fname.is_empty() && is_kebab_ident(fname) {
-                        fields.push((fname.to_string(), ftype.to_string()));
                     }
                 }
             }
@@ -660,34 +671,48 @@ fn scan_package_decls(text: &str) -> PackageDecls {
                 // Adjust depth: the `{` of the record counts inside the interface,
                 // but we track it via record_depth separately.
                 record_depth = opens - closes;
-                if record_depth <= 0 {
-                    // single-line record. Inline fields may be on
-                    // the same line: `record N { a: f64, b: f64 }`.
-                    // Parse them out of the brace body.
-                    let mut inline_fields: Vec<(String, String)> = Vec::new();
-                    if let Some(open_idx) = line.find('{') {
-                        if let Some(close_idx) = line.rfind('}') {
-                            if open_idx < close_idx {
-                                let body = &line[open_idx + 1..close_idx];
-                                for piece in split_field_pieces(body) {
-                                    let s = piece.trim();
-                                    if s.is_empty() {
-                                        continue;
-                                    }
-                                    if let Some(colon) = s.find(':') {
-                                        let fname = s[..colon].trim();
-                                        let ftype = s[colon + 1..].trim();
-                                        if !fname.is_empty() && is_kebab_ident(fname) {
-                                            inline_fields.push((
-                                                fname.to_string(),
-                                                ftype.to_string(),
-                                            ));
-                                        }
-                                    }
+                // #789: parse any inline fields that live on the
+                // same line as the `record NAME {` opener. Handles
+                // both the single-line canonical shape
+                //   `record N { a: f64, b: f64 }`
+                // AND the multi-line-with-fields-on-opener shape
+                //   `record N { a: f64,`
+                //   `           b: f64, }`
+                // where the pre-#789 parser only ran the inline
+                // parse when the record closed on the same line and
+                // dropped `a: f64` on the multi-line variant.
+                let mut inline_fields: Vec<(String, String)> = Vec::new();
+                if let Some(open_idx) = line.find('{') {
+                    // Trailing text on the opener runs from just
+                    // past `{` up to either `}` (single-line record)
+                    // or end-of-line (multi-line, fields follow).
+                    let end_idx = line[open_idx + 1..]
+                        .rfind('}')
+                        .map(|i| open_idx + 1 + i)
+                        .unwrap_or(line.len());
+                    if end_idx >= open_idx + 1 {
+                        let body = &line[open_idx + 1..end_idx];
+                        for piece in split_field_pieces(body) {
+                            let s = piece.trim().trim_end_matches(',').trim();
+                            if s.is_empty() {
+                                continue;
+                            }
+                            if let Some(colon) = s.find(':') {
+                                let fname = s[..colon].trim();
+                                let ftype = s[colon + 1..].trim();
+                                if !fname.is_empty() && is_kebab_ident(fname) {
+                                    inline_fields.push((
+                                        fname.to_string(),
+                                        ftype.to_string(),
+                                    ));
                                 }
                             }
                         }
                     }
+                }
+                if record_depth <= 0 {
+                    // Single-line record — flush immediately with any
+                    // inline fields we parsed.
                     records.push(WitRecord {
                         interface: iface_name.clone(),
                         kebab_name: rname,
@@ -695,6 +720,14 @@ fn scan_package_decls(text: &str) -> PackageDecls {
                     });
                     pending_record = None;
                     record_depth = 0;
+                } else if !inline_fields.is_empty() {
+                    // Multi-line record with fields on the opener —
+                    // stash them into the pending accumulator so the
+                    // later flush sees them alongside the fields
+                    // parsed on subsequent lines.
+                    if let Some((_, fields)) = pending_record.as_mut() {
+                        fields.extend(inline_fields);
+                    }
                 }
                 // The interface itself sees the same `{`/`}`; account for that.
                 depth_in_iface += opens - closes;
@@ -2766,6 +2799,85 @@ interface postgis-measurements {
         assert!(
             reached.is_empty(),
             "non-primary functions should not seed reachability; got {reached:?}"
+        );
+    }
+
+    /// #789: fields on the same line as the opening or closing brace
+    /// of a multi-line record must not be dropped. The pre-#789
+    /// parser short-circuited on both boundary lines; mobilitydb's
+    /// `tgeompoint-segment` record (fields on the closing-brace
+    /// line) hit the bug and was worked around at mobilitydb-wasm
+    /// a2b03f6 by reformatting to single-line.
+    ///
+    /// All three canonical WIT record shapes must produce identical
+    /// parsed field lists.
+    #[test]
+    fn scan_package_decls_captures_fields_on_brace_lines_789() {
+        let single_line = "package p:q@0.1.0;\n\
+             interface i {\n  \
+                 record foo { a: u32, b: u32, c: u32 }\n\
+             }\n";
+        let canonical_multi_line = "package p:q@0.1.0;\n\
+             interface i {\n  \
+                 record foo {\n    \
+                     a: u32,\n    \
+                     b: u32,\n    \
+                     c: u32,\n  \
+                 }\n\
+             }\n";
+        let fields_on_brace_lines = "package p:q@0.1.0;\n\
+             interface i {\n  \
+                 record foo { a: u32,\n               \
+                              b: u32,\n               \
+                              c: u32 }\n\
+             }\n";
+        let get_fields = |src: &str| -> Vec<(String, String)> {
+            let decls = scan_package_decls(src);
+            assert_eq!(decls.records.len(), 1, "expected 1 record; got {:?}", decls.records);
+            let rec = &decls.records[0];
+            assert_eq!(rec.interface, "i");
+            assert_eq!(rec.kebab_name, "foo");
+            rec.fields.clone()
+        };
+        let a = get_fields(single_line);
+        let b = get_fields(canonical_multi_line);
+        let c = get_fields(fields_on_brace_lines);
+        let expected: Vec<(String, String)> = vec![
+            ("a".to_string(), "u32".to_string()),
+            ("b".to_string(), "u32".to_string()),
+            ("c".to_string(), "u32".to_string()),
+        ];
+        assert_eq!(a, expected, "single-line");
+        assert_eq!(b, expected, "canonical multi-line");
+        assert_eq!(c, expected, "fields on brace lines (#789 target)");
+    }
+
+    /// #789: record whose fields include references to other records
+    /// (nested type refs) parses the same way whether or not the
+    /// fields live on the brace lines.
+    #[test]
+    fn scan_package_decls_record_with_type_refs_on_brace_lines_789() {
+        let src = "package p:q@0.1.0;\n\
+             interface i {\n  \
+                 record bar { x: f64, y: f64 }\n  \
+                 record foo { first: bar,\n               \
+                              second: list<bar>,\n               \
+                              third: option<bar> }\n\
+             }\n";
+        let decls = scan_package_decls(src);
+        assert_eq!(decls.records.len(), 2, "expected 2 records; got {:?}", decls.records);
+        let foo = decls
+            .records
+            .iter()
+            .find(|r| r.kebab_name == "foo")
+            .expect("foo");
+        assert_eq!(
+            foo.fields,
+            vec![
+                ("first".to_string(), "bar".to_string()),
+                ("second".to_string(), "list<bar>".to_string()),
+                ("third".to_string(), "option<bar>".to_string()),
+            ]
         );
     }
 }
