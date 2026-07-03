@@ -857,6 +857,17 @@ pub fn emit_aggregate_arm_body(
             shape, sql_name, arm_indent,
         );
     }
+    // #830: RecordToListPrim — same record-decode input side; output
+    // side serialises the upstream Rust `Vec<T>` for primitive T to
+    // JSON-array text via `serde_json::to_string` and wraps in
+    // Duckvalue::Text. Today's surface: mobilitydb
+    // `tjsonb-sequences-agg-collect-keys` (list<tjsonb-sequence> →
+    // list<string>).
+    if matches!(&shape.accumulator_kind, AccKind::RecordToListPrim { .. }) {
+        return emit_aggregate_arm_body_record_to_list_prim(
+            shape, sql_name, arm_indent,
+        );
+    }
     // #799: RecordSetToRecordSet — nested-list aggregate
     // (`<int|float|date|tstz>-spanset-aggregate-union`). Full
     // emit-path wiring lives in a follow-up; landing the
@@ -887,6 +898,7 @@ pub fn emit_aggregate_arm_body(
         AccKind::Record { .. } => unreachable!("handled above"),
         AccKind::RecordToScalar { .. } => unreachable!("handled above"),
         AccKind::RecordToTuple { .. } => unreachable!("handled above"),
+        AccKind::RecordToListPrim { .. } => unreachable!("handled above"),
         AccKind::RecordSetToRecordSet { .. } => unreachable!("handled above"),
     };
     let decode_call = decode_call.replace("AGG_NAME", sql_name);
@@ -960,6 +972,9 @@ pub fn emit_aggregate_arm_body(
         }
         AccKind::RecordToTuple { .. } => {
             unreachable!("handled by emit_aggregate_arm_body_record_to_tuple above")
+        }
+        AccKind::RecordToListPrim { .. } => {
+            unreachable!("handled by emit_aggregate_arm_body_record_to_list_prim above")
         }
         AccKind::RecordSetToRecordSet { .. } => {
             unreachable!("handled above (short-circuit stub)")
@@ -1606,6 +1621,157 @@ fn emit_aggregate_arm_body_record_to_tuple(
     s.push_str(&format!(
         "{i}let __r = {module}::{func}({call_args});\n\
          {i}{body}",
+    ));
+    s
+}
+
+/// #830: DuckDB-target aggregate body for `AccKind::RecordToListPrim`
+/// — mobilitydb `tjsonb-sequences-agg-collect-keys` and any future
+/// `list<record> -> list<primitive>` aggregate. Walks `rows` and
+/// decodes column 0 of each non-null row via the per-input-record
+/// `arg_witvalue_<in_snake>` helper (identical to the RecordToScalar
+/// input path), then serialises the upstream Rust `Vec<T>` for
+/// primitive T to JSON-array text via `serde_json::to_string` and
+/// wraps in `Duckvalue::Text`.
+fn emit_aggregate_arm_body_record_to_list_prim(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::RecordToListPrim { input, output: _ } = &shape.accumulator_kind else {
+        unreachable!("invariant: caller checks AccKind::RecordToListPrim");
+    };
+    let in_snake = input.helper_snake.clone();
+
+    let mut s = String::new();
+
+    // Extras latch (constant across rows by SQL semantics, so the
+    // first non-null row's tail is the canonical extras vector).
+    let extras_pre = if shape.extra_args.is_empty() {
+        String::new()
+    } else {
+        format!("{i}let mut extras: Option<Vec<types::Duckvalue>> = None;\n")
+    };
+    let extras_latch = if shape.extra_args.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{i}    if extras.is_none() {{\n\
+             {i}        extras = Some(row[1..].to_vec());\n\
+             {i}    }}\n",
+        )
+    };
+
+    s.push_str(&extras_pre);
+    s.push_str(&format!(
+        "{i}let mut upstream_vec = Vec::with_capacity(rows.len());\n\
+         {i}for row in &rows {{\n\
+         {i}    if row.is_empty() {{ continue; }}\n\
+         {i}    if matches!(row[0], types::Duckvalue::Null) {{ continue; }}\n\
+         {i}    upstream_vec.push(arg_witvalue_{in_snake}(row, 0, \"{sql_name}\")?);\n\
+         {extras_latch}{i}}}\n",
+    ));
+
+    // Re-decode extras into Rust-typed bindings. Same per-shape
+    // arms as the RecordToTuple aggregate finalize path.
+    let mut call_extras: Vec<String> = Vec::new();
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}let extras = extras.unwrap_or_default();\n",
+        ));
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            match p {
+                ParamShape::Text => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_text(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::F64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_f64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")? as i32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")? as u32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_i64(&extras, {j}, \"{sql_name}\")? as u64;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Bool => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_bool(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Blob => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = dv_blob(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::OptionNone => {
+                    call_extras.push("None".to_string());
+                }
+                ParamShape::Geom
+                | ParamShape::Geog
+                | ParamShape::Raster
+                | ParamShape::Topology
+                | ParamShape::ListGeom
+                | ParamShape::WitValueRecord { .. }
+                | ParamShape::Enum { .. }
+                | ParamShape::ListPrim(_)
+                | ParamShape::ListRecord { .. }
+                | ParamShape::ListTuple { .. }
+                | ParamShape::ListTupleMixed { .. }
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_)
+                | ParamShape::ListListRecord { .. } => {
+                    return format!(
+                        "{i}Err(types::Duckerror::Unsupported(format!(\
+                         \"{sql_name}: aggregate extra arg #{j} shape not wired\")))",
+                    );
+                }
+            }
+        }
+    }
+
+    let call_args = if call_extras.is_empty() {
+        "&upstream_vec".to_string()
+    } else {
+        format!("&upstream_vec, {}", call_extras.join(", "))
+    };
+
+    // JSON-encode the upstream `Vec<T>` for primitive T. serde-derives
+    // produce a homogeneous JSON array (same render as the non-optional
+    // tuple path).
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}({call_args});\n\
+         {i}let __json = serde_json::to_string(&__r)\n\
+         {i}    .map_err(|e| types::Duckerror::Internal(format!(\"{sql_name}: encode JSON: {{}}\", e)))?;\n\
+         {i}Ok(types::Duckvalue::Text(__json))",
     ));
     s
 }

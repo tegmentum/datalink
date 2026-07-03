@@ -684,6 +684,7 @@ use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
             dispatch::AccKind::Record { .. }
                 | dispatch::AccKind::RecordToScalar { .. }
                 | dispatch::AccKind::RecordToTuple { .. }
+                | dispatch::AccKind::RecordToListPrim { .. }
                 | dispatch::AccKind::RecordSetToRecordSet { .. }
         )
     });
@@ -2805,7 +2806,8 @@ fn collect_referenced_records(
                 out.insert((output.wit_interface.clone(), output.kebab_name.clone()));
             }
             dispatch::AccKind::RecordToScalar { input, .. }
-            | dispatch::AccKind::RecordToTuple { input, .. } => {
+            | dispatch::AccKind::RecordToTuple { input, .. }
+            | dispatch::AccKind::RecordToListPrim { input, .. } => {
                 out.insert((input.wit_interface.clone(), input.kebab_name.clone()));
             }
             dispatch::AccKind::Geom | dispatch::AccKind::Raster => {}

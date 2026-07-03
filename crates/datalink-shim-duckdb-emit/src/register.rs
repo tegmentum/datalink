@@ -390,6 +390,11 @@ pub fn render_aggregates(
                 AccKind::Record { .. }
                 | AccKind::RecordToScalar { .. }
                 | AccKind::RecordToTuple { .. }
+                // #830: RecordToListPrim — record-in / primitive-list-out
+                // aggregate. Full DuckDB runtime wiring lives in a follow-
+                // up; skip registration here for the same reason as the
+                // Record family above.
+                | AccKind::RecordToListPrim { .. }
                 // #799: RecordSetToRecordSet — nested-list aggregate
                 // (`<int|float|date|tstz>-spanset-aggregate-union`).
                 // Full DuckDB runtime wiring lives in a follow-up;

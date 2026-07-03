@@ -959,16 +959,18 @@ pub fn emit_aggregate_step_body(
     arm_indent: &str,
 ) -> String {
     let i = arm_indent;
-    // #607 Phase 1 + #614 + #640: AccKind::Record / RecordToScalar
-    // / RecordToTuple use a different per-row shape (WitValuePayload
-    // extracted from SqlValue::WitValue rather than a raw blob). The
-    // step body is structurally identical for all three — only
-    // finalize diverges — so reuse the existing record step emitter.
+    // #607 Phase 1 + #614 + #640 + #830: AccKind::Record /
+    // RecordToScalar / RecordToTuple / RecordToListPrim use a
+    // different per-row shape (WitValuePayload extracted from
+    // SqlValue::WitValue rather than a raw blob). The step body is
+    // structurally identical for all four — only finalize diverges —
+    // so reuse the existing record step emitter.
     if matches!(
         &shape.accumulator_kind,
         AccKind::Record { .. }
             | AccKind::RecordToScalar { .. }
             | AccKind::RecordToTuple { .. }
+            | AccKind::RecordToListPrim { .. }
     ) {
         return emit_aggregate_step_body_record(shape, sql_name, arm_indent);
     }
@@ -992,6 +994,7 @@ pub fn emit_aggregate_step_body(
         AccKind::Record { .. }
         | AccKind::RecordToScalar { .. }
         | AccKind::RecordToTuple { .. }
+        | AccKind::RecordToListPrim { .. }
         | AccKind::RecordSetToRecordSet { .. } => {
             unreachable!("handled above")
         }
@@ -1127,6 +1130,17 @@ pub fn emit_aggregate_finalize_body(
             shape, sql_name, arm_indent,
         );
     }
+    // #830: RecordToListPrim — same record-decode input side; output
+    // side serialises the upstream Rust `Vec<T>` (for primitive T)
+    // to JSON-array text via `serde_json::to_string` and wraps it in
+    // SqlValue::Text. Today's surface: mobilitydb
+    // `tjsonb-sequences-agg-collect-keys` (list<tjsonb-sequence> →
+    // list<string>).
+    if let AccKind::RecordToListPrim { .. } = &shape.accumulator_kind {
+        return emit_aggregate_finalize_body_record_to_list_prim(
+            shape, sql_name, arm_indent,
+        );
+    }
     // #802 Group B: RecordSetToRecordSet — nested-list aggregate
     // (`<int|float|date|tstz>-spanset-aggregate-union`). Route to a
     // dedicated emitter: drain each row's JSON-text spanset via the
@@ -1165,6 +1179,7 @@ pub fn emit_aggregate_finalize_body(
         AccKind::Record { .. }
         | AccKind::RecordToScalar { .. }
         | AccKind::RecordToTuple { .. }
+        | AccKind::RecordToListPrim { .. }
         | AccKind::RecordSetToRecordSet { .. } => {
             unreachable!("handled above")
         }
@@ -1831,6 +1846,144 @@ fn emit_aggregate_finalize_body_record_to_tuple(
     s
 }
 
+/// #830: aggregate finalize body for `AccKind::RecordToListPrim` —
+/// mobilitydb `tjsonb-sequences-agg-collect-keys` and any future
+/// `list<record> -> list<primitive>` aggregate. Structurally mirrors
+/// `emit_aggregate_finalize_body_record_to_tuple` (input side drains
+/// the witvalue accumulator + decodes each payload via the per-input-
+/// record helper; output side serialises via `serde_json::to_string`
+/// and wraps in SqlValue::Text). The only difference is the upstream
+/// return type — `Vec<T>` for primitive T rather than a fixed-width
+/// tuple. serde-derives auto-implement `Serialize` for `Vec<T>` so
+/// the emit body is byte-identical to the non-optional tuple path.
+fn emit_aggregate_finalize_body_record_to_list_prim(
+    shape: &AggregateShape,
+    sql_name: &str,
+    arm_indent: &str,
+) -> String {
+    let i = arm_indent;
+    let module = &shape.wit_module;
+    let func = &shape.wit_func;
+    let AccKind::RecordToListPrim { input, output: _ } = &shape.accumulator_kind else {
+        unreachable!("invariant: caller checks AccKind::RecordToListPrim");
+    };
+    let in_snake = &input.helper_snake;
+
+    let mut s = String::new();
+    // Drain the per-context witvalue accumulator + decode each
+    // payload to UPSTREAM. Identical to the RecordToScalar /
+    // RecordToTuple paths.
+    s.push_str(&format!(
+        "{i}let payloads = take_witvalue_state(context_id);\n\
+         {i}let mut upstream_vec = Vec::with_capacity(payloads.len());\n\
+         {i}for pw in payloads {{\n\
+         {i}    let __args = [SqlValue::WitValue(pw)];\n\
+         {i}    upstream_vec.push(arg_witvalue_{in_snake}(&__args, 0, \"{sql_name}\")?);\n\
+         {i}}}\n",
+    ));
+
+    // Re-decode the extras into Rust-typed bindings; mirrors the
+    // RecordToTuple finalize extras-decode block. Only the primitive
+    // ParamShape arms are reachable here (today's surface —
+    // `tjsonb-sequences-agg-collect-keys` — takes no extras).
+    let mut call_extras: Vec<String> = Vec::new();
+    if !shape.extra_args.is_empty() {
+        s.push_str(&format!(
+            "{i}let extras = take_extras_state(context_id);\n",
+        ));
+        for (j, p) in shape.extra_args.iter().enumerate() {
+            match p {
+                ParamShape::Text => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_text(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::F64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_f64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? as i32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::S64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U32 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? as u32;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::U64 => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? as u64;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Bool => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_i64(&extras, {j}, \"{sql_name}\")? != 0;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::Blob => {
+                    s.push_str(&format!(
+                        "{i}let extra{j} = arg_blob(&extras, {j}, \"{sql_name}\")?;\n",
+                    ));
+                    call_extras.push(format!("extra{j}"));
+                }
+                ParamShape::OptionNone => {
+                    call_extras.push("None".to_string());
+                }
+                ParamShape::Geom
+                | ParamShape::Geog
+                | ParamShape::Raster
+                | ParamShape::Topology
+                | ParamShape::ListGeom
+                | ParamShape::WitValueRecord { .. }
+                | ParamShape::Enum { .. }
+                | ParamShape::ListPrim(_)
+                | ParamShape::ListRecord { .. }
+                | ParamShape::ListTuple { .. }
+                | ParamShape::ListTupleMixed { .. }
+                | ParamShape::ListListU8
+                | ParamShape::ListListPrim(_)
+                | ParamShape::ListListRecord { .. } => {
+                    return format!(
+                        "{i}Err(format!(\"{sql_name}: aggregate extra arg #{j} shape not wired\"))",
+                    );
+                }
+            }
+        }
+    }
+
+    let call_args = if call_extras.is_empty() {
+        "&upstream_vec".to_string()
+    } else {
+        format!("&upstream_vec, {}", call_extras.join(", "))
+    };
+
+    // JSON-encode the upstream `Vec<T>` for primitive T. serde-derives
+    // produce a homogeneous JSON array (parallel to
+    // `JsonRetKind::ListListPrim` on the scalar surface).
+    s.push_str(&format!(
+        "{i}let __r = {module}::{func}({call_args});\n\
+         {i}let __json = serde_json::to_string(&__r)\n\
+         {i}    .map_err(|e| format!(\"{sql_name}: encode JSON: {{}}\", e))?;\n\
+         {i}Ok(SqlValue::Text(__json))",
+    ));
+    s
+}
+
 /// #802 Group B: aggregate finalize body for
 /// `AccKind::RecordSetToRecordSet` — mobilitydb `span-union-ops`'s
 /// four `<int|float|date|tstz>-spanset-aggregate-union` fns.
@@ -1930,6 +2083,90 @@ fn kebab_to_pascal(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod record_to_list_prim_aggregate_tests {
+    //! #830: emit-body coverage for `AccKind::RecordToListPrim` — the
+    //! step + finalize paths that wire aggregates like mobilitydb's
+    //! `tjsonb-sequences-agg-collect-keys` (list<tjsonb-sequence> →
+    //! list<string>). The classifier arm is tested inside
+    //! `interface_db.rs`; these check the generated Rust source is
+    //! what dispatch.rs expects at runtime.
+    use super::*;
+    use datalink_shim_codegen_core::interface_db::ListPrimElem;
+
+    fn make_shape() -> AggregateShape {
+        AggregateShape {
+            wit_module: "temporal_aggregate_ops".to_string(),
+            wit_package: "mobilitydb:temporal".to_string(),
+            wit_func: "tjsonb_sequences_agg_collect_keys".to_string(),
+            extra_args: vec![],
+            // The finalize emitter for RecordToListPrim ignores
+            // `shape.ret` (it always JSON-encodes via
+            // `serde_json::to_string`), so any RetShape is fine here.
+            ret: RetShape::Text,
+            accumulator_kind: AccKind::RecordToListPrim {
+                input: RecordSpec {
+                    kebab_name: "tjsonb-sequence".to_string(),
+                    wit_interface: "types".to_string(),
+                    wit_package: "mobilitydb:temporal".to_string(),
+                    wit_package_version: "0.1.0".to_string(),
+                    symbolic_name: "mobilitydb:temporal@0.1.0/types/tjsonb-sequence"
+                        .to_string(),
+                    type_id_hex: "00".to_string(),
+                    helper_snake: "tjsonb_sequence".to_string(),
+                },
+                output: ListPrimElem::String,
+            },
+        }
+    }
+
+    #[test]
+    fn step_body_pushes_witvalue_payload() {
+        let shape = make_shape();
+        let body = emit_aggregate_step_body(
+            &shape,
+            "tjsonb_sequences_agg_collect_keys",
+            "                ",
+        );
+        // Mirrors AccKind::Record / RecordToScalar: extract the
+        // per-row SqlValue::WitValue payload and push it onto the
+        // witvalue accumulator state.
+        assert!(body.contains("SqlValue::WitValue(p)"), "body:\n{body}");
+        assert!(body.contains("push_witvalue_state(context_id"), "body:\n{body}");
+    }
+
+    #[test]
+    fn finalize_body_json_encodes_upstream_vec() {
+        let shape = make_shape();
+        let body = emit_aggregate_finalize_body(
+            &shape,
+            "tjsonb_sequences_agg_collect_keys",
+            "                ",
+        );
+        // Drain the witvalue accumulator and decode each payload via
+        // the per-input-record helper.
+        assert!(body.contains("take_witvalue_state(context_id)"), "body:\n{body}");
+        assert!(
+            body.contains("arg_witvalue_tjsonb_sequence"),
+            "body:\n{body}"
+        );
+        // Upstream aggregator call + JSON-encoded Text return.
+        assert!(
+            body.contains(
+                "temporal_aggregate_ops::tjsonb_sequences_agg_collect_keys(&upstream_vec)"
+            ),
+            "body:\n{body}"
+        );
+        assert!(body.contains("serde_json::to_string(&__r)"), "body:\n{body}");
+        assert!(body.contains("SqlValue::Text(__json)"), "body:\n{body}");
+        // Must NOT emit the pre-#830 "return shape not wired" diagnostic.
+        assert!(
+            !body.contains("return shape not wired"),
+            "body should route to the RecordToListPrim emitter:\n{body}"
+        );
+    }
 }
 
 #[cfg(test)]

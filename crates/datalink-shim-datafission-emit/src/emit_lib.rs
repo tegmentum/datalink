@@ -515,7 +515,8 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
                     .insert((output.wit_interface.clone(), output.kebab_name.clone()));
             }
             interface_db::AccKind::RecordToScalar { input, .. }
-            | interface_db::AccKind::RecordToTuple { input, .. } => {
+            | interface_db::AccKind::RecordToTuple { input, .. }
+            | interface_db::AccKind::RecordToListPrim { input, .. } => {
                 referenced_records
                     .insert((input.wit_interface.clone(), input.kebab_name.clone()));
             }

@@ -1969,6 +1969,29 @@ pub enum AccKind {
         input: RecordSpec,
         output: RecordSpec,
     },
+    /// #830: record-typed list input, primitive-list output.
+    ///
+    /// Structurally identical to `RecordToScalar` on the input side
+    /// (decode each per-row witvalue payload via the per-input-record
+    /// `arg_witvalue_<snake>` helper). The output side serialises the
+    /// upstream Rust `Vec<T>` (for primitive `T`) to a JSON-array text
+    /// via `serde_json::to_string` — same emit template as
+    /// `RecordToTuple` and `JsonRetKind::ListListPrim`. Each emit
+    /// target wraps the string in its native Text / Utf8 variant.
+    ///
+    /// `output` carries the `ListPrimElem` for the vec element type.
+    /// Serde-derives auto-implement `Serialize` for `Vec<T>` of any
+    /// primitive T, so the emit body is uniform — the element kind
+    /// is captured for diagnostics / future typed rendering.
+    ///
+    /// Today's surface (mobilitydb `temporal-aggregate-ops`):
+    /// `tjsonb-sequences-agg-collect-keys(list<tjsonb-sequence>)
+    /// -> list<string>`. Extends naturally to any
+    /// `list<record> -> list<primitive>` aggregate.
+    RecordToListPrim {
+        input: RecordSpec,
+        output: ListPrimElem,
+    },
 }
 
 /// #614: primitive scalar return for `AccKind::RecordToScalar`.
@@ -2366,6 +2389,29 @@ pub fn classify_shape(
 /// Mirrors the prim-arm subset of `classify_return` but keeps the
 /// integer widths distinct so each emit target can pick the right
 /// native-scalar wrap on the finalize encoder.
+///
+/// #830: `list_prim_return_kind` is the sibling helper for
+/// `AccKind::RecordToListPrim` — it walks the same primitive alphabet
+/// but includes `string` (which `ScalarReturnKind` intentionally
+/// omits, since the SQLite scalar wrap has no bare-Text arm for it).
+/// `list<string>` is a legitimate aggregate return shape (mobilitydb
+/// `tjsonb-sequences-agg-collect-keys`) — the emit body serialises the
+/// whole `Vec<String>` as a JSON-array text.
+fn list_prim_return_kind(t: &WitType) -> Option<ListPrimElem> {
+    match t {
+        WitType::U32 => Some(ListPrimElem::U32),
+        WitType::S32 => Some(ListPrimElem::S32),
+        WitType::U64 => Some(ListPrimElem::U64),
+        WitType::S64 => Some(ListPrimElem::S64),
+        WitType::U8 => Some(ListPrimElem::U8),
+        WitType::F64 => Some(ListPrimElem::F64),
+        WitType::F32 => Some(ListPrimElem::F32),
+        WitType::Bool => Some(ListPrimElem::Bool),
+        WitType::String => Some(ListPrimElem::String),
+        _ => None,
+    }
+}
+
 fn scalar_return_kind(t: &WitType) -> Option<ScalarReturnKind> {
     match t {
         WitType::U32 => Some(ScalarReturnKind::U32),
@@ -2661,6 +2707,27 @@ pub fn classify_aggregate_shape(
                         "AccKind::Record aggregate input `{}` but return shape is tuple<{:?}> (tuple element not a recognised primitive scalar)",
                         input.kebab_name,
                         elems,
+                    ));
+                }
+            } else if let WitType::List(inner) = &f.ret.inner {
+                // #830: list<record> → list<primitive>. Mirrors the
+                // `list<record>` return shape (#795 landed
+                // `RecordSetToRecordSet` for the record case) but the
+                // output side serialises `Vec<T>` for a primitive T.
+                // Today's surface (mobilitydb):
+                // `tjsonb-sequences-agg-collect-keys(list<tjsonb-sequence>)
+                //   -> list<string>`.
+                // Extends to any `list<record> -> list<primitive>` shape.
+                if let Some(elem) = list_prim_return_kind(inner) {
+                    AccKind::RecordToListPrim {
+                        input,
+                        output: elem,
+                    }
+                } else {
+                    return Err(format!(
+                        "AccKind::Record aggregate input `{}` but return shape is list<{:?}> (list element not a recognised primitive scalar)",
+                        input.kebab_name,
+                        inner,
                     ));
                 }
             } else {
@@ -5578,6 +5645,117 @@ mod option_list_record_tests {
             "expected flat list<record> to stay on AccKind::Record, got {:?}",
             shape.accumulator_kind,
         );
+    }
+
+    #[test]
+    fn aggregate_list_record_to_list_prim_string_routes_to_record_to_list_prim() {
+        // #830: `tjsonb-sequences-agg-collect-keys` shape:
+        //   `func(seqs: list<tjsonb-sequence>) -> list<string>`.
+        // Input `list<record>` (AccKind::Record family) + output
+        // `list<primitive>` — classifier should build the new
+        // `AccKind::RecordToListPrim` variant with a String element.
+        use crate::wit_parse::{WitFunction, WitParam, WitRet};
+        let tjsonb_sequence = RecordType {
+            package: "mobilitydb:temporal".to_string(),
+            package_version: "0.1.0".to_string(),
+            interface: "types".to_string(),
+            kebab_name: "tjsonb-sequence".to_string(),
+            fields: vec![
+                ("instants".to_string(), "list<tjsonb-instant>".to_string()),
+                ("interpolation".to_string(), "interpolation".to_string()),
+                ("lower-inclusive".to_string(), "bool".to_string()),
+                ("upper-inclusive".to_string(), "bool".to_string()),
+            ],
+            type_id: [0u8; 32],
+            symbolic_name: "mobilitydb:temporal@0.1.0/types/tjsonb-sequence".to_string(),
+            is_copy: false,
+            direct: true,
+            kebab_collides_in_pkg: false,
+        };
+        let records = vec![tjsonb_sequence];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let f = WitFunction {
+            interface: "temporal-aggregate-ops".to_string(),
+            package: "mobilitydb:temporal".to_string(),
+            kebab_name: "tjsonb-sequences-agg-collect-keys".to_string(),
+            params: vec![WitParam {
+                name: "seqs".to_string(),
+                ty: WitType::List(Box::new(WitType::Unsupported(
+                    "tjsonb-sequence".to_string(),
+                ))),
+            }],
+            ret: WitRet {
+                inner: WitType::List(Box::new(WitType::String)),
+                fallible: false,
+                error_ty: None,
+            },
+            package_version: "0.1.0".to_string(),
+            resource: None,
+            is_constructor: false,
+        };
+        let shape = classify_aggregate_shape(&f, &records, &enums).unwrap();
+        match shape.accumulator_kind {
+            AccKind::RecordToListPrim { input, output } => {
+                assert_eq!(input.kebab_name, "tjsonb-sequence");
+                assert_eq!(output, ListPrimElem::String);
+            }
+            other => panic!("expected RecordToListPrim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_list_record_to_list_u32_routes_to_record_to_list_prim() {
+        // #830 generalisation: `list<record> -> list<u32>` (or any
+        // primitive width) should follow the same path. Belt-and-
+        // suspenders: ensures the classifier isn't over-fitted to
+        // the `list<string>` case that motivated the fix.
+        use crate::wit_parse::{WitFunction, WitParam, WitRet};
+        let tint_sequence = RecordType {
+            package: "mobilitydb:temporal".to_string(),
+            package_version: "0.1.0".to_string(),
+            interface: "types".to_string(),
+            kebab_name: "tint-sequence".to_string(),
+            fields: vec![
+                ("instants".to_string(), "list<tint-instant>".to_string()),
+                ("interpolation".to_string(), "interpolation".to_string()),
+                ("lower-inclusive".to_string(), "bool".to_string()),
+                ("upper-inclusive".to_string(), "bool".to_string()),
+            ],
+            type_id: [0u8; 32],
+            symbolic_name: "mobilitydb:temporal@0.1.0/types/tint-sequence".to_string(),
+            is_copy: false,
+            direct: true,
+            kebab_collides_in_pkg: false,
+        };
+        let records = vec![tint_sequence];
+        let enums: Vec<EnumWithPackage> = vec![];
+        let f = WitFunction {
+            interface: "temporal-aggregate-ops".to_string(),
+            package: "mobilitydb:temporal".to_string(),
+            kebab_name: "tint-sequences-agg-something".to_string(),
+            params: vec![WitParam {
+                name: "seqs".to_string(),
+                ty: WitType::List(Box::new(WitType::Unsupported(
+                    "tint-sequence".to_string(),
+                ))),
+            }],
+            ret: WitRet {
+                inner: WitType::List(Box::new(WitType::U32)),
+                fallible: false,
+                error_ty: None,
+            },
+            package_version: "0.1.0".to_string(),
+            resource: None,
+            is_constructor: false,
+        };
+        let shape = classify_aggregate_shape(&f, &records, &enums).unwrap();
+        match shape.accumulator_kind {
+            AccKind::RecordToListPrim { input, output } => {
+                assert_eq!(input.kebab_name, "tint-sequence");
+                assert_eq!(output, ListPrimElem::U32);
+            }
+            other => panic!("expected RecordToListPrim, got {other:?}"),
+        }
     }
 
     #[test]

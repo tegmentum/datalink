@@ -1918,7 +1918,8 @@ fn collect_referenced_records(
                 out.insert(output.kebab_name.clone());
             }
             interface_db::AccKind::RecordToScalar { input, .. }
-            | interface_db::AccKind::RecordToTuple { input, .. } => {
+            | interface_db::AccKind::RecordToTuple { input, .. }
+            | interface_db::AccKind::RecordToListPrim { input, .. } => {
                 out.insert(input.kebab_name.clone());
             }
             interface_db::AccKind::Geom | interface_db::AccKind::Raster => {}
