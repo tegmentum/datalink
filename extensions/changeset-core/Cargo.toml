@@ -1,0 +1,14 @@
+[package]
+name = "changeset-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `changeset` extension: a pure-Rust SQLite session changeset codec (invert / concat / count / tables / decode) written ONCE, with no dependency on libsqlite3-sys or the SQLite C session library. The per-DB shims (sqlink sqlite:extension, sqlink embed, ducklink duckdb:extension) are generated from this declaration by datalink-extcore. Reproduces sqlite3changeset_invert byte-for-byte and sqlite3changeset_concat to semantic equivalence, so the extension is provider-able as a standalone wasm component (no embedded sqlite3)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "changeset_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
