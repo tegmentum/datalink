@@ -98,25 +98,26 @@ fn build_cast_rewrites_body(plan: &BridgePlan) -> String {
             // DB and BridgePlan so distinct source-side rewrites
             // survive PK dedup. The datafission
             // `sql-extension-plugin/metadata` cast-rewrite record
-            // doesn't yet carry the field, so we drop it here on the
-            // way through the datafission-target emit. Downstream
-            // datafission consumers dispatch on `(target_type,
-            // source_kind, source_fn_hint)` only. If the datafission
-            // metadata WIT gains a `source-type-id` field, wire it in
-            // by adding a `source_type_id: <expr>,` line to the
-            // format string below.
-            let _ = c.source_type_id;
+            // gained the field in v1.2.0 (matches the sibling
+            // `postgis:wasm/postgis-metadata` shape), so we pass it
+            // through verbatim.
+            let source_type_id_lit = match c.source_type_id {
+                Some(id) => format!("Some({id}u32)"),
+                None => "None".to_string(),
+            };
             s.push_str(&format!(
                 "            setypes::CastRewrite {{\n\
                  \x20               target_type: \"{tt}\".to_string(),\n\
                  \x20               function_name: \"{fn_}\".to_string(),\n\
                  \x20               source_fn_hint: \"{hint}\".to_string(),\n\
                  \x20               source_kind: setypes::CastSourceKind::{variant},\n\
+                 \x20               source_type_id: {stid},\n\
                  \x20           }},\n",
                 tt = rust_str_escape(&c.target_type),
                 fn_ = rust_str_escape(&c.function_name),
                 hint = rust_str_escape(&c.source_fn_hint),
                 variant = variant,
+                stid = source_type_id_lit,
             ));
         }
     }
