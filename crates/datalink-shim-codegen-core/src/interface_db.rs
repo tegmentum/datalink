@@ -1109,6 +1109,108 @@ pub fn augment_plan_with_override_aggregates(
     Ok(())
 }
 
+/// Scalar equivalent of `augment_plan_with_override_aggregates`. Iterates
+/// `operator_function_overrides()` and synthesises a `ScalarFn` row for
+/// any (sql_name, wit_iface, wit_kebab) whose SQL name is not already on
+/// the plan and whose WIT function exists in the walked deps.
+///
+/// The override table is a hand-curated (sql, iface, kebab) tuple list
+/// consulted by `override_for` at dispatch-emit time to reroute a SQL
+/// name to a specific WIT overload. Without this augment, aliases whose
+/// SQL name doesn't already exist on the interface DB — e.g. a raster
+/// overload surfaced under a dedicated `st_rast<verb>` alias to sidestep
+/// a geometry/raster collision — never reach the codegen's `ext.scalars`
+/// list, so the dispatch arm never emits and `override_for` has nothing
+/// to route.
+///
+/// Synthesised rows carry `param_signatures = [[binary; arity]]` and
+/// `return_type = "binary"` — only `scalar_num_args` reads these on the
+/// synthesised path; the dispatch matcher reclassifies the real shapes
+/// against the WIT signature (via `override_for`) when it walks the
+/// plan.
+pub fn augment_plan_with_override_scalars(
+    plan: &mut shim_bridge_codegen_core::BridgePlan,
+    wit_deps_dir: &Path,
+) -> Result<()> {
+    if plan.extensions.is_empty() {
+        return Ok(());
+    }
+
+    let mut wit_fns = Vec::<wit_parse::WitFunction>::new();
+    if let Ok(rd) = std::fs::read_dir(wit_deps_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let parsed = wit_parse::parse_dir(&p)?;
+            wit_fns.extend(parsed);
+        }
+    }
+    let direct = wit_parse::parse_dir(wit_deps_dir).unwrap_or_default();
+    wit_fns.extend(direct);
+    let aliases = collect_package_aliases(wit_deps_dir);
+    let wit_fns = resolve_function_aliases(wit_fns, &aliases);
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ext in &plan.extensions {
+        for sc in &ext.scalars {
+            seen.insert(sc.canonical_name.clone());
+            for alias in &sc.aliases {
+                seen.insert(alias.clone());
+            }
+        }
+        for ag in &ext.aggregates {
+            seen.insert(ag.canonical_name.clone());
+            for alias in &ag.aliases {
+                seen.insert(alias.clone());
+            }
+        }
+    }
+
+    let mut synthetic = Vec::<shim_bridge_codegen_core::ScalarFn>::new();
+    for (sql_name, wit_iface, wit_kebab) in
+        crate::override_tables::operator_function_overrides()
+    {
+        if seen.contains(*sql_name) {
+            continue;
+        }
+        let wit_fn = wit_fns
+            .iter()
+            .find(|wf| wf.interface == *wit_iface && wf.kebab_name == *wit_kebab);
+        let Some(wit_fn) = wit_fn else {
+            continue;
+        };
+        let arity = wit_fn.params.len();
+        let param_sig: Vec<String> =
+            std::iter::repeat("binary".to_string()).take(arity).collect();
+        seen.insert(sql_name.to_string());
+        synthetic.push(shim_bridge_codegen_core::ScalarFn {
+            canonical_name: sql_name.to_string(),
+            aliases: Vec::new(),
+            param_signatures: vec![param_sig],
+            return_type: "binary".to_string(),
+            is_deterministic: true,
+            propagates_null: true,
+        });
+    }
+
+    if !synthetic.is_empty() {
+        eprintln!(
+            "[codegen] augment-plan: synthesised {} scalar(s) from override table",
+            synthetic.len(),
+        );
+        for s in &synthetic {
+            eprintln!("  + {}", s.canonical_name);
+        }
+        plan.extensions[0].scalars.extend(synthetic);
+        plan.extensions[0]
+            .scalars
+            .sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    }
+    Ok(())
+}
+
 /// #680: complement to `augment_plan_with_override_aggregates` for the
 /// SCALAR surface. Closes the codegen substrate gap that prevented
 /// upstream postgis-wasm WIT additions from surfacing as SQL functions.
