@@ -48,8 +48,8 @@ members = ["."]
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = {{ version = "0.41", features = ["macros"] }}
-wit-bindgen-rt = {{ version = "0.41", features = ["bitflags"] }}
+wit-bindgen = {{ version = "0.51", features = ["macros"] }}
+wit-bindgen-rt = {{ version = "0.44", features = ["bitflags"] }}
 # Per-shape arms: serde + serde_json drive the JSON-as-TEXT helpers
 # (`list<f64>` args parsed from `'[1.0, 2.0]'` TEXT, `JsonText`
 # returns serialized via serde_json). `ciborium` ferries WitValue
