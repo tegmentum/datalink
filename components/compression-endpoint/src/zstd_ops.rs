@@ -3,12 +3,9 @@
 //! there is ONE libzstd in the catalog. Wire format is the canonical zstd frame
 //! (magic 28 b5 2f fd) — the same bytes the `zstd` CLI writes.
 
-/// Default compression level for `compress` when level 0 is passed as "use
-/// default". zstd's documented default is 3; level 0 in the zstd C API also
-/// means "use default", forwarded unchanged.
-pub const DEFAULT_LEVEL: i32 = 3;
-
-/// Compress `data` at `level`. Output is a self-framed zstd stream.
+/// Compress `data` at `level`. Output is a self-framed zstd stream. (Level 0
+/// means "use libzstd's default" per the zstd C API — forwarded unchanged; the
+/// caller/shim chooses the default, so no constant is needed here.)
 pub fn compress(data: &[u8], level: i32) -> Result<Vec<u8>, String> {
     zstd::stream::encode_all(data, level).map_err(|e| format!("compress: {e}"))
 }
@@ -50,7 +47,7 @@ mod tests {
     #[test]
     fn round_trip_default_level() {
         let payload = b"the quick brown fox jumps over the lazy dog".repeat(20);
-        let c = compress(&payload, DEFAULT_LEVEL).unwrap();
+        let c = compress(&payload, 3).unwrap();
         assert_eq!(decompress(&c).unwrap(), payload);
     }
 
