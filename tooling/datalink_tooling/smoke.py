@@ -233,7 +233,13 @@ def build_component(cfg, name: str) -> tuple[bool, str]:
         return (False, f"expected build output {cfg.rel(built)} not found")
     ext_artifacts = cfg.path(cfg.get("smoke", "extensions_dir"))
     ext_artifacts.mkdir(parents=True, exist_ok=True)
-    dest = ext_artifacts / f"{bare(cfg, name)}.wasm"
+    # The on-disk artifact name the host resolver expects. Default keeps the
+    # historical `<name>.wasm`; a provider-backed host (e.g. sqlink post-#220,
+    # which loads `<name>-provider.wasm`) sets smoke.artifact_name accordingly.
+    art_name = cfg.get("smoke", "artifact_name", default="{NAME}.wasm").replace(
+        "{NAME}", bare(cfg, name)
+    )
+    dest = ext_artifacts / art_name
     shutil.copy2(built, dest)
     return (True, f"built + copied {cfg.rel(dest)}")
 
@@ -252,7 +258,10 @@ def _missing_artifacts(cfg, name: str) -> str | None:
     # per-extension wasm artifact, if the host resolves one from extensions_dir
     sc_dir = cfg.get("smoke", "extensions_dir")
     if sc_dir and cfg.get("smoke", "supports_build", default=False):
-        art = cfg.path(sc_dir) / f"{bare(cfg, name)}.wasm"
+        art_name = cfg.get("smoke", "artifact_name", default="{NAME}.wasm").replace(
+            "{NAME}", bare(cfg, name)
+        )
+        art = cfg.path(sc_dir) / art_name
         if not art.exists():
             return (f"extension artifact missing: {cfg.rel(art)}; "
                     f"run: smoke.py --build {bare(cfg, name)}")
