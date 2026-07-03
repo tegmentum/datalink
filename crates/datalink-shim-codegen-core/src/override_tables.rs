@@ -124,6 +124,11 @@ pub fn operator_function_overrides() -> &'static [(&'static str, &'static str, &
         // (`st_rastenvelope`, mirroring `st_rastheight` /
         // `st_rastwidth` / `st_rastnumbands` above) if needed.
         ("st_envelope",                    "postgis-accessors",        "st-envelope"),
+        // Raster overload of st-envelope surfaced under a dedicated
+        // SQL alias so it stays callable after the collision above
+        // routed the bare `st_envelope` name to the geometry overload.
+        // Mirrors the st_rast{height,width,numbands} pattern.
+        ("st_rastenvelope",                "postgis-raster-accessors", "st-envelope"),
     ]
 }
 
