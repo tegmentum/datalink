@@ -4129,20 +4129,37 @@ pub fn build_full(
             // The aggregate path wires them correctly via the
             // `build_aggregate_registry` pipeline; the scalar
             // path here finds the same WIT function by name but
-            // can't classify `list<borrow<geometry>>` /
-            // `list<borrow<raster>>` as a scalar param shape and
-            // would otherwise emit a stray "param type not in
-            // dispatcher alphabet (aggregate-only)" warning.
+            // would otherwise duplicate the entry.
             //
-            // Drop the scalar arm silently when the matched WIT
-            // function's first param is one of the aggregate-only
-            // list-borrow shapes. The aggregate dispatch arm
-            // remains the source of truth for the SQL name.
-            if matches!(
-                f.params.first().map(|p| &p.ty),
-                Some(WitType::ListGeomBorrow) | Some(WitType::ListRasterBorrow)
-            ) {
-                continue;
+            // #836: Narrow the skip to WIT functions whose FIRST
+            // param is `list<borrow<raster>>` (which the scalar
+            // arm cannot classify — the `ParamShape::Raster` list
+            // form is aggregate-only) OR to the geometry variant
+            // ONLY when the SAME SQL name also appears in the
+            // aggregate table for this extension. The earlier
+            // blanket `list<borrow<geometry>>` skip erroneously
+            // dropped legitimate variadic scalars like
+            // `st_collect(g1, g2, ...)` — `postgis-accessors::
+            // st-collect` is a scalar-shape variadic that the
+            // `ParamShape::ListGeom` emit arm handles correctly
+            // (both variadic-tail and single-blob-wrapped-as-list
+            // flavors), and its SQL name is distinct from the
+            // sibling aggregate `st_collect_aggregate`.
+            let name_in_aggregates = |name: &str| {
+                ext.aggregates.iter().any(|ag| {
+                    ag.canonical_name == name
+                        || ag.aliases.iter().any(|a| a == name)
+                })
+            };
+            let dual_registered = name_in_aggregates(&sc.canonical_name)
+                || sc
+                    .aliases
+                    .iter()
+                    .any(|a| name_in_aggregates(a));
+            match f.params.first().map(|p| &p.ty) {
+                Some(WitType::ListRasterBorrow) => continue,
+                Some(WitType::ListGeomBorrow) if dual_registered => continue,
+                _ => {}
             }
             match classify_shape(f, records, &enums) {
                 Ok(mut shape) => {
