@@ -107,6 +107,23 @@ pub fn operator_function_overrides() -> &'static [(&'static str, &'static str, &
         // existing `postgis-constructors` entry.
         ("st_wkbtosql",                    "postgis-constructors",     "st-geom-from-wkb"),
         ("st_wkttosql",                    "postgis-constructors",     "st-geom-from-text"),
+        // Name-collision resolution: `st-envelope` is declared in
+        // both `postgis-accessors` (geometry → geometry bounding-box
+        // polygon) and `postgis-raster-accessors` (raster → geometry
+        // bounding-box polygon). The default snake→kebab resolver
+        // walks a `HashMap<kebab, &WitFunction>` which overwrites on
+        // collision — file-walk order currently lets the raster
+        // overload win, so a geometry WKB input errors out inside
+        // `from_raster_binary` with a GDAL "open-failed" (the
+        // raster-header sniff fails on WKB bytes). PostGIS itself
+        // dispatches by argument type, but the datafission shim's
+        // one-arm-per-name shape has no runtime type sniff; route
+        // the collision to the geometry overload — the more common
+        // case by orders of magnitude — and leave the raster
+        // overload accessible via a follow-up dedicated SQL alias
+        // (`st_rastenvelope`, mirroring `st_rastheight` /
+        // `st_rastwidth` / `st_rastnumbands` above) if needed.
+        ("st_envelope",                    "postgis-accessors",        "st-envelope"),
     ]
 }
 
