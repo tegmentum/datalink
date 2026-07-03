@@ -1,0 +1,37 @@
+[package]
+name = "compression-endpoint"
+version = "0.1.0"
+edition = "2021"
+description = """
+DB-agnostic compression provider for the compose:dynlink/endpoint contract.
+Wraps the reference C libzstd (via the `zstd` crate) and speaks the uniform
+message endpoint with a CBOR request/response envelope. The op surface mirrors
+sqlink's `sqlite:extension/compression` WIT contract so a host can route its
+compression path through this provider as a warm-once resident — one libzstd in
+the catalog, reused by every extension (e.g. the `zstd` extension) instead of
+each statically bundling its own copy.
+"""
+license = "MIT"
+publish = false
+
+# Detached from any parent workspace — built standalone via build.sh
+# (`cargo build --release --target wasm32-wasip2`, wasi-sdk CC env exported).
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.33"
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+# Reference C libzstd. `no_asm` skips the x86 huf_decompress_amd64.S (can't
+# assemble for wasm); the C source cross-compiles under wasi-sdk clang. Built
+# direct to wasm32-wasip2 (no cargo-component wasip1 transform), so the wasip2
+# CC/AR/CFLAGS env from build.sh applies.
+zstd = { version = "0.13", default-features = false, features = ["no_asm"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
