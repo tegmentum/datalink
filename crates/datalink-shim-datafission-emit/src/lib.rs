@@ -86,9 +86,12 @@
 
 pub(crate) mod dispatch;
 pub(crate) mod emit_cargo;
+pub mod emit_dynlink;
 pub(crate) mod emit_lib;
 pub(crate) mod emit_readme;
 pub(crate) mod emit_wit;
+
+pub use emit_dynlink::{emit_dynlink, DynlinkOptions};
 
 use std::fs;
 use std::path::{Path, PathBuf};

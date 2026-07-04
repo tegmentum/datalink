@@ -151,7 +151,7 @@ pub fn write_deps(plan: &BridgePlan, deps_dir: &Path) -> Result<()> {
 ///      (i.e. the candidate is a symlink farm to canonical, not an
 ///      independent copy). #812.
 ///   4. `$HOME/git/datafission/wit` (canonical source-of-truth).
-fn source_datafission_wit_root(primary: &str) -> Result<PathBuf> {
+pub fn source_datafission_wit_root(primary: &str) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("DATAFISSION_EXTENSION_WIT_DEPS") {
         let p = PathBuf::from(p);
         if p.is_dir() {
