@@ -851,6 +851,22 @@ fn materialize_resident(registry: &ProviderRegistry, id: &str) -> Result<(), Err
         let mut linker: Linker<ProviderState> = Linker::new(engine);
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| err(ErrorCode::EmitLinkError, format!("provider wasi linker: {e}")))?;
+        // Partial backends (postgis-core-provider, postgis-sfcgal-provider,
+        // etc. under datafission's Phase 3 backend split) carry dangling
+        // non-wasi imports for the deps that the sibling sub-ext backends
+        // will satisfy. wasmtime's stock instantiate refuses; wire trap-
+        // on-call stubs so instantiation succeeds and the trap only fires
+        // if the dispatcher actually routes a call into a dangling import.
+        // Full-surface providers (postgis-composed-provider et al.) have
+        // no dangling imports and this call is a no-op.
+        linker
+            .define_unknown_imports_as_traps(&entry.component)
+            .map_err(|e| {
+                err(
+                    ErrorCode::EmitLinkError,
+                    format!("provider '{id}': define_unknown_imports_as_traps: {e}"),
+                )
+            })?;
         // Build the provider's OWN WASI ctx, preopening any registered dirs (a
         // pylon needs /lib = CPython Lib+numpy and /app = dispatcher) so the
         // resident interpreter can import them. inherit_stdio surfaces the
@@ -1264,6 +1280,18 @@ async fn materialize_resident_async(slot: &mut AsyncSlot, id: &str) -> Result<()
             async_err(AsyncErrorCode::EmitLinkError, format!("provider wasi linker: {e}"))
         })?;
     }
+    // Trap-stubs for any dangling non-wasi import on partial backends
+    // — see the sync analog in `materialize_resident` for the full
+    // rationale. Full-surface providers have no dangling imports and
+    // this call is a no-op.
+    linker
+        .define_unknown_imports_as_traps(&slot.component)
+        .map_err(|e| {
+            async_err(
+                AsyncErrorCode::EmitLinkError,
+                format!("provider '{id}': define_unknown_imports_as_traps: {e}"),
+            )
+        })?;
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
     if slot.network {
@@ -1518,6 +1546,65 @@ mod tests {
             Err(e) => assert!(matches!(e.code, AsyncErrorCode::NotImplemented)),
             Ok(_) => panic!("unmapped digest must not resolve"),
         }
+    }
+
+    /// Path to a per-sub-ext partial-backend provider (Phase 3 backend
+    /// split, sqlink-lib #823). The postgis-core-provider wraps
+    /// postgis-core-composed.wasm — a 33 MB partial backend that carries
+    /// 17 dangling non-wasi imports for raster / sfcgal / format-encoder
+    /// deps not included in the core plan. If materialization succeeds,
+    /// `define_unknown_imports_as_traps` is doing its job.
+    fn postgis_core_provider_wasm() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home)
+            .join("git/postgis-wasm/build/plans/postgis-core-provider-composed.wasm")
+    }
+
+    /// Trap-stubs substrate proof (#823 Phase 3 Commit 3): a partial
+    /// backend with 17 dangling non-wasi imports materializes cleanly,
+    /// and the dispatcher's built-in "unknown method" fallthrough
+    /// answers arms outside the partial's coverage — no trap needed
+    /// because those methods never reach a dangling import in the
+    /// first place. The trap-on-call stubs are load-bearing at
+    /// instantiate time; they earn their keep only if some code path
+    /// inside the partial backend organically wanders into a dangling
+    /// interface (e.g. postgis-composed internally calling gdal for
+    /// a raster arm the dispatcher shouldn't have routed to). We
+    /// don't fabricate such a call here — the substrate win is that
+    /// instantiate NO LONGER refuses.
+    #[test]
+    fn resident_materializes_partial_backend_via_trap_stubs() {
+        let provider = postgis_core_provider_wasm();
+        if !provider.exists() {
+            eprintln!(
+                "skipping resident_materializes_partial_backend_via_trap_stubs: prebuilt provider not found ({})",
+                provider.display()
+            );
+            return;
+        }
+
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config).expect("engine");
+
+        let registry = ProviderRegistry::new(engine);
+        registry
+            .register_provider("postgis-core", &provider)
+            .expect("register postgis-core provider");
+        assert_eq!(registry.resident_count("postgis-core"), 0, "lazy pre-resolve");
+
+        let backend = ResidentBackend::new(registry.clone());
+        // The load-bearing assertion: before the trap-stub fix this
+        // materialization failed with "unknown import <one of the 17
+        // dangling non-wasi imports> has not been defined".
+        let _handle = backend
+            .resolve_by_id("postgis-core")
+            .expect("materialize partial backend: define_unknown_imports_as_traps must satisfy dangling non-wasi imports");
+        assert_eq!(
+            registry.resident_count("postgis-core"),
+            1,
+            "partial backend now resident: trap-stubs unblocked instantiation"
+        );
     }
 
     /// Path to the framework's prebuilt `dynlink_echo_provider.wasm` (a real
