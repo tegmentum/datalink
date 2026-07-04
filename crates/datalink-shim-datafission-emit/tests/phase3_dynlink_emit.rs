@@ -37,8 +37,17 @@ fn dynlink_emit_produces_compilable_small_bridge() {
         }
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let out_dir = tmp.path().join("bridge");
+    // Emit to a stable location so a maintainer can iterate on
+    // compilation without regenerating each time. Overridable via
+    // env var for tempfile-based CI.
+    let out_dir = match std::env::var("DYNLINK_BRIDGE_OUT") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home).join(".cache/dynlink-bridge-sfcgal")
+        }
+    };
+    let _ = std::fs::remove_dir_all(&out_dir);
     std::fs::create_dir_all(&out_dir).unwrap();
 
     let opts = DynlinkOptions {
@@ -78,18 +87,7 @@ fn dynlink_emit_produces_compilable_small_bridge() {
         "lib.rs must contain at least one SFCGAL arm (st_volume)"
     );
 
-    // Assert on the emission's structural properties. Compilation
-    // to wasm32-wasip2 is DEFERRED to a follow-up commit — a few
-    // remaining wit-bindgen integration details (mod bindings
-    // wrapper alignment, exact-version datafission plugin path
-    // imports, per-guest-impl trait shape) still need to land.
-    // The wire discipline (CBOR envelope, ResponseValue map
-    // disambiguation, primitive-shape arm bodies) is proven at
-    // this layer.
-    let sz = std::fs::metadata(out_dir.join("src/lib.rs")).unwrap().len();
-    eprintln!("dynlink bridge lib.rs size: {} bytes ({:.1} KB)", sz, sz as f64 / 1024.0);
-    // Sanity: the lib.rs should reference sfcgal arms + provider id.
-    // SFCGAL-family arms — the SQL names use snake_case.
+    // Structural: SFCGAL-family SQL names use snake_case.
     let sfcgal_arms = [
         "st_volume",
         "st_area_threed",
@@ -98,21 +96,47 @@ fn dynlink_emit_produces_compilable_small_bridge() {
         "st_intersects_threed",
         "st_convex_hull_threed",
     ];
-    let mut hits = 0;
-    for arm in &sfcgal_arms {
-        if lib_rs.contains(&format!("\"{}\"", arm)) {
-            hits += 1;
-        }
-    }
-    assert!(
-        hits >= 5,
-        "expected 5+ SFCGAL arms among {:?}, found {}",
-        sfcgal_arms,
-        hits
-    );
+    let hits: usize = sfcgal_arms
+        .iter()
+        .filter(|arm| lib_rs.contains(&format!("\"{}\"", arm)))
+        .count();
+    assert!(hits >= 5, "expected 5+ SFCGAL arms among {:?}, found {}", sfcgal_arms, hits);
     let arm_count = lib_rs.matches("=> {\n").count();
     eprintln!(
         "dynlink emit: {} scalar arms wired, {} sfcgal arms found",
         arm_count, hits
     );
+
+    // Compile the emitted crate. wasm32-wasip2 is set up by the
+    // dev environment; if it isn't, skip gracefully.
+    let target = "wasm32-wasip2";
+    let status = Command::new("cargo")
+        .args(["build", "--release", "--target", target])
+        .current_dir(&out_dir)
+        .status();
+    let Ok(s) = status else {
+        eprintln!("skipping compile check: cargo not runnable");
+        return;
+    };
+    if !s.success() {
+        panic!(
+            "dynlink bridge did not compile — inspect {}",
+            out_dir.display()
+        );
+    }
+
+    let wasm = out_dir.join(format!(
+        "target/{target}/release/postgis_sfcgal_datafission_bridge_dynlink.wasm"
+    ));
+    assert!(wasm.exists(), "no compiled wasm at {}", wasm.display());
+    let sz = std::fs::metadata(&wasm).unwrap().len();
+    eprintln!(
+        "dynlink bridge wasm: {} bytes ({:.1} KB)",
+        sz,
+        sz as f64 / 1024.0
+    );
+    // Phase 3 goal per plan doc §6: ~200 KB. Empirical ceiling
+    // ~1 MB accounts for wit-bindgen boilerplate + serde CBOR
+    // codec. Any regression above 2 MB flags a plumbing leak.
+    assert!(sz < 2_000_000, "dynlink bridge should be < 2 MB, got {} bytes", sz);
 }
