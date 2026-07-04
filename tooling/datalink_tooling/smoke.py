@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -166,12 +167,39 @@ def _sql_for(cfg, name: str) -> str:
     return preamble + sql
 
 
-def _argv(cfg, name: str) -> list[str]:
+# Recognizes `-- smoke-db: <mode>` (or the repo's comment_prefix) on one of the
+# first few lines of a smoke.sql. Lets a single extension opt out of the default
+# `:memory:` db when its assertions need a file-backed db — e.g. an extension
+# that queries the session db through a host `spi` surface that can't bridge
+# `:memory:` across the host<->wasm boundary (separate page caches). Only
+# `tempfile` is meaningful today; an absent marker keeps the configured default.
+_SMOKE_DB_RE = re.compile(r"smoke-db:\s*(\S+)")
+
+
+def _smoke_db_marker(cfg, name: str) -> str | None:
+    smoke = ext_dir(cfg, name) / "smoke.sql"
+    if not smoke.exists():
+        return None
+    comment = cfg.get("smoke", "comment_prefix", default="--")
+    # The marker is a comment directive; only scan the leading comment block so
+    # a later literal "smoke-db:" inside SQL can't be misread as a directive.
+    for line in smoke.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith(comment):
+            break
+        if (m := _SMOKE_DB_RE.search(stripped)):
+            return m.group(1)
+    return None
+
+
+def _argv(cfg, name: str, db_override: str | None = None) -> list[str]:
     host_bin = cfg.path(cfg.get("smoke", "host_bin"))
     cli_comp = cfg.path(cfg.get("smoke", "cli_component"))
     sc_dir = cfg.get("smoke", "extensions_dir")
     ext_artifacts = cfg.path(sc_dir) if sc_dir else None
-    db = cfg.get("smoke", "db", default=":memory:")
+    db = db_override or cfg.get("smoke", "db", default=":memory:")
     sub = {
         "{HOST_BIN}": str(host_bin) if host_bin else "",
         "{CLI_COMPONENT}": str(cli_comp) if cli_comp else "",
@@ -195,6 +223,28 @@ def _env(cfg, name: str) -> dict:
 
 
 def _run_cli(cfg, name: str, sql: str, timeout: int) -> subprocess.CompletedProcess:
+    marker = _smoke_db_marker(cfg, name)
+    if marker == "tempfile":
+        # Fresh on-disk db per run so the host + wasm-internal sqlite3 open the
+        # SAME file (spi surfaces that can't bridge :memory: then see session
+        # state). mkstemp + immediate unlink: sqlite recreates the path; we hold
+        # the fd only to reserve a unique name. Clean up siblings (-wal/-shm/
+        # -journal) too.
+        fd, db_path = tempfile.mkstemp(prefix=f"smoke-{bare(cfg, name)}-", suffix=".db")
+        os.close(fd)
+        os.unlink(db_path)
+        try:
+            return subprocess.run(
+                _argv(cfg, name, db_override=db_path), input=sql,
+                capture_output=True, text=True,
+                timeout=timeout, cwd=cfg.repo_root, env=_env(cfg, name),
+            )
+        finally:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                try:
+                    os.unlink(db_path + suffix)
+                except OSError:
+                    pass
     return subprocess.run(
         _argv(cfg, name), input=sql, capture_output=True, text=True,
         timeout=timeout, cwd=cfg.repo_root, env=_env(cfg, name),
@@ -358,7 +408,11 @@ def main(config: str | None = None, argv=None) -> None:
     if args.dry_run:
         nm = args.name or args.seed_expected
         print(f"db_name:    {cfg.db_name}")
-        print(f"argv:       {' '.join(_argv(cfg, nm))}")
+        db_marker = _smoke_db_marker(cfg, nm)
+        dry_db = "<tempfile.db>" if db_marker == "tempfile" else None
+        print(f"argv:       {' '.join(_argv(cfg, nm, db_override=dry_db))}")
+        if db_marker:
+            print(f"smoke-db:   {db_marker}")
         env_extra = {k: v.replace('{NAME}', bare(cfg, nm))
                      for k, v in (cfg.get('smoke', 'env', default={}) or {}).items()}
         if env_extra:
