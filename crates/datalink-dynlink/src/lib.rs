@@ -838,6 +838,93 @@ impl ProviderBackend for ResidentBackend {
     }
 }
 
+/// Substitute for `wasmtime::component::Linker::define_unknown_imports_as_traps`
+/// that pre-filters top-level imports already satisfied by a prior
+/// `add_to_linker_*` call.
+///
+/// Wasmtime-46's stock impl (`wasmtime-46.0.1/src/runtime/component/linker.rs`
+/// line 387) unconditionally invokes `linker.instance(item_name)?` for every
+/// top-level `ComponentInstance` import. That is intentional for a linker with
+/// no prior `add_to_linker`, but it collides with the `wasi:*/*@0.2.x`
+/// instances that `wasmtime_wasi::p2::add_to_linker_{sync,async}` just
+/// registered:
+///
+/// ```text
+/// provider '<id>': define_unknown_imports_as_traps:
+///   map entry `wasi:cli/environment@0.2.12` defined twice
+/// ```
+///
+/// The stock impl's "skip if already defined" guard (line 362) only fires for
+/// `ComponentFunc` imports; the `ComponentInstance` arm has no such check. We
+/// mirror the stock impl's tree-walk but skip any top-level import whose name
+/// lives in the `wasi:` namespace — those belong to the WASI p2 linker that
+/// already populated them (semver-matched under the covers).
+///
+/// Non-wasi dangling imports (the partial backend's raison d'être — e.g.
+/// `postgis:sfcgal-provider/...` on a core-only backend) still trap-stub
+/// through the recursion, exactly as before.
+fn define_missing_imports_as_traps<T: 'static>(
+    linker: &mut Linker<T>,
+    component: &Component,
+    engine: &Engine,
+) -> wasmtime::Result<()> {
+    let ct = component.component_type();
+    let mut root = linker.root();
+    for (import_name, ext) in ct.imports(engine) {
+        if import_name.starts_with("wasi:") {
+            // Already wired by `wasmtime_wasi::p2::add_to_linker_{sync,async}`
+            // above. Defining it here would either error ("defined twice") or
+            // (under shadowing) wipe out the real host impls with trap stubs.
+            continue;
+        }
+        stub_component_item(&mut root, import_name, &ext.ty, engine, None)?;
+    }
+    Ok(())
+}
+
+/// Recursively trap-stub a single component import, mirroring the tree walk
+/// in wasmtime's stock `define_unknown_imports_as_traps` (linker.rs lines
+/// 354-410). See [`define_missing_imports_as_traps`] for why we reimplement
+/// this instead of calling the wasmtime helper.
+fn stub_component_item<T: 'static>(
+    linker: &mut wasmtime::component::LinkerInstance<'_, T>,
+    name: &str,
+    item: &wasmtime::component::types::ComponentItem,
+    engine: &Engine,
+    parent_instance: Option<&str>,
+) -> wasmtime::Result<()> {
+    use wasmtime::component::types::ComponentItem;
+    use wasmtime::component::ResourceType;
+    match item {
+        ComponentItem::ComponentFunc(_) => {
+            let fq = match parent_instance {
+                Some(p) => format!("{p}#{name}"),
+                None => name.to_string(),
+            };
+            linker.func_new(name, move |_, _, _, _| {
+                Err(wasmtime::Error::msg(format!(
+                    "unknown import: `{fq}` has not been defined"
+                )))
+            })?;
+        }
+        ComponentItem::ComponentInstance(ci) => {
+            let mut inner = linker.instance(name)?;
+            for (export_name, export) in ci.exports(engine) {
+                stub_component_item(&mut inner, export_name, &export.ty, engine, Some(name))?;
+            }
+        }
+        ComponentItem::Resource(_) => {
+            let ty = ResourceType::host::<()>();
+            linker.resource(name, ty, |_, _| Ok(()))?;
+        }
+        // Type / CoreFunc / Module / Component are not stubbable via the
+        // component-linker trap surface; the stock helper bails on Component /
+        // Module and drops the rest silently. Matches that behavior.
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Materialize (instantiate ONCE, then reuse) the resident provider for `id`.
 fn materialize_resident(registry: &ProviderRegistry, id: &str) -> Result<(), Error> {
     let mut inner = registry.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -859,14 +946,12 @@ fn materialize_resident(registry: &ProviderRegistry, id: &str) -> Result<(), Err
         // if the dispatcher actually routes a call into a dangling import.
         // Full-surface providers (postgis-composed-provider et al.) have
         // no dangling imports and this call is a no-op.
-        linker
-            .define_unknown_imports_as_traps(&entry.component)
-            .map_err(|e| {
-                err(
-                    ErrorCode::EmitLinkError,
-                    format!("provider '{id}': define_unknown_imports_as_traps: {e}"),
-                )
-            })?;
+        define_missing_imports_as_traps(&mut linker, &entry.component, engine).map_err(|e| {
+            err(
+                ErrorCode::EmitLinkError,
+                format!("provider '{id}': define_missing_imports_as_traps: {e}"),
+            )
+        })?;
         // Build the provider's OWN WASI ctx, preopening any registered dirs (a
         // pylon needs /lib = CPython Lib+numpy and /app = dispatcher) so the
         // resident interpreter can import them. inherit_stdio surfaces the
@@ -1284,14 +1369,12 @@ async fn materialize_resident_async(slot: &mut AsyncSlot, id: &str) -> Result<()
     // — see the sync analog in `materialize_resident` for the full
     // rationale. Full-surface providers have no dangling imports and
     // this call is a no-op.
-    linker
-        .define_unknown_imports_as_traps(&slot.component)
-        .map_err(|e| {
-            async_err(
-                AsyncErrorCode::EmitLinkError,
-                format!("provider '{id}': define_unknown_imports_as_traps: {e}"),
-            )
-        })?;
+    define_missing_imports_as_traps(&mut linker, &slot.component, &slot.engine).map_err(|e| {
+        async_err(
+            AsyncErrorCode::EmitLinkError,
+            format!("provider '{id}': define_missing_imports_as_traps: {e}"),
+        )
+    })?;
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
     if slot.network {
