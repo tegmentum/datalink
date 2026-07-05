@@ -33,7 +33,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 
 use shim_bridge_codegen_core::BridgePlan;
-use datalink_shim_codegen_core::interface_db::{self, DispatchEntry, ParamShape, RetShape};
+use datalink_shim_codegen_core::interface_db::{
+    self, DispatchEntry, ListPrimElem, ParamShape, RetShape,
+};
 
 use crate::emit_wit;
 
@@ -127,6 +129,7 @@ ciborium = {{ version = "0.2", default-features = false }}
 ciborium-io = {{ version = "0.2", default-features = false }}
 serde = {{ version = "1", default-features = false, features = ["derive", "alloc"] }}
 serde_bytes = {{ version = "0.11", default-features = false, features = ["alloc"] }}
+serde_json = {{ version = "1", default-features = false, features = ["alloc"] }}
 
 [profile.release]
 opt-level = "s"
@@ -313,6 +316,43 @@ fn lib_rs(plan: &BridgePlan, opts: &DynlinkOptions) -> Result<String> {
             "[datafission-dynlink] {} scalar(s) skipped (non-primitive shapes not supported in Commit 6 scope):",
             skipped.len()
         );
+        // Shape-family histogram — helps triage what's worth admitting next.
+        use std::collections::BTreeMap;
+        let mut shape_hist: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for e in &skipped {
+            for p in &e.shape.params {
+                let name: &'static str = match p {
+                    ParamShape::Blob => "Blob",
+                    ParamShape::F64 => "F64",
+                    ParamShape::S32 => "S32",
+                    ParamShape::S64 => "S64",
+                    ParamShape::U32 => "U32",
+                    ParamShape::U64 => "U64",
+                    ParamShape::Bool => "Bool",
+                    ParamShape::Text => "Text",
+                    ParamShape::Geom => "Geom",
+                    ParamShape::Geog => "Geog",
+                    ParamShape::Raster => "Raster",
+                    ParamShape::Topology => "Topology",
+                    ParamShape::OptionNone => "OptionNone",
+                    ParamShape::ListGeom => "ListGeom",
+                    ParamShape::WitValueRecord { .. } => "WitValueRecord",
+                    ParamShape::Enum { .. } => "Enum",
+                    ParamShape::ListPrim(_) => "ListPrim",
+                    ParamShape::ListRecord { .. } => "ListRecord",
+                    ParamShape::ListListU8 => "ListListU8",
+                    ParamShape::ListListPrim(_) => "ListListPrim",
+                    ParamShape::ListListRecord { .. } => "ListListRecord",
+                    ParamShape::ListTuple { .. } => "ListTuple",
+                    ParamShape::ListTupleMixed { .. } => "ListTupleMixed",
+                };
+                *shape_hist.entry(name).or_insert(0) += 1;
+            }
+        }
+        eprintln!("[datafission-dynlink] skipped-arm param-shape histogram:");
+        for (k, v) in shape_hist {
+            eprintln!("  - {} × {}", k, v);
+        }
         for e in &skipped[..skipped.len().min(5)] {
             eprintln!("  - {}", e.sql_name);
         }
@@ -657,6 +697,8 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             | ParamShape::U32 | ParamShape::U64
             | ParamShape::Bool | ParamShape::Text
             | ParamShape::Geom | ParamShape::Raster | ParamShape::Topology
+            | ParamShape::Enum { .. }
+            | ParamShape::ListPrim(_)
     )) && matches!(ret,
         RetShape::Text | RetShape::Real | RetShape::Int
             | RetShape::Blob | RetShape::BoolInt
@@ -671,11 +713,16 @@ fn param_to_logicaltype_lit(p: &ParamShape) -> String {
         | ParamShape::Raster
         | ParamShape::Topology => "ftypes::LogicalType::Binary".to_string(),
         ParamShape::F64 => "ftypes::LogicalType::Float64".to_string(),
-        ParamShape::S32 | ParamShape::S64 | ParamShape::U32 | ParamShape::U64 => {
-            "ftypes::LogicalType::Int64".to_string()
-        }
+        ParamShape::S32
+        | ParamShape::S64
+        | ParamShape::U32
+        | ParamShape::U64
+        | ParamShape::Enum { .. } => "ftypes::LogicalType::Int64".to_string(),
         ParamShape::Bool => "ftypes::LogicalType::Boolean".to_string(),
-        ParamShape::Text => "ftypes::LogicalType::Utf8".to_string(),
+        // ListPrim arrives as a JSON-array TEXT literal at the SQL surface.
+        ParamShape::Text | ParamShape::ListPrim(_) => {
+            "ftypes::LogicalType::Utf8".to_string()
+        }
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
 }
@@ -737,6 +784,34 @@ fn emit_scalar_arm_body(
             ParamShape::Text => format!(
                 "                let {ident} = CborValue::Text(dfv_text(&args, {i}, \"{sql}\")?);\n"
             ),
+            // W3.3 (#543): WIT enum arg. The provider dispatcher already
+            // decodes the case ordinal from `CborValue::Uint` (see e.g.
+            // `as_pixel_type` in postgis_raster.rs) — dynlink mode
+            // forwards the SQL integer as-is; the provider crate handles
+            // WIT-enum construction.
+            ParamShape::Enum { .. } => format!(
+                "                let {ident} = CborValue::Uint(dfv_i64(&args, {i}, \"{sql}\")? as u64);\n"
+            ),
+            // W2 (#542): `list<primitive>` arg. SQL surface is a JSON-array
+            // TEXT literal (e.g. `'[1.0, 2.0, 3.0]'`). Parse locally into
+            // a `Vec<T>` and forward as `CborValue::List` — the provider
+            // dispatcher accepts CborValue::List of primitives (see e.g.
+            // `st-pixels-of-values` in postgis_raster.rs). No provider-side
+            // change required.
+            ParamShape::ListPrim(elem) => format!(
+                "                let {ident} = {{\n\
+                                     let text = dfv_text(&args, {i}, \"{sql}\")?;\n\
+                                     let v: Vec<{rust_ty}> = serde_json::from_str(&text)\n\
+                                         .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} must be JSON array of {suffix} ({{}})\", e)))?;\n\
+                                     CborValue::List(v.into_iter().map(|x| {cbor_wrap}).collect())\n\
+                                 }};\n",
+                rust_ty = list_prim_rust_ty(*elem),
+                suffix = elem.helper_suffix(),
+                cbor_wrap = list_prim_cbor_wrap(*elem),
+                ident = ident,
+                i = i,
+                sql = sql,
+            ),
             _ => format!(
                 "                let {ident} = CborValue::Null; // unsupported shape\n"
             ),
@@ -765,6 +840,43 @@ fn emit_scalar_arm_body(
     };
     lines.push_str(wrap);
     lines
+}
+
+/// Rust element type used by the emitted `serde_json::from_str::<Vec<_>>`
+/// invocation for a `ParamShape::ListPrim(elem)` arg. Mirrors the
+/// WacPlug-mode helper set — see `emit_lib::JSON_LIST_PRIM_HELPERS`.
+///
+/// F32 collapses to f64 on the wire because `CborValue::Float` is
+/// double-precision; there's no lossy narrowing since the provider
+/// dispatcher unwraps `CborValue::Float(f)` back to whichever concrete
+/// f32/f64 element type its typed WIT call expects.
+fn list_prim_rust_ty(elem: ListPrimElem) -> &'static str {
+    match elem {
+        ListPrimElem::F64 | ListPrimElem::F32 => "f64",
+        ListPrimElem::S32 => "i32",
+        ListPrimElem::S64 => "i64",
+        ListPrimElem::U32 => "u32",
+        ListPrimElem::U64 => "u64",
+        ListPrimElem::U8 => "u8",
+        ListPrimElem::Bool => "bool",
+        ListPrimElem::String => "String",
+    }
+}
+
+/// Per-element wrap expression the emitted arm applies while lowering a
+/// parsed `Vec<T>` into `CborValue::List(Vec<CborValue>)`. `x` is the
+/// closure param of the surrounding `into_iter().map(|x| ...)`.
+fn list_prim_cbor_wrap(elem: ListPrimElem) -> &'static str {
+    match elem {
+        ListPrimElem::F64 | ListPrimElem::F32 => "CborValue::Float(x)",
+        ListPrimElem::S32 => "CborValue::Int(x as i64)",
+        ListPrimElem::S64 => "CborValue::Int(x)",
+        ListPrimElem::U32 => "CborValue::Uint(x as u64)",
+        ListPrimElem::U64 => "CborValue::Uint(x)",
+        ListPrimElem::U8 => "CborValue::Uint(x as u64)",
+        ListPrimElem::Bool => "CborValue::Bool(x)",
+        ListPrimElem::String => "CborValue::Text(x)",
+    }
 }
 
 fn pick_primary_shim_dir(
