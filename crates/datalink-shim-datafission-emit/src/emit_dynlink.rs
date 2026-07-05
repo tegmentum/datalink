@@ -353,6 +353,57 @@ fn lib_rs(plan: &BridgePlan, opts: &DynlinkOptions) -> Result<String> {
         for (k, v) in shape_hist {
             eprintln!("  - {} × {}", k, v);
         }
+        // RetShape histogram — after the last param-shape round the
+        // remaining skips are dominated by the return side, so tallying
+        // return shapes tells the next iteration which variants to
+        // admit.
+        let mut ret_hist: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for e in &skipped {
+            let name: &'static str = match &e.shape.ret {
+                RetShape::Text => "Text",
+                RetShape::Real => "Real",
+                RetShape::Int => "Int",
+                RetShape::BoolInt => "BoolInt",
+                RetShape::Blob => "Blob",
+                RetShape::GeomBlob => "GeomBlob",
+                RetShape::RasterBlob => "RasterBlob",
+                RetShape::TopologyBlob => "TopologyBlob",
+                RetShape::TopoGeometryViaGeom => "TopoGeometryViaGeom",
+                RetShape::OptionText => "OptionText",
+                RetShape::OptionReal => "OptionReal",
+                RetShape::OptionInt => "OptionInt",
+                RetShape::OptionBlob => "OptionBlob",
+                RetShape::OptionGeomBlob => "OptionGeomBlob",
+                RetShape::OptionRasterBlob => "OptionRasterBlob",
+                RetShape::OptionTopologyBlob => "OptionTopologyBlob",
+                RetShape::FirstGeomBlob => "FirstGeomBlob",
+                RetShape::FirstRasterBlob => "FirstRasterBlob",
+                RetShape::FirstTopologyBlob => "FirstTopologyBlob",
+                RetShape::FirstOptionU32Int => "FirstOptionU32Int",
+                RetShape::BboxBlob => "BboxBlob",
+                RetShape::IsValidDetailText => "IsValidDetailText",
+                RetShape::Bbox3dWkbLineZ => "Bbox3dWkbLineZ",
+                RetShape::WitValueRecord { .. } => "WitValueRecord",
+                RetShape::OptionBoolInt => "OptionBoolInt",
+                RetShape::OptionWitValueRecord { .. } => "OptionWitValueRecord",
+                RetShape::FirstWitValueRecord { .. } => "FirstWitValueRecord",
+                RetShape::FirstInt => "FirstInt",
+                RetShape::FirstReal => "FirstReal",
+                RetShape::FirstText => "FirstText",
+                RetShape::Enum { .. } => "Enum",
+                RetShape::OptionEnum { .. } => "OptionEnum",
+                RetShape::JsonText { .. } => "JsonText",
+                RetShape::ListBool => "ListBool",
+                RetShape::ListListU8 => "ListListU8",
+                RetShape::TuplePick { .. } => "TuplePick",
+                RetShape::Unit => "Unit",
+            };
+            *ret_hist.entry(name).or_insert(0) += 1;
+        }
+        eprintln!("[datafission-dynlink] skipped-arm ret-shape histogram:");
+        for (k, v) in ret_hist {
+            eprintln!("  - {} × {}", k, v);
+        }
         for e in &skipped[..skipped.len().min(5)] {
             eprintln!("  - {}", e.sql_name);
         }
@@ -707,6 +758,18 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
         RetShape::Text | RetShape::Real | RetShape::Int
             | RetShape::Blob | RetShape::BoolInt
             | RetShape::GeomBlob | RetShape::RasterBlob | RetShape::TopologyBlob
+            // Option<T> returns — provider emits `CborValue::<T>` on
+            // Some and `CborValue::Null` on None; wrap side turns
+            // Null into `SqlValue::Null`.
+            | RetShape::OptionText | RetShape::OptionReal | RetShape::OptionInt
+            | RetShape::OptionBlob | RetShape::OptionGeomBlob
+            | RetShape::OptionRasterBlob | RetShape::OptionTopologyBlob
+            // list<T>-then-first projections — provider does the
+            // `.first()` conversion internally and emits Bytes (or
+            // Null when the list is empty). Same wire as *Blob for
+            // dynlink purposes.
+            | RetShape::FirstGeomBlob | RetShape::FirstRasterBlob
+            | RetShape::FirstTopologyBlob
     )
 }
 
@@ -744,13 +807,20 @@ fn param_to_logicaltype_lit_stub(p: &ParamShape) -> String {
 
 fn ret_to_logicaltype_lit(r: &RetShape) -> String {
     match r {
-        RetShape::Text => "ftypes::LogicalType::Utf8".to_string(),
-        RetShape::Real => "ftypes::LogicalType::Float64".to_string(),
-        RetShape::Int => "ftypes::LogicalType::Int64".to_string(),
+        RetShape::Text | RetShape::OptionText => "ftypes::LogicalType::Utf8".to_string(),
+        RetShape::Real | RetShape::OptionReal => "ftypes::LogicalType::Float64".to_string(),
+        RetShape::Int | RetShape::OptionInt => "ftypes::LogicalType::Int64".to_string(),
         RetShape::Blob
         | RetShape::GeomBlob
         | RetShape::RasterBlob
-        | RetShape::TopologyBlob => "ftypes::LogicalType::Binary".to_string(),
+        | RetShape::TopologyBlob
+        | RetShape::OptionBlob
+        | RetShape::OptionGeomBlob
+        | RetShape::OptionRasterBlob
+        | RetShape::OptionTopologyBlob
+        | RetShape::FirstGeomBlob
+        | RetShape::FirstRasterBlob
+        | RetShape::FirstTopologyBlob => "ftypes::LogicalType::Binary".to_string(),
         RetShape::BoolInt => "ftypes::LogicalType::Boolean".to_string(),
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
@@ -873,6 +943,22 @@ fn emit_scalar_arm_body(
         | RetShape::RasterBlob
         | RetShape::TopologyBlob => "                match resp { ResponseValue::Bytes(b) => Ok(ftypes::ScalarValue::Binary(b)), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
         RetShape::BoolInt => "                match resp { ResponseValue::Bool(b) => Ok(ftypes::ScalarValue::Boolean(b)), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        // Option<T> — provider emits `CborValue::T` on Some or
+        // `CborValue::Null` on None; forward None as SQL NULL.
+        RetShape::OptionText => "                match resp { ResponseValue::Text(s) => Ok(ftypes::ScalarValue::Utf8(s)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        RetShape::OptionReal => "                match resp { ResponseValue::Float(f) => Ok(ftypes::ScalarValue::Float64(f)), ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Float64(i as f64)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        RetShape::OptionInt => "                match resp { ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Int64(i)), ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Int64(u as i64)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        // Option<blob-shaped> — same Bytes/Null two-way as Blob but
+        // admits Null on the None side. Covers OptionBlob / raster /
+        // topology / geom, plus the First*Blob dispatch that emits
+        // Bytes (first element) or Null (empty list).
+        RetShape::OptionBlob
+        | RetShape::OptionGeomBlob
+        | RetShape::OptionRasterBlob
+        | RetShape::OptionTopologyBlob
+        | RetShape::FirstGeomBlob
+        | RetShape::FirstRasterBlob
+        | RetShape::FirstTopologyBlob => "                match resp { ResponseValue::Bytes(b) => Ok(ftypes::ScalarValue::Binary(b)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
         _ => "                Err(ftypes::FunctionError::ExecutionError(\"unsupported return shape\".to_string()))",
     };
     lines.push_str(wrap);
