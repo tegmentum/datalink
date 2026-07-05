@@ -154,21 +154,34 @@ fn world_wit(crate_name: &str) -> String {
 /// imports `compose:dynlink/linker` and dispatches every SQL arm
 /// through `resolve-by-id` + `invoke` against a resident provider.
 ///
-/// Scalar-first cut: only identity + metadata + scalar-function-
-/// registry are exported. Per `datafission:extension@1.0.0`'s doc
-/// comment, a plugin that doesn't provide a given category simply
-/// omits it from its world declaration; the loader detects what's
-/// exported via component-model introspection at load time.
+/// The world exports the full 10-interface datafission composite
+/// surface so `RuntimeWasmExtension::from_file` can bind against
+/// `ExtensionBindings::instantiate` without falling over a missing
+/// export. Scalar dispatch is the only category actually wired to
+/// the resident provider; the other six categories advertise empty
+/// registries (aggregate / window / table / multi-custom-type) or
+/// honest no-op stubs (spatial-index / system-catalog / index) so
+/// the runtime sees a structurally complete component even though
+/// only scalars route through `compose:dynlink/linker`.
 world bridge {{
     // Compose:dynlink linker — the only shim-side import.
     import compose:dynlink/linker@0.1.0;
 
-    // Datafission composite exports (the minimum surface needed for
-    // scalar-function dispatch).
+    // Host-provided logging — same package as `extension`.
     import datafission:extension/logging@1.0.0;
+
+    // Datafission composite exports — full 10-interface surface so
+    // the runtime's composite-world binding is satisfied.
     export datafission:extension/identity@1.0.0;
     export datafission:sql-extension-plugin/metadata@1.2.0;
+    export datafission:spatial-index-plugin/spatial-index@1.0.0;
+    export datafission:system-catalog-plugin/system-catalog@1.0.0;
     export datafission:function-plugin/scalar-function-registry@1.0.0;
+    export datafission:function-plugin/aggregate-function-registry@1.0.0;
+    export datafission:function-plugin/table-function-registry@1.0.0;
+    export datafission:function-plugin/window-function-registry@1.0.0;
+    export datafission:type-plugin/multi-custom-type@1.0.0;
+    export datafission:index-plugin/index@1.0.0;
 }}
 "#,
         pkg = pkg,
@@ -416,6 +429,14 @@ fn lib_rs(plan: &BridgePlan, opts: &DynlinkOptions) -> Result<String> {
     let api_version = "1.0.0".to_string();
     let provider_id = &opts.provider_id;
 
+    // Stubs for the six non-scalar exports — advertised as empty
+    // (aggregate / window / table / multi-custom-type) or honest
+    // no-op (spatial-index / system-catalog / index) so the composite
+    // world's `ExtensionBindings::instantiate` binding is satisfied.
+    // Mirrors the shape emit_lib.rs produces for wac-plug bridges,
+    // adapted for the dynlink bridge's no_std + alloc environment.
+    let non_scalar_stubs = build_non_scalar_stubs(primary);
+
     // Build the scalar_function_registry match arms.
     let mut metas_block = String::new();
     let mut return_arms = String::new();
@@ -501,10 +522,21 @@ mod bindings {{
 
 use bindings::datafission::function_plugin::types as ftypes;
 use bindings::datafission::sql_extension_plugin::types as setypes;
+use bindings::datafission::type_plugin::types as ttypes;
+use bindings::datafission::spatial_index_plugin::types as sitypes;
+use bindings::datafission::system_catalog_plugin::types as sctypes;
+use bindings::datafission::index_plugin::types as ixtypes;
 
 use bindings::exports::datafission::extension::identity;
 use bindings::exports::datafission::sql_extension_plugin::metadata as se_meta;
 use bindings::exports::datafission::function_plugin::scalar_function_registry;
+use bindings::exports::datafission::function_plugin::aggregate_function_registry;
+use bindings::exports::datafission::function_plugin::window_function_registry;
+use bindings::exports::datafission::function_plugin::table_function_registry;
+use bindings::exports::datafission::type_plugin::multi_custom_type;
+use bindings::exports::datafission::spatial_index_plugin::spatial_index;
+use bindings::exports::datafission::system_catalog_plugin::system_catalog;
+use bindings::exports::datafission::index_plugin::index;
 
 use bindings::compose::dynlink::linker;
 
@@ -580,6 +612,11 @@ struct Response {{
 // map form (`{{"Int": 42}}`) for backward compat with any wasm still
 // built against the old derive. Every visitor routes to the matching
 // ResponseValue variant.
+//
+// `List` admits `CborValue::List(...)` payloads used by `RetShape::
+// BboxBlob`, `ListListU8`, `ListBool`, and `JsonText` (nested list
+// of primitives). The variant carries `Vec<ResponseValue>` so nested
+// list-of-list shapes decode recursively.
 #[derive(Debug, Clone)]
 enum ResponseValue {{
     Null,
@@ -589,16 +626,17 @@ enum ResponseValue {{
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),
+    List(Vec<ResponseValue>),
 }}
 
 impl<'de> serde::Deserialize<'de> for ResponseValue {{
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {{
-        use serde::de::{{Error, MapAccess, Visitor}};
+        use serde::de::{{Error, MapAccess, SeqAccess, Visitor}};
         struct V;
         impl<'de> Visitor<'de> for V {{
             type Value = ResponseValue;
             fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {{
-                f.write_str("a CBOR value (null, bool, int, uint, float, text, bytes) or single-key map")
+                f.write_str("a CBOR value (null, bool, int, uint, float, text, bytes, list) or single-key map")
             }}
             fn visit_unit<E: Error>(self) -> Result<ResponseValue, E> {{
                 Ok(ResponseValue::Null)
@@ -630,6 +668,13 @@ impl<'de> serde::Deserialize<'de> for ResponseValue {{
             fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<ResponseValue, E> {{
                 Ok(ResponseValue::Bytes(v))
             }}
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ResponseValue, A::Error> {{
+                let mut items = Vec::new();
+                while let Some(v) = s.next_element::<ResponseValue>()? {{
+                    items.push(v);
+                }}
+                Ok(ResponseValue::List(items))
+            }}
             fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<ResponseValue, A::Error> {{
                 let k: Option<String> = m.next_key()?;
                 let k = k.ok_or_else(|| A::Error::custom("empty map for ResponseValue"))?;
@@ -644,6 +689,7 @@ impl<'de> serde::Deserialize<'de> for ResponseValue {{
                         let b: serde_bytes::ByteBuf = m.next_value()?;
                         ResponseValue::Bytes(b.into_vec())
                     }}
+                    "List" => ResponseValue::List(m.next_value()?),
                     other => return Err(A::Error::custom(alloc::format!("unknown ResponseValue tag: {{}}", other))),
                 }};
                 if let Some(extra) = m.next_key::<String>()? {{
@@ -654,6 +700,103 @@ impl<'de> serde::Deserialize<'de> for ResponseValue {{
         }}
         d.deserialize_any(V)
     }}
+}}
+
+// Serialize `ResponseValue` as a JSON-friendly tree — used only by
+// `response_to_json` below for `JsonText` / `ListListU8` / `ListBool`
+// returns. Bytes serialize as a JSON array of u8 numbers (matches
+// what WacPlug's `serde_json::to_string(&Vec<u8>)` produces on the
+// same shape — serde renders `Vec<u8>` as an array by default).
+impl serde::Serialize for ResponseValue {{
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {{
+        use serde::ser::SerializeSeq;
+        match self {{
+            ResponseValue::Null => s.serialize_unit(),
+            ResponseValue::Bool(b) => s.serialize_bool(*b),
+            ResponseValue::Int(i) => s.serialize_i64(*i),
+            ResponseValue::Uint(u) => s.serialize_u64(*u),
+            ResponseValue::Float(f) => s.serialize_f64(*f),
+            ResponseValue::Text(t) => s.serialize_str(t),
+            ResponseValue::Bytes(b) => {{
+                let mut seq = s.serialize_seq(Some(b.len()))?;
+                for byte in b {{
+                    seq.serialize_element(byte)?;
+                }}
+                seq.end()
+            }}
+            ResponseValue::List(items) => {{
+                let mut seq = s.serialize_seq(Some(items.len()))?;
+                for item in items {{
+                    seq.serialize_element(item)?;
+                }}
+                seq.end()
+            }}
+        }}
+    }}
+}}
+
+/// Render a `ResponseValue` as JSON text. Mirrors what WacPlug emits
+/// via `serde_json::to_string(&<upstream Rust value>)` for the same
+/// SQL arm. Records are the one non-generic case (WacPlug renders
+/// records as JSON objects with named fields, while the provider
+/// encodes them positionally as `CborValue::List(...)` on the wire,
+/// so record-based `JsonText` arms produce a positional array here
+/// rather than an object). All other `JsonText` kinds map
+/// byte-identically.
+fn response_to_json(v: &ResponseValue, ctx: &str) -> Result<String, ftypes::FunctionError> {{
+    serde_json::to_string(v).map_err(|e| {{
+        ftypes::FunctionError::ExecutionError(alloc::format!("{{}}: encode JSON: {{}}", ctx, e))
+    }})
+}}
+
+/// Build a WKB polygon (little-endian, type 3 POLYGON) from a
+/// `bbox {{ min_x, min_y, max_x, max_y }}`. Mirrors WacPlug's
+/// `pg_ctor::st_make_envelope` — a closed 5-point ring around the
+/// bbox. 93 bytes.
+fn bbox_to_wkb_polygon(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<u8> {{
+    let mut w: Vec<u8> = Vec::with_capacity(93);
+    w.push(0x01u8);
+    w.extend_from_slice(&3u32.to_le_bytes());
+    w.extend_from_slice(&1u32.to_le_bytes());
+    w.extend_from_slice(&5u32.to_le_bytes());
+    for (x, y) in [
+        (min_x, min_y),
+        (max_x, min_y),
+        (max_x, max_y),
+        (min_x, max_y),
+        (min_x, min_y),
+    ] {{
+        w.extend_from_slice(&x.to_le_bytes());
+        w.extend_from_slice(&y.to_le_bytes());
+    }}
+    w
+}}
+
+/// Decode a `ResponseValue::List` of 4 floats (xmin, ymin, xmax, ymax)
+/// into an owned `[f64; 4]`. Errors if the response isn't a 4-element
+/// list of floats — matches the provider's `st-extent` / bbox-returning
+/// arms' wire discipline.
+fn response_bbox_floats(v: &ResponseValue, ctx: &str) -> Result<[f64; 4], ftypes::FunctionError> {{
+    let items = match v {{
+        ResponseValue::List(items) => items,
+        other => return Err(ftypes::FunctionError::ExecutionError(
+            alloc::format!("{{}}: expected List of 4 floats, got {{:?}}", ctx, other))),
+    }};
+    if items.len() != 4 {{
+        return Err(ftypes::FunctionError::ExecutionError(
+            alloc::format!("{{}}: expected 4-element bbox list, got {{}}", ctx, items.len())));
+    }}
+    let mut out = [0.0f64; 4];
+    for (i, item) in items.iter().enumerate() {{
+        out[i] = match item {{
+            ResponseValue::Float(f) => *f,
+            ResponseValue::Int(n) => *n as f64,
+            ResponseValue::Uint(u) => *u as f64,
+            other => return Err(ftypes::FunctionError::ExecutionError(
+                alloc::format!("{{}}: bbox[{{}}] must be float, got {{:?}}", ctx, i, other))),
+        }};
+    }}
+    Ok(out)
 }}
 
 fn encode_request(args: Vec<CborValue>) -> Result<Vec<u8>, ftypes::FunctionError> {{
@@ -775,6 +918,8 @@ impl scalar_function_registry::Guest for Component {{
     }}
 }}
 
+{non_scalar_stubs}
+
 bindings::export!(Component with_types_in bindings);
 "##,
         provider_id = provider_id,
@@ -787,7 +932,369 @@ bindings::export!(Component with_types_in bindings);
         stub_meta = stub_meta,
         stub_return = stub_return,
         stub_execute = stub_execute,
+        non_scalar_stubs = non_scalar_stubs,
     ))
+}
+
+// ============================================================
+// Non-scalar Guest impl stubs.
+// ============================================================
+
+/// Concatenate all six non-scalar Guest impl blocks. Emitted after
+/// the scalar-function-registry impl so the composite bridge world
+/// has an export for every capability instance the runtime binds
+/// against. Every block is either advertise-empty
+/// (aggregate / window / table / multi-custom-type) or honest no-op
+/// (spatial-index / system-catalog / index).
+///
+/// Mirrors the shape emit_lib.rs produces for wac-plug bridges,
+/// adapted for the dynlink bridge's no_std + alloc environment
+/// (no `vec![]`, no std `format!` prelude, error types resolved
+/// through the interface-specific type alias).
+fn build_non_scalar_stubs(primary: &str) -> String {
+    let mut s = String::new();
+    s.push_str(AGGREGATE_STUB);
+    s.push_str(WINDOW_STUB);
+    s.push_str(TABLE_STUB);
+    s.push_str(MULTI_CUSTOM_TYPE_STUB);
+    s.push_str(SPATIAL_INDEX_STUB);
+    s.push_str(&build_system_catalog_stub(primary));
+    s.push_str(&build_index_stub(primary));
+    s
+}
+
+/// Advertises no aggregate functions; every per-call method returns
+/// `UnknownFunction`. Handle-scoped methods return
+/// `FunctionError::Internal` referencing the (non-existent) handle
+/// so a runtime that racks call ordering sees a clean diagnostic.
+const AGGREGATE_STUB: &str = r##"impl aggregate_function_registry::Guest for Component {
+    fn list_functions() -> Vec<ftypes::AggregateFunctionMeta> {
+        Vec::new()
+    }
+    fn return_type(name: String, _input_types: Vec<ftypes::LogicalType>)
+        -> Result<ftypes::LogicalType, ftypes::FunctionError>
+    {
+        Err(ftypes::FunctionError::UnknownFunction(name))
+    }
+    fn create_accumulator(name: String) -> Result<u64, ftypes::FunctionError> {
+        Err(ftypes::FunctionError::UnknownFunction(name))
+    }
+    fn create_accumulator_with_config(name: String, _config: String) -> Result<u64, ftypes::FunctionError> {
+        Err(ftypes::FunctionError::UnknownFunction(name))
+    }
+    fn create_accumulator_with_configs(name: String, _configs: Vec<String>) -> Result<u64, ftypes::FunctionError> {
+        Err(ftypes::FunctionError::UnknownFunction(name))
+    }
+    fn accumulate(handle: u64, _value: ftypes::ScalarValue) -> Result<(), ftypes::FunctionError> {
+        Err(ftypes::FunctionError::Internal(format!(
+            "no accumulator at handle {handle} (aggregates not wired in dynlink scalar-first cut)"
+        )))
+    }
+    fn accumulate_batch(handle: u64, _values: Vec<ftypes::ScalarValue>) -> Result<(), ftypes::FunctionError> {
+        Err(ftypes::FunctionError::Internal(format!(
+            "no accumulator at handle {handle} (aggregates not wired in dynlink scalar-first cut)"
+        )))
+    }
+    fn merge(target: u64, _source: u64) -> Result<(), ftypes::FunctionError> {
+        Err(ftypes::FunctionError::Internal(format!(
+            "no accumulator at handle {target} (aggregates not wired in dynlink scalar-first cut)"
+        )))
+    }
+    fn finalize(handle: u64) -> Result<ftypes::ScalarValue, ftypes::FunctionError> {
+        Err(ftypes::FunctionError::Internal(format!(
+            "no accumulator at handle {handle} (aggregates not wired in dynlink scalar-first cut)"
+        )))
+    }
+    fn reset(_handle: u64) {}
+    fn destroy_accumulator(_handle: u64) {}
+}
+
+"##;
+
+/// Advertises no window functions.
+const WINDOW_STUB: &str = r##"impl window_function_registry::Guest for Component {
+    fn list_functions() -> Vec<ftypes::WindowFunctionMeta> {
+        Vec::new()
+    }
+    fn return_type(name: String, _input_types: Vec<ftypes::LogicalType>)
+        -> Result<ftypes::LogicalType, ftypes::FunctionError>
+    {
+        Err(ftypes::FunctionError::UnknownFunction(name))
+    }
+    fn compute_partition(
+        name: String,
+        _args_rows: Vec<Vec<ftypes::ScalarValue>>,
+    ) -> Result<Vec<ftypes::ScalarValue>, ftypes::FunctionError> {
+        Err(ftypes::FunctionError::UnknownFunction(name))
+    }
+}
+
+"##;
+
+/// Advertises no table functions. `next_row` returns `None` on any
+/// handle since no iterator was ever created.
+const TABLE_STUB: &str = r##"impl table_function_registry::Guest for Component {
+    fn list_functions() -> Vec<ftypes::TableFunctionMeta> {
+        Vec::new()
+    }
+    fn output_schema(
+        name: String,
+        _input_types: Vec<ftypes::LogicalType>,
+    ) -> Result<Vec<ftypes::ColumnInfo>, ftypes::FunctionError> {
+        Err(ftypes::FunctionError::UnknownFunction(name))
+    }
+    fn begin(name: String, _args: Vec<ftypes::ScalarValue>) -> Result<u64, ftypes::FunctionError> {
+        Err(ftypes::FunctionError::UnknownFunction(name))
+    }
+    fn next_row(_handle: u64) -> Option<Result<Vec<ftypes::ScalarValue>, ftypes::FunctionError>> {
+        None
+    }
+    fn end(_handle: u64) {}
+}
+
+"##;
+
+/// Advertises no custom types; per-call ops return
+/// `TypeError::Internal`. The scalar-first dynlink bridge doesn't
+/// carry the record registry the WacPlug emitter uses to advertise
+/// wit-value records, so custom-type registration is a follow-up.
+const MULTI_CUSTOM_TYPE_STUB: &str = r##"impl multi_custom_type::Guest for Component {
+    fn list_types() -> Vec<multi_custom_type::CustomTypeMeta> {
+        Vec::new()
+    }
+    fn serialize(_type_id: u32, value: Vec<u8>) -> Vec<u8> { value }
+    fn deserialize(type_id: u32, _bytes: Vec<u8>) -> Result<Vec<u8>, ttypes::TypeError> {
+        Err(ttypes::TypeError::Internal(format!(
+            "dynlink bridge advertises no custom types (id {type_id})"
+        )))
+    }
+    fn compare(_type_id: u32, _a: Vec<u8>, _b: Vec<u8>) -> ttypes::Ordering {
+        ttypes::Ordering::Equal
+    }
+    fn hash_value(_type_id: u32, _value: Vec<u8>) -> u64 { 0 }
+    fn display(type_id: u32, _value: Vec<u8>) -> String {
+        format!("<type {type_id} (dynlink stub)>")
+    }
+    fn parse(type_id: u32, _input: String) -> Result<Vec<u8>, ttypes::TypeError> {
+        Err(ttypes::TypeError::Internal(format!(
+            "dynlink bridge advertises no custom types (id {type_id})"
+        )))
+    }
+}
+
+"##;
+
+/// Advertises no aliases, no capabilities; every op returns
+/// `SpatialError::UnsupportedOperation`. Downstream wac-plug bridges
+/// route the postgis STRtree through here; the dynlink bridge would
+/// dispatch through `compose:dynlink/linker` instead, but that path
+/// is deferred to a follow-up.
+const SPATIAL_INDEX_STUB: &str = r##"impl spatial_index::Guest for Component {
+    fn name() -> String { "dynlink-stub-spatial".to_string() }
+    fn aliases() -> Vec<String> { Vec::new() }
+    fn capabilities() -> sitypes::IndexCapabilities {
+        sitypes::IndexCapabilities {
+            knn: false,
+            within_distance: false,
+            within_distance_wkb: false,
+            update_after_build: false,
+        }
+    }
+    fn build(_items: Vec<sitypes::BuildItem>) -> Result<u64, sitypes::SpatialError> {
+        Err(sitypes::SpatialError::UnsupportedOperation(
+            "spatial-index not wired in dynlink scalar-first cut".to_string(),
+        ))
+    }
+    fn entry_count(_handle: u64) -> u64 { 0 }
+    fn query_envelope(_handle: u64, _env: sitypes::Envelope) -> Result<Vec<u64>, sitypes::SpatialError> {
+        Err(sitypes::SpatialError::UnsupportedOperation(
+            "spatial-index not wired in dynlink scalar-first cut".to_string(),
+        ))
+    }
+    fn query_knn(_handle: u64, _query_bytes: Vec<u8>, _k: u32) -> Result<Vec<u64>, sitypes::SpatialError> {
+        Err(sitypes::SpatialError::UnsupportedOperation(
+            "spatial-index not wired in dynlink scalar-first cut".to_string(),
+        ))
+    }
+    fn query_within_distance(_handle: u64, _query_env: sitypes::Envelope, _distance: f64) -> Result<Vec<u64>, sitypes::SpatialError> {
+        Err(sitypes::SpatialError::UnsupportedOperation(
+            "spatial-index not wired in dynlink scalar-first cut".to_string(),
+        ))
+    }
+    fn query_within_distance_wkb(_handle: u64, _query_wkb: Vec<u8>, _distance: f64) -> Result<Vec<u64>, sitypes::SpatialError> {
+        Err(sitypes::SpatialError::UnsupportedOperation(
+            "spatial-index not wired in dynlink scalar-first cut".to_string(),
+        ))
+    }
+    fn destroy(_handle: u64) {}
+}
+
+"##;
+
+/// `catalog_name()` reports the primary shim name so a host that
+/// enumerates catalogs sees a real provider; `list_tables()` returns
+/// the empty vector (honest discovery). Notify entrypoints stay
+/// no-ops. Read arms return a clearly labelled `CatalogError::Internal`.
+fn build_system_catalog_stub(primary: &str) -> String {
+    format!(
+        r##"impl system_catalog::Guest for Component {{
+    fn catalog_name() -> String {{ "{primary}".to_string() }}
+    fn list_tables() -> Result<Vec<sctypes::SystemTable>, sctypes::CatalogError> {{
+        Ok(Vec::new())
+    }}
+    fn read_table(
+        _table_name: String,
+    ) -> Result<Vec<Vec<sctypes::ScalarValue>>, sctypes::CatalogError> {{
+        Err(unimpl_catalog_err("read_table"))
+    }}
+    fn read_table_for_session(
+        _session_id: u64,
+        _table_name: String,
+    ) -> Result<Vec<Vec<sctypes::ScalarValue>>, sctypes::CatalogError> {{
+        Err(unimpl_catalog_err("read_table_for_session"))
+    }}
+    fn notify_extension_column_added(
+        _session_id: u64,
+        _catalog: String,
+        _schema: String,
+        _table_name: String,
+        _column_name: String,
+        _type_id: u32,
+        _srid: Option<i32>,
+        _coord_dim: Option<i32>,
+    ) {{}}
+    fn notify_extension_column_removed(
+        _session_id: u64,
+        _catalog: String,
+        _schema: String,
+        _table_name: String,
+        _column_name: String,
+    ) {{}}
+    fn notify_extension_column_raster_metadata(
+        _session_id: u64,
+        _catalog: String,
+        _schema: String,
+        _table_name: String,
+        _column_name: String,
+        _metadata: sctypes::RasterColumnMetadata,
+    ) {{}}
+}}
+
+fn unimpl_catalog_err(op: &str) -> sctypes::CatalogError {{
+    sctypes::CatalogError::Internal(format!(
+        "{primary} system-catalog-plugin: {{op}} not implemented \
+         (dynlink bridge advertises no catalog tables)"
+    ))
+}}
+
+"##,
+        primary = primary,
+    )
+}
+
+/// `name()` reports `<primary>-stub-index` so a host dumping the
+/// export by name doesn't mistake the stub for a real plugin;
+/// `type_id()` returns 0; `supported_types()` is empty; capabilities
+/// all false. Per-op methods return `IndexError::Internal` naming
+/// both the primary shim and the WIT method.
+fn build_index_stub(primary: &str) -> String {
+    let methods: &[(&str, &str, &str)] = &[
+        (
+            "create",
+            "_options: Vec<(String, String)>",
+            "Result<u64, ixtypes::IndexError>",
+        ),
+        (
+            "insert",
+            "_handle: u64, _key: Vec<ixtypes::ScalarValue>, _row_id: u64",
+            "Result<(), ixtypes::IndexError>",
+        ),
+        (
+            "delete",
+            "_handle: u64, _key: Vec<ixtypes::ScalarValue>",
+            "Result<bool, ixtypes::IndexError>",
+        ),
+        (
+            "contains",
+            "_handle: u64, _key: Vec<ixtypes::ScalarValue>",
+            "Result<bool, ixtypes::IndexError>",
+        ),
+        (
+            "get",
+            "_handle: u64, _key: Vec<ixtypes::ScalarValue>",
+            "Result<Option<u64>, ixtypes::IndexError>",
+        ),
+        (
+            "stats",
+            "_handle: u64",
+            "Result<ixtypes::IndexStats, ixtypes::IndexError>",
+        ),
+        (
+            "bulk_load",
+            "_handle: u64, _entries: Vec<ixtypes::IndexEntry>",
+            "Result<(), ixtypes::IndexError>",
+        ),
+        (
+            "serialize",
+            "_handle: u64",
+            "Result<Vec<u8>, ixtypes::IndexError>",
+        ),
+        (
+            "deserialize",
+            "_data: Vec<u8>",
+            "Result<u64, ixtypes::IndexError>",
+        ),
+    ];
+    let mut per_op = String::new();
+    for (method, params, ret) in methods {
+        per_op.push_str(&format!(
+            "    fn {method}({params}) -> {ret} {{\n        \
+             Err(unimpl_index_err(\"{method}\"))\n    }}\n",
+        ));
+    }
+    format!(
+        r##"impl index::Guest for Component {{
+    fn name() -> String {{ "{primary}-stub-index".to_string() }}
+    fn type_id() -> u32 {{ 0 }}
+    fn supported_types() -> Vec<ixtypes::LogicalType> {{ Vec::new() }}
+    fn capabilities() -> ixtypes::IndexCapabilities {{
+        ixtypes::IndexCapabilities {{
+            point_lookup: false,
+            range_scan: false,
+            prefix_scan: false,
+            ordering: false,
+            spatial_search: false,
+            fulltext_search: false,
+            approximate_membership: false,
+        }}
+    }}
+    fn destroy(_handle: u64) {{}}
+    fn begin_scan(
+        _handle: u64,
+        _start: ixtypes::ScanBound,
+        _end: ixtypes::ScanBound,
+        _direction: ixtypes::ScanDirection,
+        _limit: Option<u64>,
+    ) -> Result<u64, ixtypes::IndexError> {{
+        Err(unimpl_index_err("begin_scan"))
+    }}
+    fn next(_cursor: u64) -> Option<Result<ixtypes::IndexEntry, ixtypes::IndexError>> {{
+        None
+    }}
+    fn close_scan(_cursor: u64) {{}}
+{per_op}}}
+
+fn unimpl_index_err(op: &str) -> ixtypes::IndexError {{
+    ixtypes::IndexError::Internal(format!(
+        "{primary} index-plugin: {{op}} not implemented \
+         (dynlink bridge advertises no generic index)"
+    ))
+}}
+
+"##,
+        primary = primary,
+        per_op = per_op,
+    )
 }
 
 // ============================================================
@@ -845,6 +1352,16 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             // that the decode arm discards. Either way the SQL
             // surface is NULL.
             | RetShape::Unit
+            // #823 W4b: `List`-returning shapes decoded via
+            // `ResponseValue::List(...)`. `BboxBlob` decodes 4
+            // floats and re-encodes as WKB polygon (matches
+            // WacPlug's `pg_ctor::st_make_envelope`). `ListListU8`
+            // / `ListBool` / `JsonText` render as JSON text via
+            // `response_to_json`.
+            | RetShape::BboxBlob
+            | RetShape::ListListU8
+            | RetShape::ListBool
+            | RetShape::JsonText { .. }
     )
 }
 
@@ -901,11 +1418,18 @@ fn ret_to_logicaltype_lit(r: &RetShape) -> String {
         | RetShape::OptionTopologyBlob
         | RetShape::FirstGeomBlob
         | RetShape::FirstRasterBlob
-        | RetShape::FirstTopologyBlob => "ftypes::LogicalType::Binary".to_string(),
+        | RetShape::FirstTopologyBlob
+        // BboxBlob — WKB polygon (matches WacPlug's
+        // `pg_ctor::st_make_envelope`).
+        | RetShape::BboxBlob => "ftypes::LogicalType::Binary".to_string(),
         RetShape::BoolInt => "ftypes::LogicalType::Boolean".to_string(),
         // `result<_, E>` unit-OK — SQL NULL. Advertise as Binary
         // so the neutral logical type marshals a NULL cleanly.
         RetShape::Unit => "ftypes::LogicalType::Binary".to_string(),
+        // #823 W4b: JSON-text returns (matches WacPlug's Utf8 surface).
+        RetShape::ListListU8
+        | RetShape::ListBool
+        | RetShape::JsonText { .. } => "ftypes::LogicalType::Utf8".to_string(),
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
 }
@@ -1058,6 +1582,27 @@ fn emit_scalar_arm_body(
         // — return the modified topology bytes). Discard the
         // payload uniformly.
         RetShape::Unit => "                let _ = resp; Ok(ftypes::ScalarValue::Null)",
+        // #823 W4b: `BboxBlob` — provider emits `CborValue::List([Float; 4])`
+        // (xmin, ymin, xmax, ymax); decode 4 floats and re-wrap as WKB
+        // POLYGON matching WacPlug's `pg_ctor::st_make_envelope`.
+        RetShape::BboxBlob => "                let bb = response_bbox_floats(&resp, \"bbox\")?;\n                Ok(ftypes::ScalarValue::Binary(bbox_to_wkb_polygon(bb[0], bb[1], bb[2], bb[3])))",
+        // #823 W4b: `ListListU8` / `ListBool` — provider emits
+        // `CborValue::List(Vec<Bytes>)` or `CborValue::List(Vec<Bool>)`;
+        // render as JSON text (symmetric with WacPlug's
+        // `serde_json::to_string(&Vec<Vec<u8>>)` / `Vec<bool>` output).
+        RetShape::ListListU8 | RetShape::ListBool => "                let s = response_to_json(&resp, \"list\")?;\n                Ok(ftypes::ScalarValue::Utf8(s))",
+        // #823 W4b: `JsonText { ... }` — provider emits `CborValue::List(...)`
+        // (nested list of primitives / bytes). Render as JSON text via
+        // `response_to_json`. Record-kind sub-variants render as
+        // positional arrays here rather than named-field objects
+        // (WacPlug's default via serde's record derive) — best-effort
+        // for the non-record kinds (ListListPrim, ListTuplePrim,
+        // TuplePrim, OptionListPrim, OptionListTuplePrim,
+        // OptionTuplePrim, OptionTuplePrimOrOptPrim); record-shaped
+        // JsonRetKinds (OptionListPrimRecord / OptionListRecord /
+        // ListTupleGeomF64) surface as positional arrays instead of
+        // objects (accepted trade-off for the W4b landing).
+        RetShape::JsonText { .. } => "                match resp {\n                    ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n                    other => {\n                        let s = response_to_json(&other, \"json\")?;\n                        Ok(ftypes::ScalarValue::Utf8(s))\n                    }\n                }",
         _ => "                Err(ftypes::FunctionError::ExecutionError(\"unsupported return shape\".to_string()))",
     };
     lines.push_str(wrap);
