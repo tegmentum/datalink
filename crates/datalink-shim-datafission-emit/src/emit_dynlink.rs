@@ -477,6 +477,7 @@ enum CborValue {{
     Float(f64),
     Text(String),
     Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
+    List(Vec<CborValue>),
 }}
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -696,9 +697,12 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             | ParamShape::S32 | ParamShape::S64
             | ParamShape::U32 | ParamShape::U64
             | ParamShape::Bool | ParamShape::Text
-            | ParamShape::Geom | ParamShape::Raster | ParamShape::Topology
+            | ParamShape::Geom | ParamShape::Geog
+            | ParamShape::Raster | ParamShape::Topology
+            | ParamShape::OptionNone
             | ParamShape::Enum { .. }
             | ParamShape::ListPrim(_)
+            | ParamShape::ListListU8
     )) && matches!(ret,
         RetShape::Text | RetShape::Real | RetShape::Int
             | RetShape::Blob | RetShape::BoolInt
@@ -710,6 +714,7 @@ fn param_to_logicaltype_lit(p: &ParamShape) -> String {
     match p {
         ParamShape::Blob
         | ParamShape::Geom
+        | ParamShape::Geog
         | ParamShape::Raster
         | ParamShape::Topology => "ftypes::LogicalType::Binary".to_string(),
         ParamShape::F64 => "ftypes::LogicalType::Float64".to_string(),
@@ -719,10 +724,14 @@ fn param_to_logicaltype_lit(p: &ParamShape) -> String {
         | ParamShape::U64
         | ParamShape::Enum { .. } => "ftypes::LogicalType::Int64".to_string(),
         ParamShape::Bool => "ftypes::LogicalType::Boolean".to_string(),
-        // ListPrim arrives as a JSON-array TEXT literal at the SQL surface.
-        ParamShape::Text | ParamShape::ListPrim(_) => {
-            "ftypes::LogicalType::Utf8".to_string()
-        }
+        // ListPrim + ListListU8 arrive as a JSON-array TEXT literal
+        // at the SQL surface. OptionNone consumes a SQL slot (see
+        // WacPlug's `param_to_logicaltype_lit`) whose value the arm
+        // body ignores; Utf8 matches the WacPlug convention.
+        ParamShape::Text
+        | ParamShape::ListPrim(_)
+        | ParamShape::ListListU8
+        | ParamShape::OptionNone => "ftypes::LogicalType::Utf8".to_string(),
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
 }
@@ -765,9 +774,20 @@ fn emit_scalar_arm_body(
         let decode = match p {
             ParamShape::Blob
             | ParamShape::Geom
+            | ParamShape::Geog
             | ParamShape::Raster
             | ParamShape::Topology => format!(
                 "                let {ident} = CborValue::Bytes(dfv_blob(&args, {i}, \"{sql}\")?);\n"
+            ),
+            // Option<T> param the codegen elects to default. Mirrors
+            // the WacPlug `emit_scalar_arm_body` convention: no SQL
+            // arg is decoded, we just forward `CborValue::Null` so
+            // the payload_args order stays aligned with the WIT
+            // param position. WacPlug's `param_to_logicaltype_lit`
+            // still emits a Utf8 SQL slot for OptionNone; the
+            // per-arm decode ignores it.
+            ParamShape::OptionNone => format!(
+                "                let {ident} = CborValue::Null;\n"
             ),
             ParamShape::F64 => format!(
                 "                let {ident} = CborValue::Float(dfv_f64(&args, {i}, \"{sql}\")?);\n"
@@ -808,6 +828,23 @@ fn emit_scalar_arm_body(
                 rust_ty = list_prim_rust_ty(*elem),
                 suffix = elem.helper_suffix(),
                 cbor_wrap = list_prim_cbor_wrap(*elem),
+                ident = ident,
+                i = i,
+                sql = sql,
+            ),
+            // #674: `list<list<u8>>` — batched WKB blobs surfaced by
+            // postgis's `st_*_batch` family. SQL passes JSON text
+            // matching `Vec<Vec<u8>>` (nested arrays of byte
+            // integers); parse locally and forward as
+            // `CborValue::List(Vec<CborValue::Bytes>)` — the
+            // symmetric wire shape for the provider dispatcher.
+            ParamShape::ListListU8 => format!(
+                "                let {ident} = {{\n\
+                                     let text = dfv_text(&args, {i}, \"{sql}\")?;\n\
+                                     let v: Vec<Vec<u8>> = serde_json::from_str(&text)\n\
+                                         .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} must be JSON list<list<u8>> ({{}})\", e)))?;\n\
+                                     CborValue::List(v.into_iter().map(CborValue::Bytes).collect())\n\
+                                 }};\n",
                 ident = ident,
                 i = i,
                 sql = sql,
