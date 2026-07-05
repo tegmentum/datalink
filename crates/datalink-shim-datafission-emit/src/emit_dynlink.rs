@@ -519,7 +519,15 @@ fn resolve() -> Result<linker::Instance, ftypes::FunctionError> {{
 // CBOR envelope (mirrors provider crate's Request/Response).
 // -----------------------------------------------------------
 
-#[derive(Debug, Clone, serde::Serialize)]
+// CborValue pins the wire form at the bare CBOR type of each variant
+// via manual `Serialize` — matching the provider-side envelope. The
+// derive would emit unit variant `Null` as bare CBOR text `"Null"`
+// (variant name) and tuple variant `Int(42)` as map `{{"Int": 42}}`;
+// that asymmetry lands `CborValue::Null` on the wire as text and the
+// provider decodes it as `Text("Null")`. The custom impl emits every
+// variant as its native CBOR type (Null -> null, Bool -> bool, etc.)
+// so the round-trip is symmetric on both sides.
+#[derive(Debug, Clone)]
 enum CborValue {{
     Null,
     Bool(bool),
@@ -527,8 +535,30 @@ enum CborValue {{
     Uint(u64),
     Float(f64),
     Text(String),
-    Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
+    Bytes(Vec<u8>),
     List(Vec<CborValue>),
+}}
+
+impl serde::Serialize for CborValue {{
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {{
+        match self {{
+            CborValue::Null => s.serialize_unit(),
+            CborValue::Bool(b) => s.serialize_bool(*b),
+            CborValue::Int(i) => s.serialize_i64(*i),
+            CborValue::Uint(u) => s.serialize_u64(*u),
+            CborValue::Float(f) => s.serialize_f64(*f),
+            CborValue::Text(t) => s.serialize_str(t),
+            CborValue::Bytes(b) => s.serialize_bytes(b),
+            CborValue::List(items) => {{
+                use serde::ser::SerializeSeq;
+                let mut seq = s.serialize_seq(Some(items.len()))?;
+                for item in items {{
+                    seq.serialize_element(item)?;
+                }}
+                seq.end()
+            }}
+        }}
+    }}
 }}
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -545,8 +575,11 @@ struct Response {{
     err: Option<String>,
 }}
 
-// Response `ok` uses the same single-key-map disambiguation the
-// provider crate emits.
+// Response `ok` accepts either the bare CBOR wire type (new form,
+// matches the provider's manual Serialize) or the legacy single-key
+// map form (`{{"Int": 42}}`) for backward compat with any wasm still
+// built against the old derive. Every visitor routes to the matching
+// ResponseValue variant.
 #[derive(Debug, Clone)]
 enum ResponseValue {{
     Null,
@@ -565,7 +598,37 @@ impl<'de> serde::Deserialize<'de> for ResponseValue {{
         impl<'de> Visitor<'de> for V {{
             type Value = ResponseValue;
             fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {{
-                f.write_str("a single-key CBOR map for a Response::Ok value")
+                f.write_str("a CBOR value (null, bool, int, uint, float, text, bytes) or single-key map")
+            }}
+            fn visit_unit<E: Error>(self) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Null)
+            }}
+            fn visit_none<E: Error>(self) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Null)
+            }}
+            fn visit_bool<E: Error>(self, v: bool) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Bool(v))
+            }}
+            fn visit_i64<E: Error>(self, v: i64) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Int(v))
+            }}
+            fn visit_u64<E: Error>(self, v: u64) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Uint(v))
+            }}
+            fn visit_f64<E: Error>(self, v: f64) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Float(v))
+            }}
+            fn visit_str<E: Error>(self, v: &str) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Text(v.to_string()))
+            }}
+            fn visit_string<E: Error>(self, v: String) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Text(v))
+            }}
+            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Bytes(v.to_vec()))
+            }}
+            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Bytes(v))
             }}
             fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<ResponseValue, A::Error> {{
                 let k: Option<String> = m.next_key()?;
@@ -589,7 +652,7 @@ impl<'de> serde::Deserialize<'de> for ResponseValue {{
                 Ok(v)
             }}
         }}
-        d.deserialize_map(V)
+        d.deserialize_any(V)
     }}
 }}
 
