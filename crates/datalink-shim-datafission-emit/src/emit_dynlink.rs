@@ -656,6 +656,7 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             | ParamShape::S32 | ParamShape::S64
             | ParamShape::U32 | ParamShape::U64
             | ParamShape::Bool | ParamShape::Text
+            | ParamShape::Geom | ParamShape::Raster | ParamShape::Topology
     )) && matches!(ret,
         RetShape::Text | RetShape::Real | RetShape::Int
             | RetShape::Blob | RetShape::BoolInt
@@ -665,7 +666,10 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
 
 fn param_to_logicaltype_lit(p: &ParamShape) -> String {
     match p {
-        ParamShape::Blob => "ftypes::LogicalType::Binary".to_string(),
+        ParamShape::Blob
+        | ParamShape::Geom
+        | ParamShape::Raster
+        | ParamShape::Topology => "ftypes::LogicalType::Binary".to_string(),
         ParamShape::F64 => "ftypes::LogicalType::Float64".to_string(),
         ParamShape::S32 | ParamShape::S64 | ParamShape::U32 | ParamShape::U64 => {
             "ftypes::LogicalType::Int64".to_string()
@@ -712,7 +716,10 @@ fn emit_scalar_arm_body(
     for (i, p) in params.iter().enumerate() {
         let ident = format!("a{}", i);
         let decode = match p {
-            ParamShape::Blob => format!(
+            ParamShape::Blob
+            | ParamShape::Geom
+            | ParamShape::Raster
+            | ParamShape::Topology => format!(
                 "                let {ident} = CborValue::Bytes(dfv_blob(&args, {i}, \"{sql}\")?);\n"
             ),
             ParamShape::F64 => format!(
