@@ -833,6 +833,18 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             // dynlink purposes.
             | RetShape::FirstGeomBlob | RetShape::FirstRasterBlob
             | RetShape::FirstTopologyBlob
+            // list<primitive>-then-first projections — provider does
+            // the `.first()` conversion and emits `CborValue::<T>`
+            // (or Null when the list is empty). Same wire as
+            // Option<T> for dynlink purposes.
+            | RetShape::FirstInt | RetShape::FirstReal | RetShape::FirstText
+            // `result<_, E>` unit-OK — surfaces as SQL NULL. The
+            // provider dispatcher may emit `CborValue::Null` for
+            // pure mutators or a fallback payload (bytes for
+            // topology mutators that return the modified topo)
+            // that the decode arm discards. Either way the SQL
+            // surface is NULL.
+            | RetShape::Unit
     )
 }
 
@@ -870,9 +882,15 @@ fn param_to_logicaltype_lit_stub(p: &ParamShape) -> String {
 
 fn ret_to_logicaltype_lit(r: &RetShape) -> String {
     match r {
-        RetShape::Text | RetShape::OptionText => "ftypes::LogicalType::Utf8".to_string(),
-        RetShape::Real | RetShape::OptionReal => "ftypes::LogicalType::Float64".to_string(),
-        RetShape::Int | RetShape::OptionInt => "ftypes::LogicalType::Int64".to_string(),
+        RetShape::Text | RetShape::OptionText | RetShape::FirstText => {
+            "ftypes::LogicalType::Utf8".to_string()
+        }
+        RetShape::Real | RetShape::OptionReal | RetShape::FirstReal => {
+            "ftypes::LogicalType::Float64".to_string()
+        }
+        RetShape::Int | RetShape::OptionInt | RetShape::FirstInt => {
+            "ftypes::LogicalType::Int64".to_string()
+        }
         RetShape::Blob
         | RetShape::GeomBlob
         | RetShape::RasterBlob
@@ -885,6 +903,9 @@ fn ret_to_logicaltype_lit(r: &RetShape) -> String {
         | RetShape::FirstRasterBlob
         | RetShape::FirstTopologyBlob => "ftypes::LogicalType::Binary".to_string(),
         RetShape::BoolInt => "ftypes::LogicalType::Boolean".to_string(),
+        // `result<_, E>` unit-OK — SQL NULL. Advertise as Binary
+        // so the neutral logical type marshals a NULL cleanly.
+        RetShape::Unit => "ftypes::LogicalType::Binary".to_string(),
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
 }
@@ -1022,6 +1043,21 @@ fn emit_scalar_arm_body(
         | RetShape::FirstGeomBlob
         | RetShape::FirstRasterBlob
         | RetShape::FirstTopologyBlob => "                match resp { ResponseValue::Bytes(b) => Ok(ftypes::ScalarValue::Binary(b)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        // list<T>-then-first primitive projections — provider does
+        // the `.first()` conversion and emits `CborValue::<T>` on
+        // a non-empty list or `CborValue::Null` on empty. Mirrors
+        // the Option<T> wrap arms; Int/Uint are both accepted for
+        // FirstInt so U32/U64 element lists lower cleanly.
+        RetShape::FirstInt => "                match resp { ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Int64(i)), ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Int64(u as i64)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        RetShape::FirstReal => "                match resp { ResponseValue::Float(f) => Ok(ftypes::ScalarValue::Float64(f)), ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Float64(i as f64)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        RetShape::FirstText => "                match resp { ResponseValue::Text(s) => Ok(ftypes::ScalarValue::Utf8(s)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        // `result<_, E>` unit-OK — WIT return is `()`. SQL surface
+        // is NULL regardless of what the provider dispatcher put
+        // in the response payload (some mutator arms emit
+        // `CborValue::Null`; others — notably topology mutators
+        // — return the modified topology bytes). Discard the
+        // payload uniformly.
+        RetShape::Unit => "                let _ = resp; Ok(ftypes::ScalarValue::Null)",
         _ => "                Err(ftypes::FunctionError::ExecutionError(\"unsupported return shape\".to_string()))",
     };
     lines.push_str(wrap);
