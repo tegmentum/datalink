@@ -87,6 +87,34 @@ fn dynlink_emit_produces_compilable_small_bridge() {
         "lib.rs must contain at least one SFCGAL arm (st_volume)"
     );
 
+    // Aggregate registry smoke check: real dispatch replaces the
+    // scalar-first stub. The AccState struct + SyncRefCell static
+    // shells + at least one wired postgis-core aggregate finalize
+    // arm (st-union-aggregate) must be present. Also asserts that
+    // out-of-scope aggregates (raster / record variants) still get
+    // an UnknownFunction arm rather than silently vanishing.
+    assert!(
+        lib_rs.contains("struct AccState") && lib_rs.contains("static ACCUMULATORS"),
+        "aggregate accumulator state block missing"
+    );
+    // The classifier surfaces aggregate sql_names in snake_case
+    // (matches the scalar path); the provider-side wire name spelling
+    // is the same for both families and orthogonal to this test.
+    assert!(
+        lib_rs.contains("st_union_aggregate"),
+        "st_union_aggregate metadata missing"
+    );
+    // Wired-finalize body signature: builds a CborValue::List of the
+    // accumulated blobs and routes through `call(...)`.
+    assert!(
+        lib_rs.contains("st.blobs.iter().map(|b| CborValue::Bytes(b.clone()))"),
+        "wired aggregate finalize body missing (geom_list construction)"
+    );
+    assert!(
+        lib_rs.contains("aggregate shape not yet wired in dynlink mode"),
+        "stub aggregate finalize body missing (raster/record variants)"
+    );
+
     // Structural: SFCGAL-family SQL names use snake_case.
     let sfcgal_arms = [
         "st_volume",

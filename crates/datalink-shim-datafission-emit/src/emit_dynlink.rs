@@ -23,10 +23,16 @@
 //! returns `FunctionError::UnknownFunction("<name>: not-yet
 //! supported in dynlink mode")`.
 //!
-//! Aggregates / UDTFs / window functions: emitted as empty
-//! registries. They can be added in a follow-up.
+//! UDTFs / window functions: emitted as empty registries. Aggregates
+//! now wire real dispatch through the CBOR envelope for `AccKind::Geom`
+//! arms with no extras (the plurality of the postgis surface —
+//! `st_union_aggregate`, `st_polygonize_aggregate`, `st_collect_aggregate`,
+//! `st_extent`, `st_extent_threed`, etc.). Other AccKind variants
+//! (Raster, Record, RecordToScalar/Tuple/ListPrim, RecordSetToRecordSet)
+//! still surface in `list_functions` for discoverability but their
+//! `finalize` returns `UnknownFunction`. See `build_aggregate_registry_impl_dynlink`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -34,7 +40,7 @@ use anyhow::{anyhow, Result};
 
 use shim_bridge_codegen_core::BridgePlan;
 use datalink_shim_codegen_core::interface_db::{
-    self, DispatchEntry, ListPrimElem, ParamShape, RetShape,
+    self, AccKind, AggregateEntry, DispatchEntry, ListPrimElem, ParamShape, RetShape,
 };
 
 use crate::emit_wit;
@@ -311,6 +317,17 @@ fn lib_rs(plan: &BridgePlan, opts: &DynlinkOptions) -> Result<String> {
     let (scalar_entries, _unwired) =
         interface_db::build_full(plan, &shim_wit_dir, &[])?;
 
+    // Reuse the WacPlug aggregate classifier. Failures degrade to an
+    // empty list so a shim without aggregates still emits cleanly.
+    let aggregate_entries: Vec<AggregateEntry> =
+        match interface_db::build_aggregate_registry(plan, &shim_wit_dir, &[]) {
+            Ok((entries, _agg_unwired)) => entries,
+            Err(e) => {
+                eprintln!("[datafission-dynlink] build_aggregate_registry failed: {e}");
+                Vec::new()
+            }
+        };
+
     // Filter to primitive-only shapes and partition by sub-extension.
     // For Commit 6 we scope to the sub-ext the bridge is being emitted
     // for; other sub-exts get emitted as unwired stubs (list_functions
@@ -429,13 +446,28 @@ fn lib_rs(plan: &BridgePlan, opts: &DynlinkOptions) -> Result<String> {
     let api_version = "1.0.0".to_string();
     let provider_id = &opts.provider_id;
 
-    // Stubs for the six non-scalar exports — advertised as empty
-    // (aggregate / window / table / multi-custom-type) or honest
-    // no-op (spatial-index / system-catalog / index) so the composite
-    // world's `ExtensionBindings::instantiate` binding is satisfied.
-    // Mirrors the shape emit_lib.rs produces for wac-plug bridges,
-    // adapted for the dynlink bridge's no_std + alloc environment.
-    let non_scalar_stubs = build_non_scalar_stubs(primary);
+    // Build the aggregate_function_registry impl. Wired arms are
+    // `AccKind::Geom` with `extra_args.is_empty()` and a supported
+    // return shape (GeomBlob / BboxBlob / Bbox3dWkbLineZ / Real /
+    // Int / Text plus their Option variants); other AccKind
+    // variants surface in `list_functions` for SQL discoverability
+    // but their `finalize` returns `UnknownFunction`. Empty entry
+    // list falls back to the empty-registry stub.
+    let (aggregate_impl_block, agg_wired, agg_stubbed) =
+        build_aggregate_registry_impl_dynlink(&aggregate_entries);
+    eprintln!(
+        "[datafission-dynlink] aggregate entries: {} wired, {} stubbed",
+        agg_wired, agg_stubbed
+    );
+
+    // Stubs for the five non-aggregate non-scalar exports —
+    // advertised as empty (window / table / multi-custom-type) or
+    // honest no-op (spatial-index / system-catalog / index) so the
+    // composite world's `ExtensionBindings::instantiate` binding is
+    // satisfied. Mirrors the shape emit_lib.rs produces for wac-plug
+    // bridges, adapted for the dynlink bridge's no_std + alloc
+    // environment.
+    let non_scalar_stubs = build_non_scalar_stubs(primary, &aggregate_impl_block);
 
     // Build the scalar_function_registry match arms.
     let mut metas_block = String::new();
@@ -465,7 +497,14 @@ fn lib_rs(plan: &BridgePlan, opts: &DynlinkOptions) -> Result<String> {
         ));
 
         // Execute arm body: build CBOR Request::args, invoke, decode Response.
-        let body = emit_scalar_arm_body(sql, &entry.shape.params, &entry.shape.ret, *fallible);
+        // The provider dispatcher matches on the WIT method name in
+        // kebab-case (see e.g. `"st-geom-from-text"` in
+        // postgis-wasm/crates/provider/src/dispatch/postgis_core.rs).
+        // `entry.sql_name` is the postgis SQL alias in snake_case
+        // (`st_geomfromtext`) and doesn't match — use the WIT function
+        // name (`st_geom_from_text`) converted to kebab.
+        let invoke_name = entry.shape.wit_func.replace('_', "-");
+        let body = emit_scalar_arm_body(sql, &invoke_name, &entry.shape.params, &entry.shape.ret, *fallible);
         execute_arms.push_str(&format!(
             "            \"{escaped}\" => {{\n{body}\n            }}\n",
         ));
@@ -595,6 +634,14 @@ impl serde::Serialize for CborValue {{
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct Request {{
+    // The provider's envelope decoder (postgis-wasm-provider's
+    // `envelope::Request`) declares `#[serde(rename = "v")] version`
+    // — the wire form of the version tag is the one-char key `v`,
+    // not `version`. Missing this rename here surfaces at the
+    // FIRST dynlink call as `envelope decode: Semantic(None,
+    // "missing field `v`")` because ciborium round-trips struct
+    // field names verbatim.
+    #[serde(rename = "v")]
     version: u32,
     args: Vec<CborValue>,
 }}
@@ -770,6 +817,54 @@ fn bbox_to_wkb_polygon(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<u8
         w.extend_from_slice(&y.to_le_bytes());
     }}
     w
+}}
+
+/// Build a WKB linestring-Z (little-endian, type 1002 LINESTRING Z,
+/// 2 vertices) from a `bbox3d {{ min_x, min_y, min_z, max_x, max_y,
+/// max_z }}`. Mirrors WacPlug's `Bbox3dWkbLineZ` return-shape
+/// rendering — the diagonal from min-corner to max-corner preserves
+/// all six coordinates and parses as standard WKB. 57 bytes.
+fn bbox3d_to_wkb_linestring_z(
+    min_x: f64, min_y: f64, min_z: f64,
+    max_x: f64, max_y: f64, max_z: f64,
+) -> Vec<u8> {{
+    let mut w: Vec<u8> = Vec::with_capacity(57);
+    w.push(0x01u8);
+    w.extend_from_slice(&1002u32.to_le_bytes());
+    w.extend_from_slice(&2u32.to_le_bytes());
+    w.extend_from_slice(&min_x.to_le_bytes());
+    w.extend_from_slice(&min_y.to_le_bytes());
+    w.extend_from_slice(&min_z.to_le_bytes());
+    w.extend_from_slice(&max_x.to_le_bytes());
+    w.extend_from_slice(&max_y.to_le_bytes());
+    w.extend_from_slice(&max_z.to_le_bytes());
+    w
+}}
+
+/// Decode a `ResponseValue::List` of 6 floats (xmin, ymin, zmin,
+/// xmax, ymax, zmax) into an owned `[f64; 6]`. Matches the provider's
+/// `st-extent-threed` wire discipline.
+fn response_bbox3d_floats(v: &ResponseValue, ctx: &str) -> Result<[f64; 6], ftypes::FunctionError> {{
+    let items = match v {{
+        ResponseValue::List(items) => items,
+        other => return Err(ftypes::FunctionError::ExecutionError(
+            alloc::format!("{{}}: expected List of 6 floats, got {{:?}}", ctx, other))),
+    }};
+    if items.len() != 6 {{
+        return Err(ftypes::FunctionError::ExecutionError(
+            alloc::format!("{{}}: expected 6-element bbox3d list, got {{}}", ctx, items.len())));
+    }}
+    let mut out = [0.0f64; 6];
+    for (i, item) in items.iter().enumerate() {{
+        out[i] = match item {{
+            ResponseValue::Float(f) => *f,
+            ResponseValue::Int(n) => *n as f64,
+            ResponseValue::Uint(u) => *u as f64,
+            other => return Err(ftypes::FunctionError::ExecutionError(
+                alloc::format!("{{}}: bbox3d[{{}}] must be float, got {{:?}}", ctx, i, other))),
+        }};
+    }}
+    Ok(out)
 }}
 
 /// Decode a `ResponseValue::List` of 4 floats (xmin, ymin, xmax, ymax)
@@ -951,9 +1046,13 @@ bindings::export!(Component with_types_in bindings);
 /// adapted for the dynlink bridge's no_std + alloc environment
 /// (no `vec![]`, no std `format!` prelude, error types resolved
 /// through the interface-specific type alias).
-fn build_non_scalar_stubs(primary: &str) -> String {
+fn build_non_scalar_stubs(primary: &str, aggregate_impl: &str) -> String {
     let mut s = String::new();
-    s.push_str(AGGREGATE_STUB);
+    if aggregate_impl.is_empty() {
+        s.push_str(AGGREGATE_STUB);
+    } else {
+        s.push_str(aggregate_impl);
+    }
     s.push_str(WINDOW_STUB);
     s.push_str(TABLE_STUB);
     s.push_str(MULTI_CUSTOM_TYPE_STUB);
@@ -1441,6 +1540,7 @@ fn ret_to_logicaltype_lit_stub(r: &RetShape) -> String {
 
 fn emit_scalar_arm_body(
     sql: &str,
+    invoke_name: &str,
     params: &[ParamShape],
     ret: &RetShape,
     _fallible: bool,
@@ -1539,7 +1639,7 @@ fn emit_scalar_arm_body(
         arg_ident.join(", ")
     ));
     lines.push_str(&format!(
-        "                let resp = call(\"{sql}\", payload_args)?;\n"
+        "                let resp = call(\"{invoke_name}\", payload_args)?;\n"
     ));
     // Wrap response into ScalarValue.
     let wrap = match ret {
@@ -1644,6 +1744,442 @@ fn list_prim_cbor_wrap(elem: ListPrimElem) -> &'static str {
         ListPrimElem::Bool => "CborValue::Bool(x)",
         ListPrimElem::String => "CborValue::Text(x)",
     }
+}
+
+// ============================================================
+// Aggregate registry — real dispatch through the dynlink bridge.
+// ============================================================
+//
+// Structure mirrors `emit_lib.rs::build_aggregate_registry_impl`,
+// but the finalize body routes through the CBOR envelope instead of
+// calling the upstream `pg_agg` WIT function directly. Per-handle
+// state (a `Vec<Vec<u8>>` of WKB payloads pushed by `accumulate`) is
+// shipped verbatim as `CborValue::List(<Bytes...>)` to the resident
+// provider; the provider decodes each element via
+// `marshal::decode_geometry_list` and calls the upstream aggregator.
+//
+// Wire scope: `AccKind::Geom` aggregates with `extra_args.is_empty()`
+// and a supported return shape (`GeomBlob` / `OptionGeomBlob` /
+// `BboxBlob` / `Bbox3dWkbLineZ` / `Real` / `OptionReal` / `Int` /
+// `OptionInt` / `Text` / `OptionText`). Everything else surfaces in
+// `list_functions` so the SQL layer sees it, but `finalize` returns
+// `UnknownFunction` for out-of-scope arms (Raster, record-typed
+// mobilitydb aggregates, etc.). The stubs can be lifted in a
+// follow-up once the marshal helpers land here.
+
+fn build_aggregate_registry_impl_dynlink(
+    agg_entries: &[AggregateEntry],
+) -> (String, usize, usize) {
+    if agg_entries.is_empty() {
+        return (String::new(), 0, 0);
+    }
+
+    // Assign one arm_idx per canonical sql_name; aliases reuse the
+    // canonical's arm_idx (same pattern as emit_lib).
+    let mut arm_for: BTreeMap<String, usize> = BTreeMap::new();
+    let mut next_arm: usize = 0;
+    for entry in agg_entries {
+        let arm_idx = arm_for
+            .entry(entry.sql_name.clone())
+            .or_insert_with(|| {
+                let i = next_arm;
+                next_arm += 1;
+                i
+            })
+            .to_owned();
+        for alias in &entry.aliases {
+            arm_for.entry(alias.clone()).or_insert(arm_idx);
+        }
+    }
+
+    let mut wired = 0usize;
+    let mut stubbed = 0usize;
+    let mut metas_block = String::new();
+    let mut return_arms = String::new();
+    let mut create_arms = String::new();
+    let mut finalize_arms = String::new();
+    let mut seen_meta: BTreeSet<String> = BTreeSet::new();
+    let mut seen_create: BTreeSet<String> = BTreeSet::new();
+    let mut emitted_finalize: BTreeSet<usize> = BTreeSet::new();
+
+    for entry in agg_entries {
+        let escaped = entry.sql_name.replace('"', "\\\"");
+        let arm_idx = *arm_for.get(&entry.sql_name).unwrap();
+
+        // Safety dedupe: two extensions exposing the same canonical
+        // name emit meta once (matches emit_lib.rs).
+        if !seen_meta.insert(entry.sql_name.clone()) {
+            continue;
+        }
+
+        let dynlink_wired = is_dynlink_wired_aggregate(&entry.shape);
+        if dynlink_wired {
+            wired += 1;
+        } else {
+            stubbed += 1;
+        }
+
+        // ---- metadata (canonical only — aliases ride the
+        // canonical's `aliases:` literal). ----
+        let mut sig_block = String::from("alloc::vec![alloc::vec![ftypes::LogicalType::Binary");
+        for p in &entry.shape.extra_args {
+            sig_block.push_str(", ");
+            sig_block.push_str(&param_to_logicaltype_lit(p));
+        }
+        sig_block.push_str("]]");
+        let cfg_indices: String = (0..entry.shape.extra_args.len())
+            .map(|j| format!("{}u32, ", j + 1))
+            .collect();
+        let accepts_config = !entry.shape.extra_args.is_empty();
+        let aliases_lit = aliases_literal_dynlink(&entry.aliases);
+        metas_block.push_str(&format!(
+            "        ftypes::AggregateFunctionMeta {{\n\
+             \x20           name: \"{escaped}\".to_string(),\n\
+             \x20           aliases: {aliases_lit},\n\
+             \x20           param_types: {sig_block},\n\
+             \x20           supports_grouped: true,\n\
+             \x20           supports_partial: true,\n\
+             \x20           is_order_sensitive: false,\n\
+             \x20           accepts_config: {accepts_config},\n\
+             \x20           config_arg_indices: alloc::vec![{cfg_indices}],\n\
+             \x20       }},\n",
+        ));
+
+        // ---- return_type + create arms (canonical + each alias). ----
+        let ret_logical = ret_to_logicaltype_lit(&entry.shape.ret);
+        for name in std::iter::once(entry.sql_name.as_str())
+            .chain(entry.aliases.iter().map(|s| s.as_str()))
+        {
+            let name_escaped = name.replace('"', "\\\"");
+            return_arms.push_str(&format!(
+                "            \"{name_escaped}\" => Ok({ret_logical}),\n",
+            ));
+            if seen_create.insert(name.to_string()) {
+                create_arms.push_str(&format!(
+                    "            \"{name_escaped}\" => {arm_idx}usize,\n",
+                ));
+            }
+        }
+
+        if emitted_finalize.insert(arm_idx) {
+            let body = if dynlink_wired {
+                emit_dynlink_agg_finalize_body(&entry.sql_name, &entry.shape.ret)
+            } else {
+                format!(
+                    "                let _ = st;\n\
+                     \x20               Err(ftypes::FunctionError::UnknownFunction(alloc::format!(\n\
+                     \x20                   \"{sql}: aggregate shape not yet wired in dynlink mode\"\n\
+                     \x20               )))\n",
+                    sql = entry.sql_name.replace('"', "\\\""),
+                )
+            };
+            finalize_arms.push_str(&format!(
+                "            {arm_idx}usize => {{\n{body}            }}\n",
+            ));
+        }
+    }
+
+    let impl_str = format!(
+        r##"// ─── Dynlink aggregate accumulator state ───
+//
+// Per-handle state (arm_idx + Vec<Vec<u8>> of accumulated WKB
+// payloads + Vec<String> of constant config args). Handle allocation
+// is a monotonic u64. `finalize` consumes the handle so subsequent
+// calls surface as `ExecutionError`. Wire discipline matches the
+// provider's `postgis_core::st-*-aggregate` arms:
+// `args = [CborValue::List(<CborValue::Bytes(<wkb>)>*)]`.
+//
+// The bridge is `#![no_std]` so `std::thread_local!` isn't
+// available. Under wasm32-wasip2 each component instance runs on
+// exactly one wasm thread (wit-bindgen guest exports are synchronous
+// and the bridge never spawns), so a plain `static SyncRefCell<...>`
+// with an `unsafe impl Sync` facade is race-free by construction.
+use alloc::collections::BTreeMap;
+use core::cell::RefCell;
+
+/// Single-threaded-wasm facade: expose `RefCell<T>` as a `Sync`
+/// value so it can live in a `static`. Every borrow goes through
+/// `RefCell`'s runtime borrow checker, so double-mut-borrow bugs
+/// panic instead of racing. Not sound for multi-threaded targets.
+struct SyncRefCell<T>(RefCell<T>);
+unsafe impl<T> Sync for SyncRefCell<T> {{}}
+
+#[derive(Clone)]
+struct AccState {{
+    arm_idx: usize,
+    blobs: Vec<Vec<u8>>,
+    extras: Vec<String>,
+}}
+
+static ACCUMULATORS: SyncRefCell<BTreeMap<u64, AccState>> =
+    SyncRefCell(RefCell::new(BTreeMap::new()));
+static NEXT_ACC_HANDLE: SyncRefCell<u64> = SyncRefCell(RefCell::new(1));
+
+fn alloc_accumulator(arm_idx: usize, extras: Vec<String>) -> u64 {{
+    let h = {{
+        let mut next = NEXT_ACC_HANDLE.0.borrow_mut();
+        let v = *next;
+        *next += 1;
+        v
+    }};
+    ACCUMULATORS.0.borrow_mut().insert(h, AccState {{
+        arm_idx,
+        blobs: Vec::new(),
+        extras,
+    }});
+    h
+}}
+
+impl aggregate_function_registry::Guest for Component {{
+    fn list_functions() -> Vec<ftypes::AggregateFunctionMeta> {{
+        alloc::vec![
+{metas_block}        ]
+    }}
+
+    fn return_type(
+        name: String,
+        _input_types: Vec<ftypes::LogicalType>,
+    ) -> Result<ftypes::LogicalType, ftypes::FunctionError> {{
+        match name.as_str() {{
+{return_arms}            other => Err(ftypes::FunctionError::UnknownFunction(other.to_string())),
+        }}
+    }}
+
+    fn create_accumulator(name: String) -> Result<u64, ftypes::FunctionError> {{
+        let arm = match name.as_str() {{
+{create_arms}            other => return Err(ftypes::FunctionError::UnknownFunction(other.to_string())),
+        }};
+        Ok(alloc_accumulator(arm, Vec::new()))
+    }}
+
+    fn create_accumulator_with_config(
+        name: String,
+        config: String,
+    ) -> Result<u64, ftypes::FunctionError> {{
+        let arm = match name.as_str() {{
+{create_arms}            other => return Err(ftypes::FunctionError::UnknownFunction(other.to_string())),
+        }};
+        Ok(alloc_accumulator(arm, alloc::vec![config]))
+    }}
+
+    fn create_accumulator_with_configs(
+        name: String,
+        configs: Vec<String>,
+    ) -> Result<u64, ftypes::FunctionError> {{
+        let arm = match name.as_str() {{
+{create_arms}            other => return Err(ftypes::FunctionError::UnknownFunction(other.to_string())),
+        }};
+        Ok(alloc_accumulator(arm, configs))
+    }}
+
+    fn accumulate(
+        handle: u64,
+        value: ftypes::ScalarValue,
+    ) -> Result<(), ftypes::FunctionError> {{
+        let mut g = ACCUMULATORS.0.borrow_mut();
+        let st = g.get_mut(&handle).ok_or_else(|| {{
+            ftypes::FunctionError::ExecutionError(alloc::format!(
+                "no accumulator at handle {{}}", handle
+            ))
+        }})?;
+        // SQL aggregate semantics: NULL contributions are skipped.
+        if matches!(value, ftypes::ScalarValue::Null) {{
+            return Ok(());
+        }}
+        let bytes = match value {{
+            ftypes::ScalarValue::Binary(b) => b,
+            ftypes::ScalarValue::Utf8(s) => s.into_bytes(),
+            _ => return Err(ftypes::FunctionError::ExecutionError(
+                "aggregate streaming arg must be BINARY".to_string()
+            )),
+        }};
+        st.blobs.push(bytes);
+        Ok(())
+    }}
+
+    fn accumulate_batch(
+        handle: u64,
+        values: Vec<ftypes::ScalarValue>,
+    ) -> Result<(), ftypes::FunctionError> {{
+        for v in values {{
+            <Self as aggregate_function_registry::Guest>::accumulate(handle, v)?;
+        }}
+        Ok(())
+    }}
+
+    fn merge(
+        target: u64,
+        source: u64,
+    ) -> Result<(), ftypes::FunctionError> {{
+        let mut g = ACCUMULATORS.0.borrow_mut();
+        let src = g.remove(&source).ok_or_else(|| {{
+            ftypes::FunctionError::ExecutionError(alloc::format!(
+                "merge: source handle {{}} not found", source
+            ))
+        }})?;
+        let tgt = g.get_mut(&target).ok_or_else(|| {{
+            ftypes::FunctionError::ExecutionError(alloc::format!(
+                "merge: target handle {{}} not found", target
+            ))
+        }})?;
+        if tgt.arm_idx != src.arm_idx {{
+            return Err(ftypes::FunctionError::ExecutionError(
+                "merge: target and source must come from the same aggregate".to_string()
+            ));
+        }}
+        tgt.blobs.extend(src.blobs);
+        Ok(())
+    }}
+
+    fn finalize(handle: u64) -> Result<ftypes::ScalarValue, ftypes::FunctionError> {{
+        // finalize consumes the accumulator — drop the borrow before
+        // invoking through the linker so re-entrant provider calls
+        // that touch our own registry don't hit a runtime borrow panic.
+        let st = ACCUMULATORS.0.borrow_mut().remove(&handle).ok_or_else(|| {{
+            ftypes::FunctionError::ExecutionError(alloc::format!(
+                "finalize: no accumulator at handle {{}}", handle
+            ))
+        }})?;
+        match st.arm_idx {{
+{finalize_arms}            other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(
+                "finalize: unknown aggregate arm {{}}", other
+            ))),
+        }}
+    }}
+
+    fn reset(handle: u64) {{
+        let mut g = ACCUMULATORS.0.borrow_mut();
+        if let Some(st) = g.get_mut(&handle) {{
+            st.blobs.clear();
+        }}
+    }}
+
+    fn destroy_accumulator(handle: u64) {{
+        ACCUMULATORS.0.borrow_mut().remove(&handle);
+    }}
+}}
+
+"##,
+        metas_block = metas_block,
+        return_arms = return_arms,
+        create_arms = create_arms,
+        finalize_arms = finalize_arms,
+    );
+
+    (impl_str, wired, stubbed)
+}
+
+/// True iff this aggregate's shape maps cleanly to the dynlink wire:
+/// WKB-blob streaming state + no configs + a scalar-shaped return.
+fn is_dynlink_wired_aggregate(shape: &interface_db::AggregateShape) -> bool {
+    matches!(shape.accumulator_kind, AccKind::Geom)
+        && shape.extra_args.is_empty()
+        && matches!(
+            shape.ret,
+            RetShape::GeomBlob
+                | RetShape::OptionGeomBlob
+                | RetShape::Blob
+                | RetShape::OptionBlob
+                | RetShape::BboxBlob
+                | RetShape::Bbox3dWkbLineZ
+                | RetShape::Real
+                | RetShape::OptionReal
+                | RetShape::Int
+                | RetShape::OptionInt
+                | RetShape::Text
+                | RetShape::OptionText
+        )
+}
+
+/// Emit the finalize body for a wired aggregate. The accumulator's
+/// WKB payloads ride to the provider as `CborValue::List<Bytes>`
+/// under `args[0]`; the response variant is unwrapped per return shape
+/// (Bytes → Binary, List<Float; 4|6> → WKB envelope, etc.).
+fn emit_dynlink_agg_finalize_body(sql_name: &str, ret: &RetShape) -> String {
+    let sql = sql_name.replace('"', "\\\"");
+    let mut s = String::new();
+    s.push_str(
+        "                let geom_list = CborValue::List(\n\
+         \x20                   st.blobs.iter().map(|b| CborValue::Bytes(b.clone())).collect(),\n\
+         \x20               );\n",
+    );
+    s.push_str(&format!(
+        "                let resp = call(\"{sql}\", alloc::vec![geom_list])?;\n"
+    ));
+    let wrap = match ret {
+        RetShape::GeomBlob
+        | RetShape::Blob
+        | RetShape::OptionGeomBlob
+        | RetShape::OptionBlob => {
+            "                match resp {\n\
+             \x20                   ResponseValue::Bytes(b) => Ok(ftypes::ScalarValue::Binary(b)),\n\
+             \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
+             \x20                   other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"aggregate: unexpected response {:?}\", other))),\n\
+             \x20               }\n"
+        }
+        RetShape::BboxBlob => {
+            "                match resp {\n\
+             \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
+             \x20                   other => {\n\
+             \x20                       let bb = response_bbox_floats(&other, \"aggregate bbox\")?;\n\
+             \x20                       Ok(ftypes::ScalarValue::Binary(bbox_to_wkb_polygon(bb[0], bb[1], bb[2], bb[3])))\n\
+             \x20                   }\n\
+             \x20               }\n"
+        }
+        RetShape::Bbox3dWkbLineZ => {
+            "                match resp {\n\
+             \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
+             \x20                   other => {\n\
+             \x20                       let bb = response_bbox3d_floats(&other, \"aggregate bbox3d\")?;\n\
+             \x20                       Ok(ftypes::ScalarValue::Binary(bbox3d_to_wkb_linestring_z(bb[0], bb[1], bb[2], bb[3], bb[4], bb[5])))\n\
+             \x20                   }\n\
+             \x20               }\n"
+        }
+        RetShape::Real | RetShape::OptionReal => {
+            "                match resp {\n\
+             \x20                   ResponseValue::Float(f) => Ok(ftypes::ScalarValue::Float64(f)),\n\
+             \x20                   ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Float64(i as f64)),\n\
+             \x20                   ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Float64(u as f64)),\n\
+             \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
+             \x20                   other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"aggregate: unexpected response {:?}\", other))),\n\
+             \x20               }\n"
+        }
+        RetShape::Int | RetShape::OptionInt => {
+            "                match resp {\n\
+             \x20                   ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Int64(i)),\n\
+             \x20                   ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Int64(u as i64)),\n\
+             \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
+             \x20                   other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"aggregate: unexpected response {:?}\", other))),\n\
+             \x20               }\n"
+        }
+        RetShape::Text | RetShape::OptionText => {
+            "                match resp {\n\
+             \x20                   ResponseValue::Text(t) => Ok(ftypes::ScalarValue::Utf8(t)),\n\
+             \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
+             \x20                   other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"aggregate: unexpected response {:?}\", other))),\n\
+             \x20               }\n"
+        }
+        _ => {
+            "                Err(ftypes::FunctionError::ExecutionError(\"aggregate finalize: unsupported return shape\".to_string()))\n"
+        }
+    };
+    s.push_str(wrap);
+    s
+}
+
+/// Rust literal for a `Vec<String>` of aliases inside the emitted
+/// aggregate meta block. Empty aliases collapse to `Vec::new()` so
+/// the generated code doesn't drag in an empty `alloc::vec![]`.
+fn aliases_literal_dynlink(aliases: &[String]) -> String {
+    if aliases.is_empty() {
+        return "Vec::new()".to_string();
+    }
+    let mut s = String::from("alloc::vec![");
+    for a in aliases {
+        s.push_str(&format!("\"{}\".to_string(), ", a.replace('"', "\\\"")));
+    }
+    s.push(']');
+    s
 }
 
 fn pick_primary_shim_dir(
