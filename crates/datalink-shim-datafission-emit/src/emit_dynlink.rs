@@ -1493,6 +1493,34 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             // temporal-value inputs and the postgis `raster` param
             // that carries record-typed data through the boundary.
             | ParamShape::WitValueRecord { .. }
+            // #823: `list<record>` param. SQL passes JSON-array TEXT
+            // literal of record objects (e.g.
+            // `'[{{"element_id": 1, "element_type": 1}}, ...]'` for
+            // `topo-element` list). Emit body parses the JSON to
+            // `Vec<serde_json::Value>`, ciborium-encodes each element
+            // into its own byte buffer, and wraps the whole thing as
+            // `CborValue::List(Vec<CborValue::Bytes>)` — mirrors the
+            // `WitValueRecord` param wire shape one list level deep.
+            // Provider dispatcher decodes each `Bytes` payload via
+            // `ciborium::from_reader::<UPSTREAM, _>` (upstream WIT
+            // record type derives serde::Deserialize under
+            // `additional_derives`) and reassembles a `Vec<UPSTREAM>`
+            // for the WIT call. Unlocks arms like
+            // `topo-element-array-append` and the
+            // `create-topo-geom` / `topology-create-topo-geom`
+            // topo-element-list inputs.
+            | ParamShape::ListRecord { .. }
+            // #823: `list<list<primitive>>` param over a non-u8
+            // element (u8 uses the dedicated `ListListU8` shape).
+            // SQL passes JSON-array TEXT literal matching
+            // `Vec<Vec<T>>` (e.g. `'[[1.0, 2.0], [3.0, 4.0]]'` for
+            // `list<list<f64>>`). Emit body parses locally into
+            // `Vec<Vec<T>>` via `serde_json::from_str` and forwards
+            // as `CborValue::List(Vec<CborValue::List(<CborValue::<Prim>>...)>)`
+            // — nested list of primitives on the wire. Provider
+            // dispatcher decodes recursively. Unlocks postgis
+            // raster `st-set-values` (`list<list<f64>>` values).
+            | ParamShape::ListListPrim(_)
     )) && matches!(ret,
         RetShape::Text | RetShape::Real | RetShape::Int
             | RetShape::Blob | RetShape::BoolInt
@@ -1608,6 +1636,17 @@ fn param_to_logicaltype_lit(p: &ParamShape) -> String {
         // ListGeom lowers to a JSON-array TEXT literal of WKB byte
         // arrays — same SQL surface as ListListU8.
         | ParamShape::ListGeom
+        // #823: `list<record>` — SQL passes JSON-array TEXT literal
+        // of record objects; emit body ciborium-encodes each record
+        // into `CborValue::Bytes`. Wire shape at the SQL layer is
+        // Utf8, matching WacPlug's `parse_json_list_record_<snake>`
+        // helper convention.
+        | ParamShape::ListRecord { .. }
+        // #823: `list<list<primitive>>` — SQL passes JSON-array TEXT
+        // literal of arrays of primitives. Same SQL surface as
+        // `ListListU8` but the element type is arbitrary primitive
+        // (non-u8).
+        | ParamShape::ListListPrim(_)
         | ParamShape::OptionNone => "ftypes::LogicalType::Utf8".to_string(),
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
@@ -1804,6 +1843,59 @@ fn emit_scalar_arm_body(
                                          .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} must be JSON list<geometry> as list<list<u8>> ({{}})\", e)))?;\n\
                                      CborValue::List(v.into_iter().map(CborValue::Bytes).collect())\n\
                                  }};\n",
+                ident = ident,
+                i = i,
+                sql = sql,
+            ),
+            // #823: `list<record>` — SQL passes a JSON-array TEXT
+            // literal of record-shaped objects (matches WacPlug's
+            // `parse_json_list_record_<snake>` helper). Parse locally
+            // as `Vec<serde_json::Value>`, ciborium-encode each
+            // element into its own byte buffer, and forward as
+            // `CborValue::List(Vec<CborValue::Bytes>)`. The provider
+            // dispatcher unwraps each `Bytes` payload via
+            // `ciborium::from_reader::<UPSTREAM, _>` (upstream WIT
+            // record type derives serde::Deserialize under
+            // `additional_derives`) and reassembles the
+            // `Vec<UPSTREAM>` for the WIT call — mirroring the
+            // scalar `WitValueRecord` param wire one list level up.
+            ParamShape::ListRecord { .. } => format!(
+                "                let {ident} = {{\n\
+                                     let text = dfv_text(&args, {i}, \"{sql}\")?;\n\
+                                     let values: Vec<serde_json::Value> = serde_json::from_str(&text)\n\
+                                         .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} must be JSON list<record> ({{}})\", e)))?;\n\
+                                     let mut items: Vec<CborValue> = Vec::with_capacity(values.len());\n\
+                                     for val in values {{\n\
+                                         let mut buf: Vec<u8> = Vec::new();\n\
+                                         ciborium::into_writer(&val, &mut buf)\n\
+                                             .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} ciborium encode record ({{}})\", e)))?;\n\
+                                         items.push(CborValue::Bytes(buf));\n\
+                                     }}\n\
+                                     CborValue::List(items)\n\
+                                 }};\n",
+                ident = ident,
+                i = i,
+                sql = sql,
+            ),
+            // #823: `list<list<primitive>>` (non-u8 element). SQL
+            // passes a JSON-array TEXT literal matching `Vec<Vec<T>>`
+            // (e.g. `'[[1.0, 2.0], [3.0, 4.0]]'` for
+            // `list<list<f64>>`). Parse locally into `Vec<Vec<T>>`
+            // and forward as
+            // `CborValue::List(Vec<CborValue::List(Vec<CborValue::<Prim>>)>)`.
+            // Symmetric with `ListListU8` one primitive layer up;
+            // per-element `CborValue` wrap follows the `ListPrim`
+            // convention (see `list_prim_cbor_wrap`).
+            ParamShape::ListListPrim(elem) => format!(
+                "                let {ident} = {{\n\
+                                     let text = dfv_text(&args, {i}, \"{sql}\")?;\n\
+                                     let v: Vec<Vec<{rust_ty}>> = serde_json::from_str(&text)\n\
+                                         .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} must be JSON list<list<{suffix}>> ({{}})\", e)))?;\n\
+                                     CborValue::List(v.into_iter().map(|inner| CborValue::List(inner.into_iter().map(|x| {cbor_wrap}).collect())).collect())\n\
+                                 }};\n",
+                rust_ty = list_prim_rust_ty(*elem),
+                suffix = elem.helper_suffix(),
+                cbor_wrap = list_prim_cbor_wrap(*elem),
                 ident = ident,
                 i = i,
                 sql = sql,
