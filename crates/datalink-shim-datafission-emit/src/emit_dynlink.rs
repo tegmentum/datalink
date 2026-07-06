@@ -47,7 +47,7 @@ use anyhow::{anyhow, Result};
 
 use shim_bridge_codegen_core::BridgePlan;
 use datalink_shim_codegen_core::interface_db::{
-    self, AccKind, AggregateEntry, DispatchEntry, ListPrimElem, ParamShape, RetShape,
+    self, AccKind, AggregateEntry, DispatchEntry, ListPrimElem, ListTupleElem, ParamShape, RetShape,
 };
 use datalink_shim_codegen_core::record_registry::{self, RecordType};
 
@@ -1563,6 +1563,29 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             // to `s64` so the interface DB reduces the tuple to a
             // pure-primitive `ListTuple`).
             | ParamShape::ListTuple { .. }
+            // #823 (agent #931): `list<tuple<E1, E2, ...>>` param
+            // where at least one Ei is a same-shim record (rest may
+            // be primitives). Structural extension of `ListTuple` —
+            // SQL still passes a JSON-array TEXT literal of
+            // fixed-arity inner arrays, but per-position dispatch
+            // admits either a primitive (decode +
+            // `list_prim_cbor_wrap`) or a record
+            // (`ciborium::into_writer` → `CborValue::Bytes`, same
+            // wire as the flat `ListRecord` param). Wraps outer as
+            // `CborValue::List(Vec<CborValue::List(<Text|Int|... |
+            // Bytes>...)>)`. Provider dispatcher decodes each tuple
+            // slot by declared element type (records unwrap via
+            // `ciborium::from_reader::<UPSTREAM, _>` — upstream WIT
+            // record derives `serde::Deserialize` under
+            // `additional_derives`). Today's surface (mobilitydb):
+            // `tfloat-batch-to-parquet` /
+            // `tgeompoint-batch-to-parquet` —
+            // `list<tuple<string, {tfloat,tgeompoint}-sequence>>`.
+            // Provider-side parquet dispatch for these arms is not
+            // wired yet — the emit arm here surfaces the shape to
+            // the SQL layer; runtime `unknown method` traps until a
+            // provider follow-up lands.
+            | ParamShape::ListTupleMixed { .. }
     )) && matches!(ret,
         RetShape::Text | RetShape::Real | RetShape::Int
             | RetShape::Blob | RetShape::BoolInt
@@ -1703,6 +1726,12 @@ fn param_to_logicaltype_lit(p: &ParamShape) -> String {
         // Utf8 surface as `ListListPrim`; the emit body handles the
         // per-position heterogeneous decode.
         | ParamShape::ListTuple { .. }
+        // #823 (agent #931): `list<tuple<E...>>` mixed (prim + record)
+        // — SQL passes a JSON-array TEXT literal of fixed-arity inner
+        // arrays where record slots are JSON objects. Same Utf8
+        // surface as `ListTuple`; the emit body handles per-position
+        // dispatch (prim decode vs ciborium-encode-as-Bytes).
+        | ParamShape::ListTupleMixed { .. }
         | ParamShape::OptionNone => "ftypes::LogicalType::Utf8".to_string(),
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
@@ -2001,6 +2030,130 @@ fn emit_scalar_arm_body(
                     ));
                 }
                 let sig: Vec<&str> = elements.iter().map(|e| e.helper_suffix()).collect();
+                let sig_label = sig.join(", ");
+                format!(
+                    "                let {ident} = {{\n\
+                                     let text = dfv_text(&args, {i}, \"{sql}\")?;\n\
+                                     let outer: Vec<serde_json::Value> = serde_json::from_str(&text)\n\
+                                         .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} must be JSON list<tuple<{sig_label}>> ({{}})\", e)))?;\n\
+                                     let mut out: Vec<CborValue> = Vec::with_capacity(outer.len());\n\
+                                     for (__tuple_i, val) in outer.into_iter().enumerate() {{\n\
+                                         let inner: Vec<serde_json::Value> = match val {{\n\
+                                             serde_json::Value::Array(a) => a,\n\
+                                             other => return Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} tuple[{{}}] expected JSON array, got {{:?}}\", __tuple_i, other))),\n\
+                                         }};\n\
+                                         if inner.len() != {arity} {{\n\
+                                             return Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} tuple[{{}}] expected {arity} elements, got {{}}\", __tuple_i, inner.len())));\n\
+                                         }}\n\
+                                         let mut it = inner.into_iter();\n\
+                                         let mut items: Vec<CborValue> = Vec::with_capacity({arity});\n\
+{per_elem}\
+                                         out.push(CborValue::List(items));\n\
+                                     }}\n\
+                                     CborValue::List(out)\n\
+                                 }};\n",
+                    ident = ident,
+                    i = i,
+                    sql = sql,
+                    sig_label = sig_label,
+                    arity = arity,
+                    per_elem = per_elem,
+                )
+            }
+            // #823 (agent #931): `list<tuple<E1, E2, ...>>` (mixed)
+            // — same list-of-list-of-slot shape as `ListTuple`, but
+            // each position is either a `ListTupleElem::Prim` or a
+            // `ListTupleElem::Record`. SQL passes a JSON-array TEXT
+            // literal matching `Vec<Vec<serde_json::Value>>` — record
+            // slots are JSON objects, primitives are their native JSON
+            // form. Emit body parses each inner slot as
+            // `serde_json::Value` (unavoidable — heterogeneous per
+            // position + records aren't a single Rust type), then
+            // dispatches per position:
+            //   - Prim(P) → `serde_json::from_value::<{rust_ty}>` +
+            //     `list_prim_cbor_wrap(P)` (same rule as `ListTuple`).
+            //   - Record(_) → `ciborium::into_writer(&raw, &mut buf)`
+            //     + `CborValue::Bytes(buf)` (same wire as the flat
+            //     `ListRecord` param — provider decodes each Bytes
+            //     via `ciborium::from_reader::<UPSTREAM, _>`, upstream
+            //     record derives `serde::Deserialize` under
+            //     `additional_derives`).
+            // Wraps outer as
+            // `CborValue::List(Vec<CborValue::List(<Text|Int|... | Bytes>...)>)`
+            // — provider dispatcher walks each inner list, decoding
+            // slots by declared element type.
+            //
+            // Today's surface (mobilitydb): `tfloat-batch-to-parquet`
+            // / `tgeompoint-batch-to-parquet` —
+            // `list<tuple<string, {tfloat,tgeompoint}-sequence>>`.
+            // Provider-side parquet dispatch for these arms is not
+            // wired yet; the emitted arm surfaces the shape to the
+            // SQL layer but the runtime call will trap with
+            // `unknown method` until a provider follow-up lands.
+            ParamShape::ListTupleMixed { elements } => {
+                let arity = elements.len();
+                let mut per_elem = String::new();
+                for (pos, elem) in elements.iter().enumerate() {
+                    match elem {
+                        ListTupleElem::Prim(p) => {
+                            let rust_ty = list_prim_rust_ty(*p);
+                            let suffix = p.helper_suffix();
+                            let cbor_wrap = list_prim_cbor_wrap(*p);
+                            // Consume `it.next()` — take ownership so
+                            // the wrap arms that move (e.g.
+                            // `CborValue::Text(x)`) don't have to
+                            // clone. `serde_json::from_value` handles
+                            // the per-position primitive coercion
+                            // (rejects mistyped slots with an
+                            // ExecutionError). Arity was pre-checked
+                            // so `next()` never returns None here.
+                            per_elem.push_str(&format!(
+                                "                                         let raw_{pos} = it.next().unwrap();\n\
+                                         let x: {rust_ty} = serde_json::from_value(raw_{pos})\n\
+                                             .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} tuple[{{}}][{pos}] must be {suffix} ({{}})\", __tuple_i, e)))?;\n\
+                                         items.push({cbor_wrap});\n",
+                                pos = pos,
+                                rust_ty = rust_ty,
+                                suffix = suffix,
+                                cbor_wrap = cbor_wrap,
+                                i = i,
+                                sql = sql,
+                            ));
+                        }
+                        ListTupleElem::Record(r) => {
+                            let kebab = &r.kebab_name;
+                            // Ciborium-encode the parsed
+                            // `serde_json::Value` directly. Wire-shape
+                            // parity with `ListRecord` per-record
+                            // encode: the record slot on the JSON side
+                            // is an object matching the upstream WIT
+                            // record's field layout (wit-bindgen's
+                            // `additional_derives: [Deserialize]`
+                            // makes the upstream type serde-round-
+                            // trippable via CBOR). Buffer name is
+                            // suffixed with `pos` so multiple record
+                            // slots in the same tuple don't collide.
+                            per_elem.push_str(&format!(
+                                "                                         let raw_{pos} = it.next().unwrap();\n\
+                                         let mut buf_{pos}: Vec<u8> = Vec::new();\n\
+                                         ciborium::into_writer(&raw_{pos}, &mut buf_{pos})\n\
+                                             .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} tuple[{{}}][{pos}] ciborium encode {kebab} ({{}})\", __tuple_i, e)))?;\n\
+                                         items.push(CborValue::Bytes(buf_{pos}));\n",
+                                pos = pos,
+                                kebab = kebab,
+                                i = i,
+                                sql = sql,
+                            ));
+                        }
+                    }
+                }
+                let sig: Vec<String> = elements
+                    .iter()
+                    .map(|e| match e {
+                        ListTupleElem::Prim(p) => p.helper_suffix().to_string(),
+                        ListTupleElem::Record(r) => r.kebab_name.clone(),
+                    })
+                    .collect();
                 let sig_label = sig.join(", ");
                 format!(
                     "                let {ident} = {{\n\
