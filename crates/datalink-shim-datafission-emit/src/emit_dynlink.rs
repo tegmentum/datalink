@@ -24,13 +24,20 @@
 //! supported in dynlink mode")`.
 //!
 //! UDTFs / window functions: emitted as empty registries. Aggregates
-//! now wire real dispatch through the CBOR envelope for `AccKind::Geom`
-//! arms with no extras (the plurality of the postgis surface —
-//! `st_union_aggregate`, `st_polygonize_aggregate`, `st_collect_aggregate`,
-//! `st_extent`, `st_extent_threed`, etc.). Other AccKind variants
-//! (Raster, Record, RecordToScalar/Tuple/ListPrim, RecordSetToRecordSet)
-//! still surface in `list_functions` for discoverability but their
-//! `finalize` returns `UnknownFunction`. See `build_aggregate_registry_impl_dynlink`.
+//! wire real dispatch through the CBOR envelope for `AccKind::Geom`
+//! (postgis WKB blobs — `st_union_aggregate`, `st_polygonize_aggregate`,
+//! `st_collect_aggregate`, `st_extent`, `st_extent_threed`, etc.) plus
+//! the record-typed `AccKind::Record{,ToScalar,ToTuple,ToListPrim,
+//! SetToRecordSet}` families (mobilitydb temporal aggregators —
+//! `tint_merge_agg`, `tfloat_temporal_min`, `tint_count_aggregate`,
+//! `tint_range_aggregate`, `tjsonb_sequences_agg_*`, etc.). The
+//! accumulator is always `Vec<Vec<u8>>` since every SQL aggregate row
+//! streams a `binary` payload; the provider owns record decode via
+//! the CBOR envelope. `AccKind::Raster` still surfaces in
+//! `list_functions` but its `finalize` returns `UnknownFunction` —
+//! the raster-blob accumulator ABI shares the same wire shape but no
+//! resident provider dispatches it today. See
+//! `build_aggregate_registry_impl_dynlink`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -42,6 +49,7 @@ use shim_bridge_codegen_core::BridgePlan;
 use datalink_shim_codegen_core::interface_db::{
     self, AccKind, AggregateEntry, DispatchEntry, ListPrimElem, ParamShape, RetShape,
 };
+use datalink_shim_codegen_core::record_registry::{self, RecordType};
 
 use crate::emit_wit;
 
@@ -314,13 +322,26 @@ fn lib_rs(plan: &BridgePlan, opts: &DynlinkOptions) -> Result<String> {
     let wit_deps_root = emit_wit::source_shim_deps_dir(primary)?;
     let shim_packages = emit_wit::discover_shim_packages(&wit_deps_root)?;
     let shim_wit_dir = pick_primary_shim_dir(primary, &wit_deps_root, &shim_packages);
+
+    // Build the record registry so the aggregate classifier can
+    // resolve `list<record>` inputs (mobilitydb temporal-type
+    // aggregates) into `AccKind::Record{To*}` variants. Without
+    // records the classifier can never match these — every
+    // mobilitydb aggregate would fall through to `unwired` and the
+    // emitted registry would report `0 wired / 0 stubbed`. Mirrors
+    // the sibling `emit_lib.rs` shape.
+    let records: Vec<RecordType> = record_registry::build(&shim_packages, primary)
+        .into_iter()
+        .filter(|r| emit_wit::package_belongs_to_primary(&r.package, primary))
+        .collect();
+
     let (scalar_entries, _unwired) =
-        interface_db::build_full(plan, &shim_wit_dir, &[])?;
+        interface_db::build_full(plan, &shim_wit_dir, &records)?;
 
     // Reuse the WacPlug aggregate classifier. Failures degrade to an
     // empty list so a shim without aggregates still emits cleanly.
     let aggregate_entries: Vec<AggregateEntry> =
-        match interface_db::build_aggregate_registry(plan, &shim_wit_dir, &[]) {
+        match interface_db::build_aggregate_registry(plan, &shim_wit_dir, &records) {
             Ok((entries, _agg_unwired)) => entries,
             Err(e) => {
                 eprintln!("[datafission-dynlink] build_aggregate_registry failed: {e}");
@@ -2094,25 +2115,58 @@ impl aggregate_function_registry::Guest for Component {{
 }
 
 /// True iff this aggregate's shape maps cleanly to the dynlink wire:
-/// WKB-blob streaming state + no configs + a scalar-shaped return.
+/// blob streaming state + no configs + a return shape the finalize
+/// wrapper knows how to unpack.
+///
+/// The dynlink accumulator is always `Vec<Vec<u8>>` of the SQL-side
+/// binary payloads (the SQL `param_types` for every aggregate is
+/// `binary`, both for postgis's WKB blobs and for mobilitydb's
+/// CBOR-encoded temporal records). The finalize call ships
+/// `CborValue::List<Bytes>` to the provider regardless of the
+/// upstream WIT input type — the provider owns the decode. So the
+/// wired set is gated only on the return-shape wrap the emit
+/// currently generates.
 fn is_dynlink_wired_aggregate(shape: &interface_db::AggregateShape) -> bool {
-    matches!(shape.accumulator_kind, AccKind::Geom)
-        && shape.extra_args.is_empty()
-        && matches!(
-            shape.ret,
-            RetShape::GeomBlob
-                | RetShape::OptionGeomBlob
-                | RetShape::Blob
-                | RetShape::OptionBlob
-                | RetShape::BboxBlob
-                | RetShape::Bbox3dWkbLineZ
-                | RetShape::Real
-                | RetShape::OptionReal
-                | RetShape::Int
-                | RetShape::OptionInt
-                | RetShape::Text
-                | RetShape::OptionText
-        )
+    if !shape.extra_args.is_empty() {
+        return false;
+    }
+    let acc_ok = matches!(
+        shape.accumulator_kind,
+        AccKind::Geom
+            | AccKind::Record { .. }
+            | AccKind::RecordToScalar { .. }
+            | AccKind::RecordToTuple { .. }
+            | AccKind::RecordToListPrim { .. }
+            | AccKind::RecordSetToRecordSet { .. }
+    );
+    if !acc_ok {
+        return false;
+    }
+    matches!(
+        shape.ret,
+        RetShape::GeomBlob
+            | RetShape::OptionGeomBlob
+            | RetShape::Blob
+            | RetShape::OptionBlob
+            | RetShape::BboxBlob
+            | RetShape::Bbox3dWkbLineZ
+            | RetShape::Real
+            | RetShape::OptionReal
+            | RetShape::Int
+            | RetShape::OptionInt
+            | RetShape::Text
+            | RetShape::OptionText
+            // Record-shaped returns (mobilitydb temporal aggregators):
+            // the provider re-serialises the record as CBOR bytes and
+            // we ship them straight through as SQL BINARY.
+            | RetShape::WitValueRecord { .. }
+            | RetShape::OptionWitValueRecord { .. }
+            | RetShape::FirstWitValueRecord { .. }
+            // JSON-shaped returns (RecordToTuple / RecordToListPrim):
+            // the provider serialises the tuple/list via serde_json
+            // and returns a text payload. Bridge forwards as SQL TEXT.
+            | RetShape::JsonText { .. }
+    )
 }
 
 /// Emit the finalize body for a wired aggregate. The accumulator's
@@ -2177,6 +2231,32 @@ fn emit_dynlink_agg_finalize_body(invoke_name: &str, ret: &RetShape) -> String {
              \x20               }\n"
         }
         RetShape::Text | RetShape::OptionText => {
+            "                match resp {\n\
+             \x20                   ResponseValue::Text(t) => Ok(ftypes::ScalarValue::Utf8(t)),\n\
+             \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
+             \x20                   other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"aggregate: unexpected response {:?}\", other))),\n\
+             \x20               }\n"
+        }
+        // Record-shaped returns (mobilitydb temporal aggregators):
+        // the provider re-serialises the upstream record as CBOR
+        // bytes (`ResponseValue::Bytes`) and we forward as SQL
+        // BINARY. `FirstWitValueRecord` is symmetric — the provider
+        // has already collapsed to a single record before returning.
+        RetShape::WitValueRecord { .. }
+        | RetShape::OptionWitValueRecord { .. }
+        | RetShape::FirstWitValueRecord { .. } => {
+            "                match resp {\n\
+             \x20                   ResponseValue::Bytes(b) => Ok(ftypes::ScalarValue::Binary(b)),\n\
+             \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
+             \x20                   other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"aggregate: unexpected response {:?}\", other))),\n\
+             \x20               }\n"
+        }
+        // JSON-shaped returns (RecordToTuple option<tuple<...>>,
+        // RecordToListPrim list<primitive>, RecordSetToRecordSet
+        // list<record>): provider serialises via serde_json and
+        // returns Text; bridge forwards as SQL TEXT. Null is passed
+        // through so `option<...>` shapes surface SQL NULL cleanly.
+        RetShape::JsonText { .. } => {
             "                match resp {\n\
              \x20                   ResponseValue::Text(t) => Ok(ftypes::ScalarValue::Utf8(t)),\n\
              \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
