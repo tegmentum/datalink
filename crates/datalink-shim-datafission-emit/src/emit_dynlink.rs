@@ -1586,6 +1586,28 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             // the SQL layer; runtime `unknown method` traps until a
             // provider follow-up lands.
             | ParamShape::ListTupleMixed { .. }
+            // #823 (agent #930): `list<list<record>>` param — the
+            // spanset-extent shape from mobilitydb's
+            // `spanset-extent-ops` interface (see
+            // `mobilitydb-wasm/crates/provider/wit/deps/
+            // mobilitydb-temporal/temporal.wit` around
+            // `interface spanset-extent-ops`). Each of the 4 arms
+            // (`{int,float,date,tstz}-spanset-extent`) takes
+            // `sets: list<list<{int,float,date}-span>>` where the
+            // outer list is a batch of spansets and each inner list
+            // is one spanset's spans. Structural analog of the
+            // scalar `ListRecord` param one nesting level deeper —
+            // same per-record ciborium-Bytes encoding, wrapped
+            // twice: JSON `[[{rec0}, {rec1}], [{rec2}]]` →
+            // `CborValue::List(Vec<CborValue::List(Vec<CborValue::Bytes>)>)`
+            // where each innermost Bytes ciborium-encodes one span
+            // record. Provider-side dispatch for the spanset-extent
+            // arms is not wired yet in
+            // `mobilitydb-wasm/crates/provider/src/dispatch/` — the
+            // emit arm here surfaces the shape to the SQL layer;
+            // runtime `unknown method` traps until a provider
+            // follow-up lands.
+            | ParamShape::ListListRecord { .. }
     )) && matches!(ret,
         RetShape::Text | RetShape::Real | RetShape::Int
             | RetShape::Blob | RetShape::BoolInt
@@ -1732,6 +1754,12 @@ fn param_to_logicaltype_lit(p: &ParamShape) -> String {
         // surface as `ListTuple`; the emit body handles per-position
         // dispatch (prim decode vs ciborium-encode-as-Bytes).
         | ParamShape::ListTupleMixed { .. }
+        // #823 (agent #930): `list<list<record>>` — SQL passes a
+        // JSON-array TEXT literal of arrays of record objects. Same
+        // Utf8 surface as `ListRecord`; the emit body ciborium-
+        // encodes each innermost record into `CborValue::Bytes` and
+        // wraps twice.
+        | ParamShape::ListListRecord { .. }
         | ParamShape::OptionNone => "ftypes::LogicalType::Utf8".to_string(),
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
@@ -2184,6 +2212,54 @@ fn emit_scalar_arm_body(
                     per_elem = per_elem,
                 )
             }
+            // #823 (agent #930): `list<list<record>>` — the
+            // spanset-extent shape from mobilitydb's
+            // `spanset-extent-ops` interface. SQL passes a JSON-
+            // array TEXT literal of arrays of record-shaped objects
+            // matching `Vec<Vec<serde_json::Value>>` (e.g.
+            // `'[[{"lower":1,"upper":10,"lower-inc":true,"upper-inc":false}], ...]'`
+            // for `list<list<int-span>>`). Structural analog of
+            // `ListRecord` one nesting level deeper — each innermost
+            // record ciborium-encodes to its own byte buffer and
+            // wraps as `CborValue::Bytes`, then the inner Vec wraps
+            // as `CborValue::List(Vec<CborValue::Bytes>)`, and the
+            // outer wraps once more as `CborValue::List(...)`. Wire
+            // is `CborValue::List<List<Bytes<ciborium of R>>>` — the
+            // provider dispatcher (when it lands — see
+            // `mobilitydb-wasm/crates/provider/src/dispatch/
+            // mobilitydb_core.rs`) walks the outer list, then walks
+            // each inner list decoding each Bytes payload via
+            // `ciborium::from_reader::<UPSTREAM, _>` (upstream WIT
+            // record type derives serde::Deserialize under
+            // `additional_derives`) and reassembles a
+            // `Vec<Vec<UPSTREAM>>` for the WIT call. Unlocks the 4
+            // `{int,float,date,tstz}-spanset-extent` arms.
+            ParamShape::ListListRecord { .. } => format!(
+                "                let {ident} = {{\n\
+                                     let text = dfv_text(&args, {i}, \"{sql}\")?;\n\
+                                     let outer: Vec<serde_json::Value> = serde_json::from_str(&text)\n\
+                                         .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} must be JSON list<list<record>> ({{}})\", e)))?;\n\
+                                     let mut out: Vec<CborValue> = Vec::with_capacity(outer.len());\n\
+                                     for (__llr_i, val) in outer.into_iter().enumerate() {{\n\
+                                         let inner: Vec<serde_json::Value> = match val {{\n\
+                                             serde_json::Value::Array(a) => a,\n\
+                                             other => return Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} outer[{{}}] expected JSON array, got {{:?}}\", __llr_i, other))),\n\
+                                         }};\n\
+                                         let mut items: Vec<CborValue> = Vec::with_capacity(inner.len());\n\
+                                         for rec in inner {{\n\
+                                             let mut buf: Vec<u8> = Vec::new();\n\
+                                             ciborium::into_writer(&rec, &mut buf)\n\
+                                                 .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} outer[{{}}] ciborium encode record ({{}})\", __llr_i, e)))?;\n\
+                                             items.push(CborValue::Bytes(buf));\n\
+                                         }}\n\
+                                         out.push(CborValue::List(items));\n\
+                                     }}\n\
+                                     CborValue::List(out)\n\
+                                 }};\n",
+                ident = ident,
+                i = i,
+                sql = sql,
+            ),
             _ => format!(
                 "                let {ident} = CborValue::Null; // unsupported shape\n"
             ),
