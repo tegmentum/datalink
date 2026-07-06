@@ -2170,20 +2170,14 @@ fn is_dynlink_wired_aggregate(shape: &interface_db::AggregateShape) -> bool {
         return false;
     }
     // Raster aggregates that return a record (e.g. `st-summary-stats-agg`)
-    // need per-record marshaling substrate that AccKind::Raster doesn't
-    // ship — the record codec sites the Record-branch finalize body
-    // resolves against are declared for `AccKind::Record` only. Gate
-    // this combination out until the raster-record codec lands.
-    if matches!(shape.accumulator_kind, AccKind::Raster)
-        && matches!(
-            shape.ret,
-            RetShape::WitValueRecord { .. }
-                | RetShape::OptionWitValueRecord { .. }
-                | RetShape::FirstWitValueRecord { .. }
-        )
-    {
-        return false;
-    }
+    // use the same list-of-Bytes accumulator envelope as every other
+    // `AccKind::Raster` arm — the finalize wrap for `WitValueRecord`
+    // just forwards the provider-side `ResponseValue::Bytes` verbatim
+    // to SQL `Binary`. The provider re-serializes the WIT record as
+    // CBOR bytes before wrapping in `CborValue::Bytes`; see
+    // `postgis-wasm-provider`'s `st-summary-stats-agg` arm. No extra
+    // marshaling substrate is required on the emit side beyond the
+    // existing WitValueRecord wrap.
     matches!(
         shape.ret,
         RetShape::GeomBlob

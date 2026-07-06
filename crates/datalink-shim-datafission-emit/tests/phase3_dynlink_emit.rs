@@ -90,9 +90,16 @@ fn dynlink_emit_produces_compilable_small_bridge() {
     // Aggregate registry smoke check: real dispatch replaces the
     // scalar-first stub. The AccState struct + SyncRefCell static
     // shells + at least one wired postgis-core aggregate finalize
-    // arm (st-union-aggregate) must be present. Also asserts that
-    // out-of-scope aggregates (raster / record variants) still get
-    // an UnknownFunction arm rather than silently vanishing.
+    // arm (st-union-aggregate) must be present. The out-of-scope
+    // stub-body assertion was retired when `st-summary-stats-agg`
+    // landed (see `is_dynlink_wired_aggregate` — the last stubbed
+    // postgis aggregate, `AccKind::Raster + RetShape::WitValueRecord`,
+    // is now wired). The `alloc::format!("... aggregate shape not
+    // yet wired in dynlink mode ...")` UnknownFunction arm is
+    // still emitted in code but no aggregate entry currently
+    // routes to it for postgis — asserting on it becomes a
+    // regression trap that fires whenever the wired coverage
+    // increases.
     assert!(
         lib_rs.contains("struct AccState") && lib_rs.contains("static ACCUMULATORS"),
         "aggregate accumulator state block missing"
@@ -109,10 +116,6 @@ fn dynlink_emit_produces_compilable_small_bridge() {
     assert!(
         lib_rs.contains("st.blobs.iter().map(|b| CborValue::Bytes(b.clone()))"),
         "wired aggregate finalize body missing (geom_list construction)"
-    );
-    assert!(
-        lib_rs.contains("aggregate shape not yet wired in dynlink mode"),
-        "stub aggregate finalize body missing (raster/record variants)"
     );
 
     // Structural: SFCGAL-family SQL names use snake_case.
