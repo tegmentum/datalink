@@ -1908,7 +1908,11 @@ fn build_aggregate_registry_impl_dynlink(
                 // dispatch/postgis_core.rs). Mirror the scalar arm's fix
                 // (commit 2441545) and route on wit_func rather than sql_name.
                 let invoke_name = entry.shape.wit_func.replace('_', "-");
-                emit_dynlink_agg_finalize_body(&invoke_name, &entry.shape.ret)
+                emit_dynlink_agg_finalize_body(
+                    &invoke_name,
+                    &entry.shape.ret,
+                    &entry.shape.extra_args,
+                )
             } else {
                 format!(
                     "                let _ = st;\n\
@@ -2127,12 +2131,35 @@ impl aggregate_function_registry::Guest for Component {{
 /// wired set is gated only on the return-shape wrap the emit
 /// currently generates.
 fn is_dynlink_wired_aggregate(shape: &interface_db::AggregateShape) -> bool {
-    if !shape.extra_args.is_empty() {
-        return false;
+    // Extras are admitted for primitive scalar shapes only — the
+    // finalize body parses each config string into its CBOR wire
+    // form. Non-primitive extras (record, list, geometry) can't be
+    // shipped through the config-string ABI without additional
+    // marshaling substrate.
+    for p in &shape.extra_args {
+        if !matches!(
+            p,
+            ParamShape::F64
+                | ParamShape::S32
+                | ParamShape::S64
+                | ParamShape::U32
+                | ParamShape::U64
+                | ParamShape::Bool
+                | ParamShape::Text
+        ) {
+            return false;
+        }
     }
     let acc_ok = matches!(
         shape.accumulator_kind,
         AccKind::Geom
+            // AccKind::Raster admits raster-list aggregates. The
+            // finalize body ships the accumulated raster-binary
+            // blobs through the same `CborValue::List<Bytes>`
+            // envelope as geometry aggregates — the provider's
+            // per-arm decoder picks between `decode_geometry` and
+            // `decode_raster` by method name.
+            | AccKind::Raster
             | AccKind::Record { .. }
             | AccKind::RecordToScalar { .. }
             | AccKind::RecordToTuple { .. }
@@ -2140,6 +2167,21 @@ fn is_dynlink_wired_aggregate(shape: &interface_db::AggregateShape) -> bool {
             | AccKind::RecordSetToRecordSet { .. }
     );
     if !acc_ok {
+        return false;
+    }
+    // Raster aggregates that return a record (e.g. `st-summary-stats-agg`)
+    // need per-record marshaling substrate that AccKind::Raster doesn't
+    // ship — the record codec sites the Record-branch finalize body
+    // resolves against are declared for `AccKind::Record` only. Gate
+    // this combination out until the raster-record codec lands.
+    if matches!(shape.accumulator_kind, AccKind::Raster)
+        && matches!(
+            shape.ret,
+            RetShape::WitValueRecord { .. }
+                | RetShape::OptionWitValueRecord { .. }
+                | RetShape::FirstWitValueRecord { .. }
+        )
+    {
         return false;
     }
     matches!(
@@ -2156,6 +2198,17 @@ fn is_dynlink_wired_aggregate(shape: &interface_db::AggregateShape) -> bool {
             | RetShape::OptionInt
             | RetShape::Text
             | RetShape::OptionText
+            // Raster-blob returns (raster aggregates). Provider
+            // ships the aggregated raster's `as_binary()` as
+            // `CborValue::Bytes`; SQL surface is Binary.
+            | RetShape::RasterBlob
+            | RetShape::OptionRasterBlob
+            // list<geometry>-then-first projection: provider emits
+            // `CborValue::List<Bytes>` (per-cluster WKB), bridge
+            // returns the first element as SQL Binary (or Null on
+            // empty). Matches the scalar-side FirstGeomBlob wrap.
+            | RetShape::FirstGeomBlob
+            | RetShape::FirstRasterBlob
             // Record-shaped returns (mobilitydb temporal aggregators):
             // the provider re-serialises the record as CBOR bytes and
             // we ship them straight through as SQL BINARY.
@@ -2170,10 +2223,19 @@ fn is_dynlink_wired_aggregate(shape: &interface_db::AggregateShape) -> bool {
 }
 
 /// Emit the finalize body for a wired aggregate. The accumulator's
-/// WKB payloads ride to the provider as `CborValue::List<Bytes>`
-/// under `args[0]`; the response variant is unwrapped per return shape
-/// (Bytes → Binary, List<Float; 4|6> → WKB envelope, etc.).
-fn emit_dynlink_agg_finalize_body(invoke_name: &str, ret: &RetShape) -> String {
+/// WKB / raster-binary payloads ride to the provider as
+/// `CborValue::List<Bytes>` under `args[0]`; each captured extra
+/// config (planner literal, e.g. `st_clusterwithin(geom, 0.5)`'s
+/// `0.5`) is parsed from its config-string form into the matching
+/// CBOR wire type and appended after the list. The response variant
+/// is unwrapped per return shape (Bytes → Binary, List<Float; 4|6> →
+/// WKB envelope, List<Bytes>-then-first → Binary for
+/// `FirstGeomBlob` / `FirstRasterBlob`, etc.).
+fn emit_dynlink_agg_finalize_body(
+    invoke_name: &str,
+    ret: &RetShape,
+    extras: &[ParamShape],
+) -> String {
     let invoke = invoke_name.replace('"', "\\\"");
     let mut s = String::new();
     s.push_str(
@@ -2181,16 +2243,93 @@ fn emit_dynlink_agg_finalize_body(invoke_name: &str, ret: &RetShape) -> String {
          \x20                   st.blobs.iter().map(|b| CborValue::Bytes(b.clone())).collect(),\n\
          \x20               );\n",
     );
+    // Parse each config-string extra into its CBOR wire form.
+    // Extras arrive via `create-accumulator-with-config(s)` as raw
+    // planner-literal text — parse per WIT param type here so the
+    // provider's per-arm decoders (`as_u32` / `as_f64` / …) see the
+    // shape they expect.
+    let mut payload_idents: Vec<String> = vec!["geom_list".to_string()];
+    for (j, p) in extras.iter().enumerate() {
+        let ident = format!("extra{}", j);
+        let parse = match p {
+            ParamShape::F64 => format!(
+                "                let {ident} = {{\n\
+                 \x20                   let s = st.extras.get({j}).ok_or_else(|| ftypes::FunctionError::ExecutionError(alloc::format!(\"{invoke}: missing extra arg {j}\")))?;\n\
+                 \x20                   let v: f64 = s.parse().map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{invoke}: extra arg {j} not f64: {{}}\", e)))?;\n\
+                 \x20                   CborValue::Float(v)\n\
+                 \x20               }};\n",
+            ),
+            ParamShape::U32 | ParamShape::U64 => format!(
+                "                let {ident} = {{\n\
+                 \x20                   let s = st.extras.get({j}).ok_or_else(|| ftypes::FunctionError::ExecutionError(alloc::format!(\"{invoke}: missing extra arg {j}\")))?;\n\
+                 \x20                   let v: u64 = s.parse().map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{invoke}: extra arg {j} not unsigned int: {{}}\", e)))?;\n\
+                 \x20                   CborValue::Uint(v)\n\
+                 \x20               }};\n",
+            ),
+            ParamShape::S32 | ParamShape::S64 => format!(
+                "                let {ident} = {{\n\
+                 \x20                   let s = st.extras.get({j}).ok_or_else(|| ftypes::FunctionError::ExecutionError(alloc::format!(\"{invoke}: missing extra arg {j}\")))?;\n\
+                 \x20                   let v: i64 = s.parse().map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{invoke}: extra arg {j} not signed int: {{}}\", e)))?;\n\
+                 \x20                   CborValue::Int(v)\n\
+                 \x20               }};\n",
+            ),
+            ParamShape::Bool => format!(
+                "                let {ident} = {{\n\
+                 \x20                   let s = st.extras.get({j}).ok_or_else(|| ftypes::FunctionError::ExecutionError(alloc::format!(\"{invoke}: missing extra arg {j}\")))?;\n\
+                 \x20                   let v: bool = s.parse().map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{invoke}: extra arg {j} not bool: {{}}\", e)))?;\n\
+                 \x20                   CborValue::Bool(v)\n\
+                 \x20               }};\n",
+            ),
+            ParamShape::Text => format!(
+                "                let {ident} = {{\n\
+                 \x20                   let s = st.extras.get({j}).ok_or_else(|| ftypes::FunctionError::ExecutionError(alloc::format!(\"{invoke}: missing extra arg {j}\")))?;\n\
+                 \x20                   CborValue::Text(s.clone())\n\
+                 \x20               }};\n",
+            ),
+            _ => format!(
+                "                let {ident} = CborValue::Null; // unsupported extra shape (should be gated by is_dynlink_wired_aggregate)\n",
+            ),
+        };
+        s.push_str(&parse);
+        payload_idents.push(ident);
+    }
     s.push_str(&format!(
-        "                let resp = call(\"{invoke}\", alloc::vec![geom_list])?;\n"
+        "                let resp = call(\"{invoke}\", alloc::vec![{}])?;\n",
+        payload_idents.join(", "),
     ));
     let wrap = match ret {
         RetShape::GeomBlob
         | RetShape::Blob
         | RetShape::OptionGeomBlob
-        | RetShape::OptionBlob => {
+        | RetShape::OptionBlob
+        // RasterBlob shape: raster aggregates emit the aggregated
+        // raster's `as_binary()` as `CborValue::Bytes` on the wire.
+        // Same envelope as GeomBlob — the SQL surface is Binary
+        // either way; the classifier keeps the shape distinct only
+        // for provider-side substrate accounting.
+        | RetShape::RasterBlob
+        | RetShape::OptionRasterBlob => {
             "                match resp {\n\
              \x20                   ResponseValue::Bytes(b) => Ok(ftypes::ScalarValue::Binary(b)),\n\
+             \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
+             \x20                   other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"aggregate: unexpected response {:?}\", other))),\n\
+             \x20               }\n"
+        }
+        // list<geometry>-then-first projection: the provider emits
+        // `CborValue::List` of per-cluster WKB payloads; SQL surface
+        // is a single Binary (first element) or Null on empty. The
+        // classifier assigns this shape when a `list<geometry>`
+        // return is folded into a scalar SQL slot — same rule the
+        // scalar-side FirstGeomBlob wrap follows.
+        RetShape::FirstGeomBlob
+        | RetShape::FirstRasterBlob => {
+            "                match resp {\n\
+             \x20                   ResponseValue::Bytes(b) => Ok(ftypes::ScalarValue::Binary(b)),\n\
+             \x20                   ResponseValue::List(items) => match items.into_iter().next() {\n\
+             \x20                       Some(ResponseValue::Bytes(b)) => Ok(ftypes::ScalarValue::Binary(b)),\n\
+             \x20                       Some(ResponseValue::Null) | None => Ok(ftypes::ScalarValue::Null),\n\
+             \x20                       Some(other) => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"aggregate first-of-list: unexpected element {:?}\", other))),\n\
+             \x20                   },\n\
              \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
              \x20                   other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"aggregate: unexpected response {:?}\", other))),\n\
              \x20               }\n"
