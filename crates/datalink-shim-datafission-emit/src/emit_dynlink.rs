@@ -1463,6 +1463,15 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             | ParamShape::Enum { .. }
             | ParamShape::ListPrim(_)
             | ParamShape::ListListU8
+            // #823: `list<borrow<geometry>>` / `list<geometry>` — SQL
+            // surface is a JSON-array TEXT literal of WKB byte arrays
+            // (`'[[<u8>...], [<u8>...], ...]'`). Same wire shape as
+            // `ListListU8` — the arm body parses `Vec<Vec<u8>>` and
+            // forwards as `CborValue::List(<CborValue::Bytes>)`. Provider
+            // dispatchers decode via `decode_geometry_list`. Unlocks
+            // `st_as_geobuf`, `st_as_mvt`, `st_collect`, and other
+            // variadic-geometry arms.
+            | ParamShape::ListGeom
     )) && matches!(ret,
         RetShape::Text | RetShape::Real | RetShape::Int
             | RetShape::Blob | RetShape::BoolInt
@@ -1501,6 +1510,22 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             | RetShape::ListListU8
             | RetShape::ListBool
             | RetShape::JsonText { .. }
+            // #823: `tuple<X0, X1, ...>` return with a per-arm
+            // element-index override that projects a single tuple
+            // slot to a SQL scalar. Provider emits `CborValue::List`
+            // of primitives (matches the WacPlug path); bridge picks
+            // position `index` and wraps per `elem`.
+            | RetShape::TuplePick { .. }
+            // #823: WIT enum return. Provider serialises the case
+            // ordinal as `CborValue::Uint(n)` (see e.g.
+            // `pixel_type_to_u64` in
+            // `postgis-wasm-provider::dispatch::postgis_raster`);
+            // bridge wraps as `ScalarValue::Int64` matching the
+            // WacPlug convention. `OptionEnum` adds Null for None —
+            // no postgis arm classifies as OptionEnum today but the
+            // wire shape is the same modulo Null-passthrough.
+            | RetShape::Enum { .. }
+            | RetShape::OptionEnum { .. }
     )
 }
 
@@ -1525,6 +1550,9 @@ fn param_to_logicaltype_lit(p: &ParamShape) -> String {
         ParamShape::Text
         | ParamShape::ListPrim(_)
         | ParamShape::ListListU8
+        // ListGeom lowers to a JSON-array TEXT literal of WKB byte
+        // arrays — same SQL surface as ListListU8.
+        | ParamShape::ListGeom
         | ParamShape::OptionNone => "ftypes::LogicalType::Utf8".to_string(),
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
@@ -1569,6 +1597,24 @@ fn ret_to_logicaltype_lit(r: &RetShape) -> String {
         RetShape::ListListU8
         | RetShape::ListBool
         | RetShape::JsonText { .. } => "ftypes::LogicalType::Utf8".to_string(),
+        // #823: WIT enum return — advertised as Int64 (the ordinal).
+        // Matches WacPlug's convention.
+        RetShape::Enum { .. } | RetShape::OptionEnum { .. } => {
+            "ftypes::LogicalType::Int64".to_string()
+        }
+        // #823: tuple-pick — advertised type matches the projected
+        // element. Mirrors WacPlug's `dispatch::TuplePick` logical
+        // type mapping.
+        RetShape::TuplePick { elem, .. } => match elem {
+            ListPrimElem::F64 | ListPrimElem::F32 => "ftypes::LogicalType::Float64".to_string(),
+            ListPrimElem::S32
+            | ListPrimElem::S64
+            | ListPrimElem::U32
+            | ListPrimElem::U64
+            | ListPrimElem::U8 => "ftypes::LogicalType::Int64".to_string(),
+            ListPrimElem::Bool => "ftypes::LogicalType::Boolean".to_string(),
+            ListPrimElem::String => "ftypes::LogicalType::Utf8".to_string(),
+        },
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
 }
@@ -1667,6 +1713,28 @@ fn emit_scalar_arm_body(
                 i = i,
                 sql = sql,
             ),
+            // #823: `list<borrow<geometry>>` — same wire shape as
+            // `ListListU8` (nested byte arrays), but the SQL name is
+            // documented as a list of WKB blobs. Parse locally into
+            // `Vec<Vec<u8>>` and forward as `CborValue::List<Bytes>`;
+            // the provider dispatcher unpacks via
+            // `decode_geometry_list` (see e.g. `st-as-geobuf` in
+            // postgis-wasm-provider). WacPlug supports true variadic
+            // args here — the dynlink bridge takes the single-slot
+            // JSON-text path only (the SQL rewriter is expected to
+            // collapse variadic geometry lists into one JSON literal
+            // before the arm sees it).
+            ParamShape::ListGeom => format!(
+                "                let {ident} = {{\n\
+                                     let text = dfv_text(&args, {i}, \"{sql}\")?;\n\
+                                     let v: Vec<Vec<u8>> = serde_json::from_str(&text)\n\
+                                         .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} must be JSON list<geometry> as list<list<u8>> ({{}})\", e)))?;\n\
+                                     CborValue::List(v.into_iter().map(CborValue::Bytes).collect())\n\
+                                 }};\n",
+                ident = ident,
+                i = i,
+                sql = sql,
+            ),
             _ => format!(
                 "                let {ident} = CborValue::Null; // unsupported shape\n"
             ),
@@ -1743,6 +1811,56 @@ fn emit_scalar_arm_body(
         // ListTupleGeomF64) surface as positional arrays instead of
         // objects (accepted trade-off for the W4b landing).
         RetShape::JsonText { .. } => "                match resp {\n                    ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n                    other => {\n                        let s = response_to_json(&other, \"json\")?;\n                        Ok(ftypes::ScalarValue::Utf8(s))\n                    }\n                }",
+        // #823: WIT enum return — provider emits `CborValue::Uint(ordinal)`.
+        // Wrap as SQL Int64. `OptionEnum` accepts `CborValue::Null`
+        // for the None case. Both variants ship the same wire form
+        // as an Int-typed arm; the classifier keeps the shapes
+        // distinct so downstream tools (e.g. metadata dumpers) can
+        // recover the enum's case names later.
+        RetShape::Enum { .. } => "                match resp { ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Int64(u as i64)), ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Int64(i)), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"enum-return: unexpected {:?}\", other))) }",
+        RetShape::OptionEnum { .. } => "                match resp { ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Int64(u as i64)), ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Int64(i)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"option-enum-return: unexpected {:?}\", other))) }",
+        // #823: tuple-pick — provider emits `CborValue::List` of
+        // primitives (the tuple's positional payload); pick position
+        // `index` and wrap per element type. Matches WacPlug's
+        // `dispatch::TuplePick` semantics — the only difference is
+        // that we decode a `ResponseValue::List` sequence rather than
+        // dereferencing a Rust tuple field.
+        RetShape::TuplePick { index, elem } => {
+            let idx = *index;
+            let wrap_expr = match elem {
+                ListPrimElem::F64 | ListPrimElem::F32 => {
+                    "match __x {\n                            ResponseValue::Float(f) => Ok(ftypes::ScalarValue::Float64(*f)),\n                            ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Float64(*i as f64)),\n                            ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Float64(*u as f64)),\n                            other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"tuple-pick[{}]: unexpected {:?}\", __idx, other))),\n                        }"
+                }
+                ListPrimElem::S32
+                | ListPrimElem::S64
+                | ListPrimElem::U32
+                | ListPrimElem::U64
+                | ListPrimElem::U8 => {
+                    "match __x {\n                            ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Int64(*i)),\n                            ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Int64(*u as i64)),\n                            other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"tuple-pick[{}]: unexpected {:?}\", __idx, other))),\n                        }"
+                }
+                ListPrimElem::Bool => {
+                    "match __x {\n                            ResponseValue::Bool(b) => Ok(ftypes::ScalarValue::Boolean(*b)),\n                            other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"tuple-pick[{}]: unexpected {:?}\", __idx, other))),\n                        }"
+                }
+                ListPrimElem::String => {
+                    "match __x {\n                            ResponseValue::Text(t) => Ok(ftypes::ScalarValue::Utf8(t.clone())),\n                            other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"tuple-pick[{}]: unexpected {:?}\", __idx, other))),\n                        }"
+                }
+            };
+            let body = format!(
+                "                let __idx: usize = {idx};\n\
+                 \x20               match &resp {{\n\
+                 \x20                   ResponseValue::List(items) => {{\n\
+                 \x20                       let __x = items.get(__idx).ok_or_else(|| ftypes::FunctionError::ExecutionError(alloc::format!(\"tuple-pick: index {{}} out of range (len={{}})\", __idx, items.len())))?;\n\
+                 \x20                       {wrap_expr}\n\
+                 \x20                   }},\n\
+                 \x20                   ResponseValue::Null => Ok(ftypes::ScalarValue::Null),\n\
+                 \x20                   other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"tuple-pick: expected List, got {{:?}}\", other))),\n\
+                 \x20               }}",
+                idx = idx,
+                wrap_expr = wrap_expr,
+            );
+            lines.push_str(&body);
+            return lines;
+        }
         _ => "                Err(ftypes::FunctionError::ExecutionError(\"unsupported return shape\".to_string()))",
     };
     lines.push_str(wrap);
@@ -1907,7 +2025,20 @@ fn build_aggregate_registry_impl_dynlink(
                 // (see e.g. `"st-extent"` in postgis-wasm/crates/provider/src/
                 // dispatch/postgis_core.rs). Mirror the scalar arm's fix
                 // (commit 2441545) and route on wit_func rather than sql_name.
-                let invoke_name = entry.shape.wit_func.replace('_', "-");
+                //
+                // #823 Agent #907 Blocker 4: distinct method-name namespace
+                // for the aggregate finalize wire (blob-list) vs. the
+                // scalar arm's structured input. The provider ships a
+                // separate arm keyed on the `-agg` suffix which decodes
+                // `List<Bytes>` per-row payloads via `marshal::decode_*`
+                // and returns `Bytes`. Every mobilitydb aggregate finalize
+                // call routes through this suffixed name so the existing
+                // scalar arm (which may share the base kebab name — e.g.
+                // `tint-temporal-avg` at
+                // `mobilitydb-wasm-provider::dispatch/mobilitydb_analytics.rs`)
+                // keeps working for structured callers.
+                let invoke_name =
+                    format!("{}-agg", entry.shape.wit_func.replace('_', "-"));
                 emit_dynlink_agg_finalize_body(
                     &invoke_name,
                     &entry.shape.ret,
