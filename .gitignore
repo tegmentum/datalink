@@ -1,0 +1,4 @@
+# R2 / S3 credentials for publish scripts. Never commit — object-scoped
+# tokens. Per-crate .gitignore files handle each crate's /target; this
+# file only handles repo-root secrets that don't fit that pattern.
+/r2.env
