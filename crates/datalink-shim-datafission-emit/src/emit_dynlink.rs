@@ -524,7 +524,17 @@ fn lib_rs(plan: &BridgePlan, opts: &DynlinkOptions) -> Result<String> {
         // `entry.sql_name` is the postgis SQL alias in snake_case
         // (`st_geomfromtext`) and doesn't match — use the WIT function
         // name (`st_geom_from_text`) converted to kebab.
-        let invoke_name = entry.shape.wit_func.replace('_', "-");
+        //
+        // #823: `RetShape::TopoGeometryViaGeom` arms route through the
+        // provider's `-via-geom` companion (`create-topo-geom-via-geom`
+        // / `to-topogeom-via-geom`), which emits `CborValue::Bytes`
+        // for the assembled MULTI* WKB instead of the base arm's tgm
+        // wire form. The base arm names stay reserved for callers who
+        // need the tgm wire (e.g. `topogeom-add-element` chains).
+        let mut invoke_name = entry.shape.wit_func.replace('_', "-");
+        if matches!(entry.shape.ret, RetShape::TopoGeometryViaGeom) {
+            invoke_name.push_str("-via-geom");
+        }
         let body = emit_scalar_arm_body(sql, &invoke_name, &entry.shape.params, &entry.shape.ret, *fallible);
         execute_arms.push_str(&format!(
             "            \"{escaped}\" => {{\n{body}\n            }}\n",
@@ -1472,10 +1482,38 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             // `st_as_geobuf`, `st_as_mvt`, `st_collect`, and other
             // variadic-geometry arms.
             | ParamShape::ListGeom
+            // WitValueRecord param — SQL surface is a Binary literal
+            // carrying the WTV-framed CBOR envelope. Same wire shape
+            // as `Blob` / `Geom` — the arm body forwards the SQL
+            // Binary bytes verbatim as `CborValue::Bytes`; the
+            // provider dispatcher re-decodes the record via
+            // `ciborium::from_reader::<UPSTREAM, _>` (upstream WIT
+            // record type derives serde::Deserialize under
+            // `additional_derives`). Unlocks arms like the mobilitydb
+            // temporal-value inputs and the postgis `raster` param
+            // that carries record-typed data through the boundary.
+            | ParamShape::WitValueRecord { .. }
     )) && matches!(ret,
         RetShape::Text | RetShape::Real | RetShape::Int
             | RetShape::Blob | RetShape::BoolInt
             | RetShape::GeomBlob | RetShape::RasterBlob | RetShape::TopologyBlob
+            // #823: `topo-geometry` resource return, lifted via the
+            // provider's `-via-geom` companion arm to the assembled
+            // MULTI* WKB. The provider ships `CborValue::Bytes`
+            // (`topo_geometry.geometry().as_wkb()`); bridge decode is
+            // the same `Bytes -> Binary` path as `GeomBlob`. Provider
+            // side: see `create-topo-geom-via-geom` /
+            // `to-topogeom-via-geom` in
+            // `postgis-wasm/crates/provider/src/dispatch/postgis_topology.rs`.
+            | RetShape::TopoGeometryViaGeom
+            // #823: SFCGAL validity report — `tuple<bool,
+            // option<string>, option<geometry>>` with the location
+            // geometry lifted to WKT via `st_as_text`. Provider ships
+            // `CborValue::List([Bool, Text-or-Null, Text-or-Null])`;
+            // bridge decode formats as the PostgreSQL composite-type
+            // text `(valid,"reason","location")` — same SQL surface
+            // WacPlug produces.
+            | RetShape::IsValidDetailText
             // Option<T> returns — provider emits `CborValue::<T>` on
             // Some and `CborValue::Null` on None; wrap side turns
             // Null into `SqlValue::Null`.
@@ -1526,6 +1564,19 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             // wire shape is the same modulo Null-passthrough.
             | RetShape::Enum { .. }
             | RetShape::OptionEnum { .. }
+            // WitValueRecord returns — the provider re-serialises the
+            // WIT-generated record as CBOR bytes and wraps in
+            // `CborValue::Bytes`. Bridge forwards as SQL Binary. The
+            // magic-prefix WTV envelope adds `WTV\x01` + type_id + CBOR
+            // payload on the emit side so downstream consumers can
+            // rebuild the typed record. `FirstWitValueRecord` is the
+            // `list<R>`-then-first projection; the provider does the
+            // `.first()` conversion and either emits `CborValue::Bytes`
+            // (single-record CBOR envelope) or `CborValue::Null` on
+            // empty. `OptionWitValueRecord` follows the same shape.
+            | RetShape::WitValueRecord { .. }
+            | RetShape::OptionWitValueRecord { .. }
+            | RetShape::FirstWitValueRecord { .. }
     )
 }
 
@@ -1535,7 +1586,11 @@ fn param_to_logicaltype_lit(p: &ParamShape) -> String {
         | ParamShape::Geom
         | ParamShape::Geog
         | ParamShape::Raster
-        | ParamShape::Topology => "ftypes::LogicalType::Binary".to_string(),
+        | ParamShape::Topology
+        // WitValueRecord param — SQL Binary carrying the WTV-framed
+        // CBOR envelope. Provider ciborium-decodes into the
+        // wit-bindgen record type.
+        | ParamShape::WitValueRecord { .. } => "ftypes::LogicalType::Binary".to_string(),
         ParamShape::F64 => "ftypes::LogicalType::Float64".to_string(),
         ParamShape::S32
         | ParamShape::S64
@@ -1569,6 +1624,9 @@ fn ret_to_logicaltype_lit(r: &RetShape) -> String {
         RetShape::Text | RetShape::OptionText | RetShape::FirstText => {
             "ftypes::LogicalType::Utf8".to_string()
         }
+        // #823: `IsValidDetailText` renders as PostgreSQL composite-type
+        // text `(valid,"reason","location")` — Utf8 on the SQL surface.
+        RetShape::IsValidDetailText => "ftypes::LogicalType::Utf8".to_string(),
         RetShape::Real | RetShape::OptionReal | RetShape::FirstReal => {
             "ftypes::LogicalType::Float64".to_string()
         }
@@ -1579,6 +1637,10 @@ fn ret_to_logicaltype_lit(r: &RetShape) -> String {
         | RetShape::GeomBlob
         | RetShape::RasterBlob
         | RetShape::TopologyBlob
+        // #823: `TopoGeometryViaGeom` returns WKB Binary via the
+        // provider's `-via-geom` companion arm — same SQL surface as
+        // `GeomBlob`.
+        | RetShape::TopoGeometryViaGeom
         | RetShape::OptionBlob
         | RetShape::OptionGeomBlob
         | RetShape::OptionRasterBlob
@@ -1588,7 +1650,12 @@ fn ret_to_logicaltype_lit(r: &RetShape) -> String {
         | RetShape::FirstTopologyBlob
         // BboxBlob — WKB polygon (matches WacPlug's
         // `pg_ctor::st_make_envelope`).
-        | RetShape::BboxBlob => "ftypes::LogicalType::Binary".to_string(),
+        | RetShape::BboxBlob
+        // WitValueRecord returns — Binary carrying the WTV-framed
+        // CBOR envelope. Bridge forwards provider bytes verbatim.
+        | RetShape::WitValueRecord { .. }
+        | RetShape::OptionWitValueRecord { .. }
+        | RetShape::FirstWitValueRecord { .. } => "ftypes::LogicalType::Binary".to_string(),
         RetShape::BoolInt => "ftypes::LogicalType::Boolean".to_string(),
         // `result<_, E>` unit-OK — SQL NULL. Advertise as Binary
         // so the neutral logical type marshals a NULL cleanly.
@@ -1640,7 +1707,13 @@ fn emit_scalar_arm_body(
             | ParamShape::Geom
             | ParamShape::Geog
             | ParamShape::Raster
-            | ParamShape::Topology => format!(
+            | ParamShape::Topology
+            // WitValueRecord param — SQL surface is Binary carrying
+            // the WTV-framed record envelope. Provider dispatcher
+            // ciborium-decodes the payload straight into the
+            // wit-bindgen record type (upstream derives serde
+            // via `additional_derives`). Wire shape = Blob.
+            | ParamShape::WitValueRecord { .. } => format!(
                 "                let {ident} = CborValue::Bytes(dfv_blob(&args, {i}, \"{sql}\")?);\n"
             ),
             // Option<T> param the codegen elects to default. Mirrors
@@ -1757,7 +1830,17 @@ fn emit_scalar_arm_body(
         RetShape::Blob
         | RetShape::GeomBlob
         | RetShape::RasterBlob
-        | RetShape::TopologyBlob => "                match resp { ResponseValue::Bytes(b) => Ok(ftypes::ScalarValue::Binary(b)), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        | RetShape::TopologyBlob
+        // #823: `TopoGeometryViaGeom` — provider's `-via-geom` companion
+        // arm emits `CborValue::Bytes` for the assembled MULTI* WKB.
+        // Same decode path as `GeomBlob`.
+        | RetShape::TopoGeometryViaGeom => "                match resp { ResponseValue::Bytes(b) => Ok(ftypes::ScalarValue::Binary(b)), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        // #823: `IsValidDetailText` — provider emits
+        // `CborValue::List([Bool, Text-or-Null, Text-or-Null])`. Bridge
+        // renders the PostgreSQL composite-type text form
+        // `(valid,"reason","location")` byte-for-byte matching WacPlug's
+        // `emit_lib.rs` `RetShape::IsValidDetailText` arm.
+        RetShape::IsValidDetailText => "                match resp {\n                    ResponseValue::List(items) if items.len() == 3 => {\n                        let valid = match &items[0] {\n                            ResponseValue::Bool(b) => *b,\n                            other => return Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"is-valid-detail[0] expected Bool, got {:?}\", other))),\n                        };\n                        let reason = match &items[1] {\n                            ResponseValue::Text(s) => s.clone(),\n                            ResponseValue::Null => String::new(),\n                            other => return Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"is-valid-detail[1] expected Text or Null, got {:?}\", other))),\n                        };\n                        let loc = match &items[2] {\n                            ResponseValue::Text(s) => s.clone(),\n                            ResponseValue::Null => String::new(),\n                            other => return Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"is-valid-detail[2] expected Text or Null, got {:?}\", other))),\n                        };\n                        Ok(ftypes::ScalarValue::Utf8(alloc::format!(\"({},\\\"{}\\\",\\\"{}\\\")\", valid, reason, loc)))\n                    }\n                    other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"is-valid-detail: expected 3-element List, got {:?}\", other))),\n                }",
         RetShape::BoolInt => "                match resp { ResponseValue::Bool(b) => Ok(ftypes::ScalarValue::Boolean(b)), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
         // Option<T> — provider emits `CborValue::T` on Some or
         // `CborValue::Null` on None; forward None as SQL NULL.
@@ -1819,6 +1902,16 @@ fn emit_scalar_arm_body(
         // recover the enum's case names later.
         RetShape::Enum { .. } => "                match resp { ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Int64(u as i64)), ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Int64(i)), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"enum-return: unexpected {:?}\", other))) }",
         RetShape::OptionEnum { .. } => "                match resp { ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Int64(u as i64)), ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Int64(i)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"option-enum-return: unexpected {:?}\", other))) }",
+        // WitValueRecord returns — provider ciborium-encodes the
+        // WIT-generated record and wraps in `CborValue::Bytes`. We
+        // forward the WTV-framed payload verbatim as SQL Binary. The
+        // Null path covers `Option<R>` and `list<R>`-then-first empty
+        // cases (the provider emits `CborValue::Null` there). Same
+        // wire shape as the aggregate finalize wrap for
+        // `WitValueRecord*` — see the sibling arm above (~line 2509).
+        RetShape::WitValueRecord { .. }
+        | RetShape::OptionWitValueRecord { .. }
+        | RetShape::FirstWitValueRecord { .. } => "                match resp { ResponseValue::Bytes(b) => Ok(ftypes::ScalarValue::Binary(b)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"wit-value-record: unexpected {:?}\", other))) }",
         // #823: tuple-pick — provider emits `CborValue::List` of
         // primitives (the tuple's positional payload); pick position
         // `index` and wrap per element type. Matches WacPlug's
