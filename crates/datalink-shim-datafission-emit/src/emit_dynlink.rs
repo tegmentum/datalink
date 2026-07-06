@@ -455,11 +455,29 @@ fn lib_rs(plan: &BridgePlan, opts: &DynlinkOptions) -> Result<String> {
         for (k, v) in ret_hist {
             eprintln!("  - {} × {}", k, v);
         }
-        for e in &skipped[..skipped.len().min(5)] {
-            eprintln!("  - {}", e.sql_name);
+        // Per-arm dump gated on env var — the default keeps CI log
+        // volume down while `SKIPPED_ARM_DUMP=1` lets an operator
+        // enumerate the exact set (with param + return shapes) when
+        // triaging which shape to admit next.
+        let dump_all = std::env::var("SKIPPED_ARM_DUMP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let head = if dump_all { skipped.len() } else { skipped.len().min(5) };
+        for e in &skipped[..head] {
+            if dump_all {
+                let ps: Vec<String> = e.shape.params.iter().map(|p| format!("{:?}", p)).collect();
+                eprintln!(
+                    "  - {} :: params=[{}] ret={:?}",
+                    e.sql_name,
+                    ps.join(", "),
+                    e.shape.ret,
+                );
+            } else {
+                eprintln!("  - {}", e.sql_name);
+            }
         }
-        if skipped.len() > 5 {
-            eprintln!("  - ... ({} more)", skipped.len() - 5);
+        if !dump_all && skipped.len() > 5 {
+            eprintln!("  - ... ({} more; SKIPPED_ARM_DUMP=1 to enumerate)", skipped.len() - 5);
         }
     }
 
@@ -1548,6 +1566,15 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             | RetShape::OptionText | RetShape::OptionReal | RetShape::OptionInt
             | RetShape::OptionBlob | RetShape::OptionGeomBlob
             | RetShape::OptionRasterBlob | RetShape::OptionTopologyBlob
+            // #823: `option<bool>` — provider emits `CborValue::Bool(v)` on
+            // Some and `CborValue::Null` on None; wrap turns Null into SQL
+            // Null and Bool into `ScalarValue::Boolean`. Same shape family
+            // as the other Option primitives above. Unlocks the mobilitydb
+            // `tbool-value-at` / `tbool-start-value` / `tbool-end-value` /
+            // `tbool-value-n` / `bitemporal-bool-*` / `tgeography-is-simple`
+            // family (10 scalars, provider dispatch arms still pending in
+            // mobilitydb-wasm/crates/provider).
+            | RetShape::OptionBoolInt
             // list<T>-then-first projections — provider does the
             // `.first()` conversion internally and emits Bytes (or
             // Null when the list is empty). Same wire as *Blob for
@@ -1695,7 +1722,9 @@ fn ret_to_logicaltype_lit(r: &RetShape) -> String {
         | RetShape::WitValueRecord { .. }
         | RetShape::OptionWitValueRecord { .. }
         | RetShape::FirstWitValueRecord { .. } => "ftypes::LogicalType::Binary".to_string(),
-        RetShape::BoolInt => "ftypes::LogicalType::Boolean".to_string(),
+        RetShape::BoolInt | RetShape::OptionBoolInt => {
+            "ftypes::LogicalType::Boolean".to_string()
+        }
         // `result<_, E>` unit-OK — SQL NULL. Advertise as Binary
         // so the neutral logical type marshals a NULL cleanly.
         RetShape::Unit => "ftypes::LogicalType::Binary".to_string(),
@@ -1939,6 +1968,10 @@ fn emit_scalar_arm_body(
         RetShape::OptionText => "                match resp { ResponseValue::Text(s) => Ok(ftypes::ScalarValue::Utf8(s)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
         RetShape::OptionReal => "                match resp { ResponseValue::Float(f) => Ok(ftypes::ScalarValue::Float64(f)), ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Float64(i as f64)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
         RetShape::OptionInt => "                match resp { ResponseValue::Int(i) => Ok(ftypes::ScalarValue::Int64(i)), ResponseValue::Uint(u) => Ok(ftypes::ScalarValue::Int64(u as i64)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
+        // #823: `option<bool>` — provider emits `CborValue::Bool(v)` on
+        // Some, `CborValue::Null` on None. Wrap to Boolean / Null. Symmetric
+        // with `BoolInt` above but admits the None side.
+        RetShape::OptionBoolInt => "                match resp { ResponseValue::Bool(b) => Ok(ftypes::ScalarValue::Boolean(b)), ResponseValue::Null => Ok(ftypes::ScalarValue::Null), other => Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"unexpected: {:?}\", other))) }",
         // Option<blob-shaped> — same Bytes/Null two-way as Blob but
         // admits Null on the None side. Covers OptionBlob / raster /
         // topology / geom, plus the First*Blob dispatch that emits
