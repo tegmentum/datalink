@@ -627,9 +627,16 @@ fn render_return_expr(
             )
         }
         RetShape::JsonText { kind } => match kind {
+            // #823 (agent #928): `ListRecord` (bare `list<R>` return
+            // for mutation-style arms) reuses the same
+            // `serde_json::to_string(&__r)` template — same encode
+            // path as `ListListPrim` / `ListTuplePrim`; the upstream
+            // `Vec<R>` serialises via wit-bindgen's `Serialize`
+            // derive on the record element.
             JsonRetKind::ListListPrim(_)
             | JsonRetKind::ListTuplePrim(_)
             | JsonRetKind::ListTupleMixed(_)
+            | JsonRetKind::ListRecord(_)
             | JsonRetKind::TuplePrim(_) => format!(
                 "{{\n\
                  {i}    let __r = {call_expr}{unwrap_chain};\n\

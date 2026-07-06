@@ -675,9 +675,16 @@ fn render_ret_to_scalarvalue(
             // `serde_json::to_string(&__r)` template — the
             // upstream `Vec<(String, UPSTREAM_R)>` serializes
             // via the record's wit-bindgen `Serialize` derive.
+            // #823 (agent #928): `ListRecord` (bare `list<R>` return
+            // for mutation-style arms — see `is_mutation_style_list_return`
+            // in interface_db.rs) uses the identical
+            // `serde_json::to_string(&__r)` template — records carry
+            // `Serialize` via wit-bindgen's `additional_derives`, so
+            // the outer `Vec<R>` renders as a JSON array of objects.
             JsonRetKind::ListListPrim(_)
             | JsonRetKind::ListTuplePrim(_)
             | JsonRetKind::ListTupleMixed(_)
+            | JsonRetKind::ListRecord(_)
             | JsonRetKind::TuplePrim(_) => format!(
                 "{{\n\
                  {i}    let __r = {call_expr}{unwrap_chain};\n\

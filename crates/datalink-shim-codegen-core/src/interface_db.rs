@@ -719,6 +719,32 @@ pub enum JsonRetKind {
     /// consume the JSON array of nested objects via SQLite's JSON1
     /// ops / DuckDB's `json_extract`.
     OptionListRecord(String),
+    /// #823 (agent #928): bare `list<R>` return where R is a same-shim
+    /// record AND the WIT function's kebab name matches a mutation-
+    /// style suffix (`-append`, `-set`, `-delete`, `-remove`, or
+    /// `-array-append`). Emit template renders `serde_json::to_string`
+    /// on the upstream `Vec<R>` — records carry `serde::Serialize`
+    /// via wit-bindgen's `additional_derives`, matching the sibling
+    /// `OptionListRecord` template exactly on the encode side; the
+    /// only difference is that the upstream value is bare `Vec<R>`
+    /// (not `Option<Vec<R>>`), so there's no None-to-NULL arm.
+    ///
+    /// Today's surface (postgis topology): `topo-element-array-append`
+    /// -> `list<topo-element>`. Prior to this variant the classifier
+    /// collapsed the whole list to `FirstWitValueRecord` — a lossy
+    /// projection that surfaced only element 0 to SQL. Mutation arms
+    /// need every element (users read the updated array back), so the
+    /// JSON-text carrier admits full-list preservation; SQL callers
+    /// unpack via SQLite's `json_each()` / DuckDB's `json_extract`.
+    /// Query-shape arms (`tgm-get-elements`, `tgm-get-element-array`,
+    /// `st-get-topo-geom-elements`) still route through
+    /// `FirstWitValueRecord` — the heuristic intentionally scopes to
+    /// mutation-style names so the query surface stays scalar.
+    ///
+    /// The carried `String` is the record's kebab name — captured for
+    /// diagnostics / codec-helper lookup, mirroring
+    /// `OptionListPrimRecord` / `OptionListRecord`.
+    ListRecord(String),
     /// #716: `option<list<X>>` for primitive X — Some(vec) →
     /// `serde_json::to_string` on the inner `Vec<X>`; None → SQL NULL.
     /// Today's surface (mobilitydb): the four `*-set-from-text`
@@ -2470,7 +2496,7 @@ pub fn classify_shape(
         params.push(ps);
     }
 
-    let ret = classify_return(&f.ret, records, enums, &f.interface)?;
+    let ret = classify_return(&f.ret, records, enums, &f.interface, &f.kebab_name)?;
 
     Ok(DispatchShape {
         wit_module: alias,
@@ -2657,7 +2683,7 @@ pub fn classify_aggregate_shape(
         })?);
     }
 
-    let ret = classify_return(&f.ret, records, enums, &f.interface)?;
+    let ret = classify_return(&f.ret, records, enums, &f.interface, &f.kebab_name)?;
 
     // #607 Phase 0 + #612 (OQ1): when the first param is a
     // `list<record>` (Record accumulator path), resolve the output
@@ -3434,11 +3460,48 @@ pub fn classify_param(
     })
 }
 
+/// #823 (agent #928): does the WIT function's kebab name look like a
+/// mutation-style arm — one that grows / edits / removes items in an
+/// input list and returns the modified list to the caller?
+///
+/// The check is a suffix match on the arm's kebab name. Covers the
+/// canonical mutation suffixes seen in postgis / mobilitydb WIT:
+///   * `-append` / `-array-append` — postgis topology
+///     `topo-element-array-append`.
+///   * `-set` / `-set-*` — future-proof: no `list<R>`-returning `-set`
+///     arm exists today, but the same "user needs every element back"
+///     motivation applies.
+///   * `-delete` / `-remove` — same.
+///
+/// Only used to route `list<R>` returns through the JsonText carrier
+/// (variant `JsonRetKind::ListRecord`) instead of the lossy
+/// `FirstWitValueRecord` projection. Query-shape arms (`-get-*` /
+/// unprefixed) stay on `FirstWitValueRecord` so the scalar surface
+/// doesn't unexpectedly flip to a JSON-text return.
+fn is_mutation_style_list_return(fn_kebab: &str) -> bool {
+    // Suffix (dash-prefixed) OR the exact form — no substring match
+    // to avoid tripping on `-appender`, `-settings`, etc. Every check
+    // requires the preceding `-` so name fragments like `reset` /
+    // `basement` don't collide.
+    fn_kebab.ends_with("-append")
+        || fn_kebab.ends_with("-array-append")
+        || fn_kebab.ends_with("-delete")
+        || fn_kebab.ends_with("-remove")
+        || fn_kebab.ends_with("-set")
+        // `-set-<x>` is a common PostGIS shape (`st-set-srid`,
+        // `st-set-value`, etc.) — accept the family but keep the
+        // list<R>-return gate below as the actual selector so the
+        // scalar `-set-*` arms (which return `raster` / `geometry`,
+        // not `list<R>`) are unaffected.
+        || fn_kebab.contains("-set-")
+}
+
 pub fn classify_return(
     r: &WitRet,
     records: &[RecordType],
     enums: &[EnumWithPackage],
     caller_interface: &str,
+    fn_kebab: &str,
 ) -> Result<RetShape, String> {
     // #753 / #754: rewrite same-kebab collisions (`geography`,
     // `geometry`) from resource-form to record-form when the caller's
@@ -3662,6 +3725,21 @@ pub fn classify_return(
         WitType::List(inner) => match inner.as_ref() {
             WitType::Unsupported(s) => {
                 if let Some(rec) = find_record(records, s, caller_interface) {
+                    // #823 (agent #928): mutation-style arms need the
+                    // FULL list back, not a first-element projection.
+                    // Route to the JsonText carrier so the whole
+                    // `Vec<R>` reaches the SQL surface as a JSON-array
+                    // text (unpacked via `json_each()` on SQLite,
+                    // `json_extract` on DuckDB). Query-shape arms keep
+                    // the `FirstWitValueRecord` projection — the
+                    // scalar surface has no `list<R>` variant, so
+                    // "first element" is the historical fallback for
+                    // callers that only need one row.
+                    if is_mutation_style_list_return(fn_kebab) {
+                        return Ok(RetShape::JsonText {
+                            kind: JsonRetKind::ListRecord(rec.kebab_name.clone()),
+                        });
+                    }
                     let type_id_hex: String =
                         rec.type_id.iter().map(|b| format!("{:02x}", b)).collect();
                     return Ok(RetShape::FirstWitValueRecord {
@@ -4770,7 +4848,7 @@ mod geog_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let shape = classify_return(&r, &records, &enums, "tgeography-ops").unwrap();
+        let shape = classify_return(&r, &records, &enums, "tgeography-ops", "test-fn").unwrap();
         assert!(
             matches!(shape, RetShape::WitValueRecord { .. }),
             "expected WitValueRecord, got {shape:?}",
@@ -4786,7 +4864,7 @@ mod geog_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let shape = classify_return(&r, &records, &enums, "tgeography-ops").unwrap();
+        let shape = classify_return(&r, &records, &enums, "tgeography-ops", "test-fn").unwrap();
         assert!(
             matches!(shape, RetShape::OptionWitValueRecord { .. }),
             "expected OptionWitValueRecord, got {shape:?}",
@@ -4802,7 +4880,7 @@ mod geog_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let shape = classify_return(&r, &records, &enums, "postgis-scalars").unwrap();
+        let shape = classify_return(&r, &records, &enums, "postgis-scalars", "test-fn").unwrap();
         assert!(matches!(shape, RetShape::GeomBlob), "expected GeomBlob, got {shape:?}");
     }
 }
@@ -4883,7 +4961,7 @@ mod geom_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let shape = classify_return(&r, &records, &enums, "tgeometry-ops").unwrap();
+        let shape = classify_return(&r, &records, &enums, "tgeometry-ops", "test-fn").unwrap();
         assert!(
             matches!(shape, RetShape::WitValueRecord { .. }),
             "expected WitValueRecord, got {shape:?}",
@@ -4899,7 +4977,7 @@ mod geom_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let shape = classify_return(&r, &records, &enums, "tgeometry-ops").unwrap();
+        let shape = classify_return(&r, &records, &enums, "tgeometry-ops", "test-fn").unwrap();
         assert!(
             matches!(shape, RetShape::OptionWitValueRecord { .. }),
             "expected OptionWitValueRecord, got {shape:?}",
@@ -4919,7 +4997,7 @@ mod geom_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let shape = classify_return(&r, &records, &enums, "tgeometry-ops").unwrap();
+        let shape = classify_return(&r, &records, &enums, "tgeometry-ops", "test-fn").unwrap();
         assert!(
             matches!(shape, RetShape::FirstWitValueRecord { .. }),
             "expected FirstWitValueRecord, got {shape:?}",
@@ -4935,7 +5013,7 @@ mod geom_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let shape = classify_return(&r, &records, &enums, "postgis-scalars").unwrap();
+        let shape = classify_return(&r, &records, &enums, "postgis-scalars", "test-fn").unwrap();
         assert!(matches!(shape, RetShape::GeomBlob), "expected GeomBlob, got {shape:?}");
     }
 
@@ -4951,7 +5029,7 @@ mod geom_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let shape = classify_return(&r, &records, &enums, "postgis-scalars").unwrap();
+        let shape = classify_return(&r, &records, &enums, "postgis-scalars", "test-fn").unwrap();
         assert!(
             matches!(shape, RetShape::FirstGeomBlob),
             "expected FirstGeomBlob, got {shape:?}",
@@ -5602,7 +5680,7 @@ mod option_list_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let shape = classify_return(&r, &records, &enums, "temporal-append-ops").unwrap();
+        let shape = classify_return(&r, &records, &enums, "temporal-append-ops", "test-fn").unwrap();
         match shape {
             RetShape::JsonText { kind } => match kind {
                 JsonRetKind::OptionListRecord(name) => {
@@ -5646,7 +5724,7 @@ mod option_list_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let shape = classify_return(&r, &records, &enums, "spanset-constructor-ops").unwrap();
+        let shape = classify_return(&r, &records, &enums, "spanset-constructor-ops", "test-fn").unwrap();
         match shape {
             RetShape::JsonText { kind } => match kind {
                 JsonRetKind::OptionListPrimRecord(name) => {
@@ -5891,7 +5969,7 @@ mod option_list_record_tests {
             fallible: false,
             error_ty: None,
         };
-        let err = classify_return(&r, &records, &enums, "temporal-append-ops").unwrap_err();
+        let err = classify_return(&r, &records, &enums, "temporal-append-ops", "test-fn").unwrap_err();
         assert!(
             err.contains("not in dispatcher alphabet"),
             "expected alphabet-diagnostic, got {err}",

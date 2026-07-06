@@ -814,9 +814,15 @@ pub fn emit_arm_body(
             // `ListTuplePrim` — the upstream `Vec<(String,
             // UPSTREAM_R)>` serializes via wit-bindgen's
             // `Serialize` derive on the record element.
+            // #823 (agent #928): `ListRecord` (bare `list<R>` return
+            // for mutation-style arms) reuses the same
+            // `serde_json::to_string(&__r)` template — the upstream
+            // `Vec<R>` renders as a JSON array of objects via
+            // wit-bindgen's `Serialize` derive on the record element.
             JsonRetKind::ListListPrim(_)
             | JsonRetKind::ListTuplePrim(_)
             | JsonRetKind::ListTupleMixed(_)
+            | JsonRetKind::ListRecord(_)
             | JsonRetKind::TuplePrim(_) => format!(
                 "{{\n\
                  {i}    let __r = {call_expr}{unwrap_chain};\n\
