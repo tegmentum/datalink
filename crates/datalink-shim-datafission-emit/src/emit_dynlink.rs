@@ -697,8 +697,27 @@ impl<'de> serde::Deserialize<'de> for ResponseValue {{
             fn visit_i64<E: Error>(self, v: i64) -> Result<ResponseValue, E> {{
                 Ok(ResponseValue::Int(v))
             }}
+            fn visit_u8<E: Error>(self, v: u8) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Int(v as i64))
+            }}
+            fn visit_u16<E: Error>(self, v: u16) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Int(v as i64))
+            }}
+            fn visit_u32<E: Error>(self, v: u32) -> Result<ResponseValue, E> {{
+                Ok(ResponseValue::Int(v as i64))
+            }}
+            // Positive CBOR unsigned int is inherently ambiguous — the
+            // wire form for `Int(n)` and `Uint(n)` with n >= 0 is
+            // identical (major type 0). Canonicalise positive values
+            // that fit in i64 as `Int` so timestamps and other s64
+            // fields round-trip cleanly. Values above i64::MAX still
+            // decode as `Uint` to preserve the full u64 range.
             fn visit_u64<E: Error>(self, v: u64) -> Result<ResponseValue, E> {{
-                Ok(ResponseValue::Uint(v))
+                if v <= i64::MAX as u64 {{
+                    Ok(ResponseValue::Int(v as i64))
+                }} else {{
+                    Ok(ResponseValue::Uint(v))
+                }}
             }}
             fn visit_f64<E: Error>(self, v: f64) -> Result<ResponseValue, E> {{
                 Ok(ResponseValue::Float(v))
