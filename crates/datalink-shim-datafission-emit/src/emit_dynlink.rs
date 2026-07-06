@@ -1539,6 +1539,30 @@ fn is_primitive_shape(params: &[ParamShape], ret: &RetShape) -> bool {
             // dispatcher decodes recursively. Unlocks postgis
             // raster `st-set-values` (`list<list<f64>>` values).
             | ParamShape::ListListPrim(_)
+            // #823 (agent #926): `list<tuple<P1, P2, ...>>` param
+            // where every Pi is a primitive kind (`ListPrimElem`).
+            // Structural analog of `ListListPrim` — same wire depth
+            // (list-of-list-of-prim), but each inner list is a
+            // fixed-arity heterogeneous tuple whose element types
+            // come from the interface DB's tuple metadata (see
+            // `interface_db.rs::classify_param` around the
+            // `ParamShape::ListTuple { elements }` return). SQL
+            // passes a JSON-array TEXT literal matching
+            // `Vec<Vec<serde_json::Value>>`; the emit body decodes
+            // each inner tuple slot with the per-position primitive
+            // rule (`list_prim_rust_ty` / `list_prim_cbor_wrap`) and
+            // forwards as `CborValue::List(Vec<CborValue::List(...)>)`.
+            // Provider dispatchers already accept that wire —
+            // `decode_coord_pairs` at mobilitydb_core.rs:613 is the
+            // reference decode for `to-geojson-linestring`
+            // (`list<tuple<f64, f64>>`). Also unlocks
+            // `datespanset-{make,lower,upper}` (`list<tuple<s32, s32>>`)
+            // and `tbigint-sequence-from-pairs` /
+            // `tjsonb-sequence-from-pairs`
+            // (`list<tuple<timestamp-tz, ...>>` — timestamp-tz aliases
+            // to `s64` so the interface DB reduces the tuple to a
+            // pure-primitive `ListTuple`).
+            | ParamShape::ListTuple { .. }
     )) && matches!(ret,
         RetShape::Text | RetShape::Real | RetShape::Int
             | RetShape::Blob | RetShape::BoolInt
@@ -1674,6 +1698,11 @@ fn param_to_logicaltype_lit(p: &ParamShape) -> String {
         // `ListListU8` but the element type is arbitrary primitive
         // (non-u8).
         | ParamShape::ListListPrim(_)
+        // #823 (agent #926): `list<tuple<P...>>` — SQL passes a
+        // JSON-array TEXT literal of fixed-arity inner arrays. Same
+        // Utf8 surface as `ListListPrim`; the emit body handles the
+        // per-position heterogeneous decode.
+        | ParamShape::ListTuple { .. }
         | ParamShape::OptionNone => "ftypes::LogicalType::Utf8".to_string(),
         _ => "ftypes::LogicalType::Binary".to_string(),
     }
@@ -1929,6 +1958,79 @@ fn emit_scalar_arm_body(
                 i = i,
                 sql = sql,
             ),
+            // #823 (agent #926): `list<tuple<P1, P2, ...>>` (all
+            // primitive). SQL passes a JSON-array TEXT literal
+            // matching `Vec<[Pi; N]>` — each inner is a fixed-arity
+            // heterogeneous tuple whose element types come from the
+            // interface DB's tuple metadata. Emit body parses each
+            // inner slot as `serde_json::Value` (heterogeneous
+            // element types can't share a single Rust type), decodes
+            // the per-position primitive with the shared
+            // `list_prim_rust_ty` rule, then wraps the outer as
+            // `CborValue::List(Vec<CborValue::List(<per-elem CborValue>...)>)`.
+            // Matches the wire form the provider dispatchers expect
+            // — see `decode_coord_pairs` at
+            // `mobilitydb-wasm/crates/provider/src/dispatch/mobilitydb_core.rs:613`
+            // for the `to-geojson-linestring`
+            // (`list<tuple<f64, f64>>`) reference decode.
+            ParamShape::ListTuple { elements } => {
+                let arity = elements.len();
+                let mut per_elem = String::new();
+                for (pos, elem) in elements.iter().enumerate() {
+                    let rust_ty = list_prim_rust_ty(*elem);
+                    let suffix = elem.helper_suffix();
+                    let cbor_wrap = list_prim_cbor_wrap(*elem);
+                    // Consume `it.next()` — take ownership so the
+                    // wrap arms that move (e.g. `CborValue::Text(x)`)
+                    // don't have to clone. `serde_json::from_value`
+                    // handles the per-position primitive coercion
+                    // (rejects mistyped slots with an ExecutionError).
+                    // Arity was pre-checked so `next()` never returns
+                    // None here.
+                    per_elem.push_str(&format!(
+                        "                                         let raw_{pos} = it.next().unwrap();\n\
+                                         let x: {rust_ty} = serde_json::from_value(raw_{pos})\n\
+                                             .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} tuple[{{}}][{pos}] must be {suffix} ({{}})\", __tuple_i, e)))?;\n\
+                                         items.push({cbor_wrap});\n",
+                        pos = pos,
+                        rust_ty = rust_ty,
+                        suffix = suffix,
+                        cbor_wrap = cbor_wrap,
+                        i = i,
+                        sql = sql,
+                    ));
+                }
+                let sig: Vec<&str> = elements.iter().map(|e| e.helper_suffix()).collect();
+                let sig_label = sig.join(", ");
+                format!(
+                    "                let {ident} = {{\n\
+                                     let text = dfv_text(&args, {i}, \"{sql}\")?;\n\
+                                     let outer: Vec<serde_json::Value> = serde_json::from_str(&text)\n\
+                                         .map_err(|e| ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} must be JSON list<tuple<{sig_label}>> ({{}})\", e)))?;\n\
+                                     let mut out: Vec<CborValue> = Vec::with_capacity(outer.len());\n\
+                                     for (__tuple_i, val) in outer.into_iter().enumerate() {{\n\
+                                         let inner: Vec<serde_json::Value> = match val {{\n\
+                                             serde_json::Value::Array(a) => a,\n\
+                                             other => return Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} tuple[{{}}] expected JSON array, got {{:?}}\", __tuple_i, other))),\n\
+                                         }};\n\
+                                         if inner.len() != {arity} {{\n\
+                                             return Err(ftypes::FunctionError::ExecutionError(alloc::format!(\"{sql}: arg {i} tuple[{{}}] expected {arity} elements, got {{}}\", __tuple_i, inner.len())));\n\
+                                         }}\n\
+                                         let mut it = inner.into_iter();\n\
+                                         let mut items: Vec<CborValue> = Vec::with_capacity({arity});\n\
+{per_elem}\
+                                         out.push(CborValue::List(items));\n\
+                                     }}\n\
+                                     CborValue::List(out)\n\
+                                 }};\n",
+                    ident = ident,
+                    i = i,
+                    sql = sql,
+                    sig_label = sig_label,
+                    arity = arity,
+                    per_elem = per_elem,
+                )
+            }
             _ => format!(
                 "                let {ident} = CborValue::Null; // unsupported shape\n"
             ),
