@@ -1882,7 +1882,12 @@ fn build_aggregate_registry_impl_dynlink(
 
         if emitted_finalize.insert(arm_idx) {
             let body = if dynlink_wired {
-                emit_dynlink_agg_finalize_body(&entry.sql_name, &entry.shape.ret)
+                // Provider dispatchers match on kebab-case WIT method names
+                // (see e.g. `"st-extent"` in postgis-wasm/crates/provider/src/
+                // dispatch/postgis_core.rs). Mirror the scalar arm's fix
+                // (commit 2441545) and route on wit_func rather than sql_name.
+                let invoke_name = entry.shape.wit_func.replace('_', "-");
+                emit_dynlink_agg_finalize_body(&invoke_name, &entry.shape.ret)
             } else {
                 format!(
                     "                let _ = st;\n\
@@ -2114,8 +2119,8 @@ fn is_dynlink_wired_aggregate(shape: &interface_db::AggregateShape) -> bool {
 /// WKB payloads ride to the provider as `CborValue::List<Bytes>`
 /// under `args[0]`; the response variant is unwrapped per return shape
 /// (Bytes → Binary, List<Float; 4|6> → WKB envelope, etc.).
-fn emit_dynlink_agg_finalize_body(sql_name: &str, ret: &RetShape) -> String {
-    let sql = sql_name.replace('"', "\\\"");
+fn emit_dynlink_agg_finalize_body(invoke_name: &str, ret: &RetShape) -> String {
+    let invoke = invoke_name.replace('"', "\\\"");
     let mut s = String::new();
     s.push_str(
         "                let geom_list = CborValue::List(\n\
@@ -2123,7 +2128,7 @@ fn emit_dynlink_agg_finalize_body(sql_name: &str, ret: &RetShape) -> String {
          \x20               );\n",
     );
     s.push_str(&format!(
-        "                let resp = call(\"{sql}\", alloc::vec![geom_list])?;\n"
+        "                let resp = call(\"{invoke}\", alloc::vec![geom_list])?;\n"
     ));
     let wrap = match ret {
         RetShape::GeomBlob
