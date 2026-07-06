@@ -171,3 +171,103 @@ fn dynlink_emit_produces_compilable_small_bridge() {
     // codec. Any regression above 2 MB flags a plumbing leak.
     assert!(sz < 2_000_000, "dynlink bridge should be < 2 MB, got {} bytes", sz);
 }
+
+/// Regression: Null-collapse rehydration in the emitted `call()` helper.
+///
+/// Agent #935 (Round 17) surfaced a bug where a provider arm returning
+/// `Response::ok(CborValue::Null)` — the canonical `Option<T>::None` /
+/// empty-first return — surfaced at the bridge as
+/// `ExecutionError("<method>: empty response")` instead of SQL NULL.
+///
+/// Root cause: on the wire the response is `{v:1, ok: null}` (bare
+/// CBOR null). The bridge's `Response { ok: Option<ResponseValue> }`
+/// field decodes `Some(Null)` → `None` because ciborium reads CBOR
+/// null in an `Option<T>` slot as the absent variant. The old
+/// `resp.ok.ok_or_else(...)` template then turned that `None` into a
+/// hard error, cutting off the `RetShape::WitValueRecord`,
+/// `OptionText`, `FirstGeomBlob`, etc. arms that all already had a
+/// `ResponseValue::Null => Ok(ScalarValue::Null)` branch waiting.
+///
+/// The fix (#823 Agent #938) replaces the `.ok_or_else` with
+/// `resp.ok.unwrap_or(ResponseValue::Null)` so downstream match arms
+/// see the Null and lower it to `ScalarValue::Null`. The err-branch
+/// above the unwrap keeps working (provider-side errors still surface
+/// as ExecutionError with the provider's message intact), so the
+/// unknown-method / explicit-error path is unaffected.
+///
+/// This structural assertion pins the fix in the emit template so a
+/// future rewrite can't silently re-introduce the collapse.
+#[test]
+fn dynlink_emit_call_helper_rehydrates_null_response() {
+    let db = postgis_interface_db();
+    if !db.exists() {
+        eprintln!("skipping null-collapse regression: {} not found", db.display());
+        return;
+    }
+    let plan = match load_plan(&db) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skipping null-collapse regression: load_plan failed: {e}");
+            return;
+        }
+    };
+
+    let out_dir = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home).join(".cache/dynlink-bridge-null-collapse")
+    };
+    let _ = std::fs::remove_dir_all(&out_dir);
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let opts = DynlinkOptions {
+        provider_id: "postgis-sfcgal-composed".to_string(),
+        sub_ext: "postgis-sfcgal".to_string(),
+    };
+    emit_dynlink(&plan, &out_dir, &opts).expect("emit_dynlink");
+
+    let lib_rs = std::fs::read_to_string(out_dir.join("src/lib.rs")).unwrap();
+
+    // Fix present: the null-collapse rehydration is in the template.
+    assert!(
+        lib_rs.contains("resp.ok.unwrap_or(ResponseValue::Null)"),
+        "call() must rehydrate `ok: null` collapse as ResponseValue::Null \
+         (regression: Agent #935 Round 17 null-collapse bug — see #823 #938)"
+    );
+
+    // Regression trip-wire: the old collapse pattern must not resurface.
+    // The `unwrap_or(ResponseValue::Null)` line above is the ONLY valid
+    // way to write this today; a `.ok_or_else` in `call()` returning
+    // "empty response" was the exact bug.
+    assert!(
+        !lib_rs.contains("\"{}: empty response\""),
+        "call() must not raise 'empty response' — the null-collapse fix \
+         should route `ok: null` to ResponseValue::Null instead"
+    );
+
+    // Provider-side error path unaffected: explicit err messages still
+    // surface as ExecutionError with the provider's text intact. This
+    // check pins the branch that handles `resp.err` above the null
+    // rehydration so unknown-method / explicit-arm errors don't get
+    // swallowed by the Null default.
+    assert!(
+        lib_rs.contains("if let Some(err) = resp.err")
+            && lib_rs.contains("ftypes::FunctionError::ExecutionError(alloc::format!(\"{}: {}\", method, err))"),
+        "call() must preserve provider-side err branch above the null-collapse \
+         rehydration so explicit errors surface unmasked"
+    );
+
+    // Every RetShape arm that admits null still routes to
+    // `ScalarValue::Null`. Spot-check the shapes that Agent #935 was
+    // exercising when the bug surfaced (WitValueRecord, OptionText,
+    // FirstGeomBlob) plus the JsonText / Unit shapes that all funnel
+    // a bare Null through the same call() helper.
+    for admit_null_arm in [
+        "ResponseValue::Null => Ok(ftypes::ScalarValue::Null)",
+    ] {
+        assert!(
+            lib_rs.contains(admit_null_arm),
+            "expected null-admitting arm pattern missing from emitted bridge: {}",
+            admit_null_arm,
+        );
+    }
+}

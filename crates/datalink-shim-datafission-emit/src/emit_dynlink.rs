@@ -975,6 +975,26 @@ fn decode_response(bytes: &[u8]) -> Result<Response, ftypes::FunctionError> {{
 }}
 
 /// Invoke `method` on the resident provider and unwrap its Ok payload.
+///
+/// Null-collapse rehydration (#823, Agent #935 -> #938): the provider
+/// emits `Response::ok(CborValue::Null)` for arms whose typed WIT return
+/// is `Option<T>::None` (empty `list<T>`-then-first, absent geometry,
+/// etc.). That serialises as the wire form `{{v:1, ok: null}}` — a bare
+/// CBOR null in the `ok` slot. ciborium round-trips `Some(Null)` payloads
+/// through the bridge-side `Option<ResponseValue>` field as `None` (an
+/// `Option<T>` field decodes CBOR null as the absent variant). Prior
+/// versions of this template turned the resulting `None` into
+/// `ExecutionError("<method>: empty response")`, which collapsed
+/// legitimate SQL NULLs into hard errors before any downstream
+/// `RetShape` arm could wrap them as `ScalarValue::Null`.
+///
+/// Fix: treat `err.is_none() && ok.is_none()` as `ResponseValue::Null`.
+/// Every RetShape arm that admits null (Option*, First*, Unit,
+/// WitValueRecord*, JsonText, TuplePick) will now surface SQL NULL;
+/// arms that don't admit null still error via their existing catchall
+/// (`unexpected: Null`). A genuinely malformed provider response with
+/// neither field set is indistinguishable from `ok: null` on the wire —
+/// treating both as Null is the semantically-correct default.
 fn call(method: &str, args: Vec<CborValue>) -> Result<ResponseValue, ftypes::FunctionError> {{
     let inst = resolve()?;
     let payload = encode_request(args)?;
@@ -985,9 +1005,7 @@ fn call(method: &str, args: Vec<CborValue>) -> Result<ResponseValue, ftypes::Fun
     if let Some(err) = resp.err {{
         return Err(ftypes::FunctionError::ExecutionError(alloc::format!("{{}}: {{}}", method, err)));
     }}
-    resp.ok.ok_or_else(|| {{
-        ftypes::FunctionError::ExecutionError(alloc::format!("{{}}: empty response", method))
-    }})
+    Ok(resp.ok.unwrap_or(ResponseValue::Null))
 }}
 
 // -----------------------------------------------------------
