@@ -117,8 +117,8 @@ members = ["."]
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = {{ version = "0.51", features = ["macros"] }}
-wit-bindgen-rt = {{ version = "0.44", features = ["bitflags"] }}
+wit-bindgen = {{ version = "0.41", features = ["macros"] }}
+wit-bindgen-rt = {{ version = "0.41", features = ["bitflags"] }}
 ciborium = {{ version = "0.2", default-features = false }}
 ciborium-io = {{ version = "0.2", default-features = false }}
 serde = {{ version = "1", default-features = false, features = ["derive", "alloc"] }}
@@ -156,8 +156,13 @@ world bridge {{
     import compose:dynlink/linker@0.1.0;
 
     // Minimal contract-side imports — the guest needs `runtime`
-    // to register its scalars during `load`.
+    // to register its scalars during `load`. `runtime-ext` is the
+    // additive 2.2.0 surface used for `register-scalar-ex` with
+    // varargs — the dynlink emit consumes only the catalog, which
+    // carries no per-fn arity, so every scalar is registered as
+    // varargs<blob> (matching sqlite emit's `num_args: -1`).
     import duckdb:extension/runtime@4.0.0;
+    import duckdb:extension/runtime-ext@4.0.0;
     import duckdb:extension/logging@4.0.0;
 
     export duckdb:extension/guest@4.0.0;
@@ -306,13 +311,18 @@ fn lib_rs(
         scalar_name_arms.push_str(&format!(
             "        {arm_idx} => Some(\"{escaped}\"),\n"
         ));
-        // Phase A dynlink registers every scalar with a single
-        // Blob argument and Blob return. The catalog carries no
-        // arity or per-arg logical-type information (the interface
-        // DB does; the dynlink flow deliberately consumes only the
-        // catalog). TODO(phase-B): thread arity + per-arg logical-
-        // type from `datalink-shim-codegen-core::interface_db`
-        // once catalog carries the shape (Phase B roadmap #834).
+        // Phase A dynlink registers every scalar as VARARGS<Blob>
+        // via `runtime-ext.register-scalar-ex` — the catalog carries
+        // no per-fn arity or per-arg logical-type information (the
+        // interface DB does; the dynlink flow deliberately consumes
+        // only the catalog), so accepting variadic input at
+        // registration time is the correct opaque discipline
+        // (mirrors sqlite emit's `num_args: -1`). Callback-side
+        // marshalling ferries every arg through the CBOR envelope
+        // regardless of the physical logical-type it entered as.
+        // TODO(phase-B): thread arity + per-arg logical-type from
+        // `datalink-shim-codegen-core::interface_db` once catalog
+        // carries the shape (Phase B roadmap #834).
         scalar_register_calls.push_str(&format!(
             r#"    {{
         let handle = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -320,21 +330,19 @@ fn lib_rs(
             .lock()
             .expect("scalar handle mutex poisoned")
             .insert(handle, {arm_idx}usize);
-        let callback = runtime::ScalarCallback::new(handle);
-        let args: Vec<runtime::Funcarg> = vec![runtime::Funcarg {{
-            name: Some("arg0".into()),
-            logical: Logicaltype::Blob,
-        }}];
-        let opts = runtime::Funcopts {{
+        let args: Vec<runtime_ext::Funcarg> = Vec::new();
+        let opts = runtime_ext::Funcopts {{
             description: Some("{escaped} (sqlink-shim-codegen --dynlink)".into()),
             tags: vec!["{escaped}".into()],
             attributes: Funcflags::DETERMINISTIC | Funcflags::STATELESS,
         }};
-        registry.register(
+        runtime_ext::register_scalar_ex(
             "{escaped}",
             &args,
+            Some(&Logicaltype::Blob),
             &Logicaltype::Blob,
-            callback,
+            runtime_ext::NullHandling::Default,
+            handle,
             Some(&opts),
         )?;
     }}
@@ -365,6 +373,7 @@ use bindings::duckdb::extension::types::{{
     Capabilitykind, Duckerror, Duckvalue, Funcflags, Invokeinfo, Logicaltype, Resultset,
 }};
 use bindings::duckdb::extension::runtime;
+use bindings::duckdb::extension::runtime_ext;
 use bindings::exports::duckdb::extension::guest::{{self as guest_export, Guest as GuestGuest, Loadresult}};
 use bindings::exports::duckdb::extension::callback_dispatch::{{
     self as cb_export, Guest as CallbackGuest,
@@ -646,51 +655,171 @@ fn materialize_row(args: &[column_types::Colvec], i: usize, out: &mut Vec<Duckva
     }}
 }}
 
-/// Lower a Vec<Duckvalue> back to a Blob-typed colvec (opaque-
-/// blob Phase A convention). Non-Blob returns are still
-/// wrapped through their Duckvalue variant into a Blob column
-/// only if bytes are already present; otherwise the row is
-/// marked NULL in the validity bitmap. Callers that need the
-/// exact per-row native type must wait for the multi-shape
-/// column lowering follow-up.
+/// Lower a `Vec<Duckvalue>` (per-row scalar returns) into a
+/// typed `Colvec`. The column arm is picked from the first
+/// non-NULL row's Duckvalue variant; every subsequent row must
+/// match that arm or a `Duckerror::Internal` is returned
+/// (rather than silently dropping the row to NULL — the old
+/// blob-only path lost every non-Blob/non-Text primitive
+/// result). A colvec of all-NULLs is lowered as Blob (chosen
+/// arbitrarily: no data buffer is ever addressed since the
+/// validity bitmap zeros every row).
 fn values_to_colvec(values: Vec<Duckvalue>) -> Result<column_types::Colvec, Duckerror> {{
     let n = values.len();
     let rows = n as u32;
     let mut bits: Vec<u8> = vec![0u8; (n + 7) / 8];
     let mut any_null = false;
-    let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(n);
+
+    // Discriminator: which arm we picked, populated on first
+    // non-NULL row. Repeated per-arm buffers avoid an enum tag
+    // in the hot path and let the compiler prove exhaustiveness.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Arm {{
+        Unknown,
+        Boolean,
+        Int8, Int16, Int32, Int64,
+        Uint8, Uint16, Uint32, Uint64,
+        Float32, Float64,
+        Text, Blob,
+        Date, Time, Timestamp, Timestamptz,
+    }}
+
+    let mut arm = Arm::Unknown;
+    let mut booleans: Vec<bool> = Vec::new();
+    let mut int8s: Vec<i8> = Vec::new();
+    let mut int16s: Vec<i16> = Vec::new();
+    let mut int32s: Vec<i32> = Vec::new();
+    let mut int64s: Vec<i64> = Vec::new();
+    let mut uint8s: Vec<u8> = Vec::new();
+    let mut uint16s: Vec<u16> = Vec::new();
+    let mut uint32s: Vec<u32> = Vec::new();
+    let mut uint64s: Vec<u64> = Vec::new();
+    let mut float32s: Vec<f32> = Vec::new();
+    let mut float64s: Vec<f64> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut dates: Vec<i32> = Vec::new();
+    let mut times: Vec<i64> = Vec::new();
+    let mut timestamps: Vec<i64> = Vec::new();
+    let mut timestamptzs: Vec<i64> = Vec::new();
+
+    fn arm_of(v: &Duckvalue) -> Option<Arm> {{
+        Some(match v {{
+            Duckvalue::Boolean(_) => Arm::Boolean,
+            Duckvalue::Int8(_) => Arm::Int8,
+            Duckvalue::Int16(_) => Arm::Int16,
+            Duckvalue::Int32(_) => Arm::Int32,
+            Duckvalue::Int64(_) => Arm::Int64,
+            Duckvalue::Uint8(_) => Arm::Uint8,
+            Duckvalue::Uint16(_) => Arm::Uint16,
+            Duckvalue::Uint32(_) => Arm::Uint32,
+            Duckvalue::Uint64(_) => Arm::Uint64,
+            Duckvalue::Float32(_) => Arm::Float32,
+            Duckvalue::Float64(_) => Arm::Float64,
+            Duckvalue::Text(_) => Arm::Text,
+            Duckvalue::Blob(_) => Arm::Blob,
+            Duckvalue::Date(_) => Arm::Date,
+            Duckvalue::Time(_) => Arm::Time,
+            Duckvalue::Timestamp(_) => Arm::Timestamp,
+            Duckvalue::Timestamptz(_) => Arm::Timestamptz,
+            Duckvalue::Null
+            | Duckvalue::Decimal(_)
+            | Duckvalue::Interval(_)
+            | Duckvalue::Uuid(_)
+            | Duckvalue::Complex(_) => return None,
+        }})
+    }}
+
+    fn mismatch(expected: &Arm, actual: &Duckvalue) -> Duckerror {{
+        Duckerror::Internal(format!(
+            "values_to_colvec: column arm mismatch (expected={{:?}}, saw variant with tag {{:?}}); \
+             heterogeneous rows in a single columnar batch are unsupported",
+            expected, core::mem::discriminant(actual),
+        ))
+    }}
+
     for (i, v) in values.into_iter().enumerate() {{
+        if matches!(v, Duckvalue::Null) {{
+            any_null = true;
+            // Push a placeholder so the buffer index tracks the
+            // row index; the validity bit stays 0.
+            match arm {{
+                Arm::Unknown | Arm::Blob => blobs.push(Vec::new()),
+                Arm::Boolean => booleans.push(false),
+                Arm::Int8 => int8s.push(0),
+                Arm::Int16 => int16s.push(0),
+                Arm::Int32 => int32s.push(0),
+                Arm::Int64 => int64s.push(0),
+                Arm::Uint8 => uint8s.push(0),
+                Arm::Uint16 => uint16s.push(0),
+                Arm::Uint32 => uint32s.push(0),
+                Arm::Uint64 => uint64s.push(0),
+                Arm::Float32 => float32s.push(0.0),
+                Arm::Float64 => float64s.push(0.0),
+                Arm::Text => texts.push(String::new()),
+                Arm::Date => dates.push(0),
+                Arm::Time => times.push(0),
+                Arm::Timestamp => timestamps.push(0),
+                Arm::Timestamptz => timestamptzs.push(0),
+            }}
+            continue;
+        }}
+        // Refuse unsupported (Decimal/Interval/Uuid/Complex)
+        // returns explicitly — the old code silently NULLed them.
+        let this_arm = arm_of(&v).ok_or_else(|| Duckerror::Internal(format!(
+            "values_to_colvec: unsupported column arm for row {{}} (Decimal/Interval/Uuid/Complex \
+             lowering is not yet implemented in the dynlink emit)",
+            i,
+        )))?;
+        if arm == Arm::Unknown {{
+            arm = this_arm;
+        }} else if arm != this_arm {{
+            return Err(mismatch(&arm, &v));
+        }}
+        bits[i / 8] |= 1u8 << (i % 8);
         match v {{
-            Duckvalue::Null => {{
-                any_null = true;
-                blobs.push(Vec::new());
-            }}
-            Duckvalue::Blob(b) => {{
-                bits[i / 8] |= 1u8 << (i % 8);
-                blobs.push(b);
-            }}
-            Duckvalue::Text(t) => {{
-                bits[i / 8] |= 1u8 << (i % 8);
-                blobs.push(t.into_bytes());
-            }}
-            other => {{
-                // Non-blob primitive returns: for the opaque-blob
-                // Phase A discipline we render them as null in the
-                // columnar path so the SQL surface sees the same
-                // shape it expected. The row-major cold path
-                // preserves the native Duckvalue.
-                let _ = other;
-                any_null = true;
-                blobs.push(Vec::new());
-            }}
+            Duckvalue::Boolean(b) => booleans.push(b),
+            Duckvalue::Int8(x) => int8s.push(x),
+            Duckvalue::Int16(x) => int16s.push(x),
+            Duckvalue::Int32(x) => int32s.push(x),
+            Duckvalue::Int64(x) => int64s.push(x),
+            Duckvalue::Uint8(x) => uint8s.push(x),
+            Duckvalue::Uint16(x) => uint16s.push(x),
+            Duckvalue::Uint32(x) => uint32s.push(x),
+            Duckvalue::Uint64(x) => uint64s.push(x),
+            Duckvalue::Float32(x) => float32s.push(x),
+            Duckvalue::Float64(x) => float64s.push(x),
+            Duckvalue::Text(s) => texts.push(s),
+            Duckvalue::Blob(b) => blobs.push(b),
+            Duckvalue::Date(x) => dates.push(x),
+            Duckvalue::Time(x) => times.push(x),
+            Duckvalue::Timestamp(x) => timestamps.push(x),
+            Duckvalue::Timestamptz(x) => timestamptzs.push(x),
+            // Null / unsupported: already handled above.
+            _ => unreachable!("arm_of admitted a variant we didn't push"),
         }}
     }}
     let validity = if any_null {{ bits }} else {{ Vec::new() }};
-    Ok(column_types::Colvec {{
-        rows,
-        validity,
-        data: column_types::Column::Blob(blobs),
-    }})
+    let data = match arm {{
+        Arm::Unknown | Arm::Blob => column_types::Column::Blob(blobs),
+        Arm::Boolean => column_types::Column::Boolean(booleans),
+        Arm::Int8 => column_types::Column::Int8(int8s),
+        Arm::Int16 => column_types::Column::Int16(int16s),
+        Arm::Int32 => column_types::Column::Int32(int32s),
+        Arm::Int64 => column_types::Column::Int64(int64s),
+        Arm::Uint8 => column_types::Column::Uint8(uint8s),
+        Arm::Uint16 => column_types::Column::Uint16(uint16s),
+        Arm::Uint32 => column_types::Column::Uint32(uint32s),
+        Arm::Uint64 => column_types::Column::Uint64(uint64s),
+        Arm::Float32 => column_types::Column::Float32(float32s),
+        Arm::Float64 => column_types::Column::Float64(float64s),
+        Arm::Text => column_types::Column::Text(texts),
+        Arm::Date => column_types::Column::Date(dates),
+        Arm::Time => column_types::Column::Time(times),
+        Arm::Timestamp => column_types::Column::Timestamp(timestamps),
+        Arm::Timestamptz => column_types::Column::Timestamptz(timestamptzs),
+    }};
+    Ok(column_types::Colvec {{ rows, validity, data }})
 }}
 
 fn scalar_name_by_arm_idx(arm: usize) -> Option<&'static str> {{
@@ -719,18 +848,12 @@ fn handle_table() -> &'static std::sync::Mutex<std::collections::HashMap<u32, us
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 
 fn register_scalars() -> Result<(), Duckerror> {{
-    let capability = runtime::get_capability(Capabilitykind::Scalar)
-        .ok_or_else(|| Duckerror::Internal(
-            "host did not expose scalar capability".into(),
-        ))?;
-    let registry = match capability {{
-        runtime::Capability::Scalar(r) => r,
-        _ => {{
-            return Err(Duckerror::Internal(
-                "scalar capability returned unexpected variant".into(),
-            ));
-        }}
-    }};
+    // We register via `runtime-ext.register-scalar-ex` (top-level
+    // interface function, not a capability resource) so the
+    // capability handshake the base `runtime.get-capability` path
+    // performs is not needed here. The `requires` field of
+    // `Loadresult` still asks the host to activate Scalar so the
+    // register calls succeed.
 {scalar_register_calls}    Ok(())
 }}
 

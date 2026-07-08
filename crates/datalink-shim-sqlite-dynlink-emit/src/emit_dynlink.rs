@@ -126,8 +126,8 @@ members = ["."]
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = {{ version = "0.51", features = ["macros"] }}
-wit-bindgen-rt = {{ version = "0.44", features = ["bitflags"] }}
+wit-bindgen = {{ version = "0.41", features = ["macros"] }}
+wit-bindgen-rt = {{ version = "0.41", features = ["bitflags"] }}
 ciborium = {{ version = "0.2", default-features = false }}
 ciborium-io = {{ version = "0.2", default-features = false }}
 serde = {{ version = "1", default-features = false, features = ["derive", "alloc"] }}
