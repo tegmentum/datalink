@@ -16,6 +16,11 @@ anyhow = "1"
 sha2 = "0.10"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Read per-fn signatures out of the sibling shim-interface DB so the
+# emitted registrations declare the right arity + arg logicaltypes.
+# Feature parity with shim-bridge-codegen-core's transitive pin.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -42,11 +42,23 @@ use anyhow::{Context, Result};
 
 /// Options for `emit`. Mirrors the sibling sqlite-dynlink-emit
 /// crate's options struct — every field is target-agnostic.
+///
+/// `interface_sqlite` is the sibling shim-interface `.sqlite` (e.g.
+/// `~/git/postgis-shim-interface/postgis-interface.sqlite`). The
+/// catalog TOML only lists scalar names per leaf; per-fn arg types
+/// and return type live in the sqlite `scalars` table. When
+/// provided, `emit_dynlink` reads that table and emits typed
+/// `register_scalar` calls (base `runtime.scalar-registry.register`
+/// path). When absent — or a name is missing from the DB — the
+/// emitter falls back to a single-arg Blob shape, preserving Phase A
+/// behaviour so a codegen invocation without `--interface` still
+/// produces a compilable bridge.
 pub struct DynlinkOptions {
     pub provider_id: String,
     pub sub_ext: String,
     pub extension_root: String,
     pub target: String,
+    pub interface_sqlite: Option<std::path::PathBuf>,
 }
 
 /// Public entry point.
@@ -83,6 +95,7 @@ mod smoke {
             sub_ext: "sub".into(),
             extension_root: "root".into(),
             target: "t".into(),
+            interface_sqlite: None,
         };
     }
 }

@@ -28,6 +28,7 @@
 //! envelope. See the deep note on `Response::ok` null-collapse
 //! rehydration in the emitted `call` function.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,98 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::spatial_catalog::{Catalog, FnKind, LeavesOverlay};
 use crate::DynlinkOptions;
+
+/// Per-scalar signature loaded from the sibling shim-interface DB.
+///
+/// `param_tokens` is a list of already-normalised type tokens (one of
+/// `"binary" | "boolean" | "float64" | "int64" | "text"`) — the
+/// `spatial_catalog_emit` ingester collapses every upstream WIT type
+/// down to that closed set before writing `scalars.param_types_json`.
+/// `return_token` is one of the same tokens.
+#[derive(Debug, Clone)]
+pub(crate) struct ScalarSig {
+    pub param_tokens: Vec<String>,
+    pub return_token: String,
+}
+
+/// Load `SELECT name, param_types_json, return_type FROM scalars
+/// WHERE extension = ?` into a name→signature map.
+///
+/// `param_types_json` is a JSON `array-of-arrays`; postgis today only
+/// carries a single overload group per name so we take element 0.
+/// Multi-overload extensions land in Phase B: for now we log a
+/// warning to stderr and pick the first group deterministically.
+pub(crate) fn load_scalar_sigs(
+    sqlite: &Path,
+    extension: &str,
+) -> Result<HashMap<String, ScalarSig>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        sqlite,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening shim-interface sqlite: {}", sqlite.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT name, param_types_json, return_type FROM scalars WHERE extension = ?1",
+    )?;
+    let rows = stmt.query_map([extension], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out: HashMap<String, ScalarSig> = HashMap::new();
+    let mut multi_overload_count = 0usize;
+    for row in rows {
+        let (name, param_json, return_token) = row?;
+        // Parse `[[T,...], ...]` and pick the first overload group.
+        // Postgis has exactly one overload per name today; other
+        // extensions may not — track a warning count so operators can
+        // see if the first-only assumption bites them.
+        let outer: Vec<Vec<String>> = serde_json::from_str(&param_json)
+            .with_context(|| format!("parsing param_types_json for scalar {name}"))?;
+        if outer.len() > 1 {
+            multi_overload_count += 1;
+        }
+        let param_tokens = outer.into_iter().next().unwrap_or_default();
+        out.insert(
+            name,
+            ScalarSig {
+                param_tokens,
+                return_token,
+            },
+        );
+    }
+    if multi_overload_count > 0 {
+        eprintln!(
+            "[duckdb-dynlink-emit] warning: {multi_overload_count} scalar(s) with >1 overload \
+             group; using the first (Phase A behaviour). Multi-overload dispatch lands in Phase B."
+        );
+    }
+    Ok(out)
+}
+
+/// Map a sqlite scalar-type token to the WIT-bindgen `Logicaltype`
+/// variant literal used at the register call site.
+///
+/// The token set is closed to the 5 values the shim-interface
+/// ingester produces (see `postgis-shim-interface/src/bin/
+/// spatial_catalog_emit/db_ingest.rs::ScalarRow`). Every geometry /
+/// geography / raster / topogeometry type upstream is collapsed to
+/// `"binary"` (WKB / serialised wire form); every numeric width
+/// collapses to `int64` or `float64`. Unknown tokens fall back to
+/// `Blob` — matches the WacPlug convention and keeps a codegen run
+/// against a hypothetical future token from lockstep.
+fn token_to_logicaltype_lit(token: &str) -> &'static str {
+    match token {
+        "boolean" => "Logicaltype::Boolean",
+        "int64" => "Logicaltype::Int64",
+        "float64" => "Logicaltype::Float64",
+        "text" => "Logicaltype::Text",
+        "binary" => "Logicaltype::Blob",
+        _ => "Logicaltype::Blob",
+    }
+}
 
 /// Emit a Dynlink-mode duckdb bridge crate under `out_dir`.
 ///
@@ -70,6 +163,29 @@ pub fn emit_dynlink(
         catalog.meta.version.clone()
     };
 
+    // Load per-fn signatures from the sibling shim-interface DB, if
+    // provided. Every scalar name the catalog surfaces MUST have a
+    // matching row in the sqlite for the emit to declare the right
+    // arity + arg logicaltypes (postgis: 1218/1218 today, verified
+    // via `SELECT COUNT(*) FROM scalars WHERE extension='postgis'`).
+    // When absent, we fall back to the arity-1 opaque-Blob shape so a
+    // codegen run without `--interface` still produces a valid crate.
+    let sig_map = match opts.interface_sqlite.as_deref() {
+        Some(p) => load_scalar_sigs(p, &catalog.meta.extension).with_context(|| {
+            format!(
+                "loading scalar signatures from shim-interface: {}",
+                p.display()
+            )
+        })?,
+        None => {
+            eprintln!(
+                "[duckdb-dynlink-emit] warning: no --interface sqlite provided; \
+                 emitting arity-1 Blob shape for every scalar (Phase A fallback)."
+            );
+            HashMap::new()
+        }
+    };
+
     fs::write(out_dir.join("Cargo.toml"), cargo_toml(&crate_name, &version))?;
     fs::write(out_dir.join("wit/world.wit"), world_wit(&opts.sub_ext))?;
     populate_deps(&out_dir.join("wit/deps"))?;
@@ -80,6 +196,7 @@ pub fn emit_dynlink(
         &catalog.meta.extension,
         &version,
         functions.iter().collect::<Vec<_>>().as_slice(),
+        &sig_map,
     );
     fs::write(out_dir.join("src/lib.rs"), lib_src)?;
 
@@ -156,11 +273,14 @@ world bridge {{
     import compose:dynlink/linker@0.1.0;
 
     // Minimal contract-side imports — the guest needs `runtime`
-    // to register its scalars during `load`. `runtime-ext` is the
-    // additive 2.2.0 surface used for `register-scalar-ex` with
-    // varargs — the dynlink emit consumes only the catalog, which
-    // carries no per-fn arity, so every scalar is registered as
-    // varargs<blob> (matching sqlite emit's `num_args: -1`).
+    // to register its scalars during `load`. The default path uses
+    // `runtime.scalar-registry.register` with per-fn arity + per-arg
+    // logicaltypes derived from the sibling shim-interface DB (see
+    // `emit_dynlink::load_scalar_sigs`). `runtime-ext` stays imported
+    // for a future variadic opt-in surface (`register-scalar-ex`);
+    // the emitted lib.rs currently doesn't call it at the default
+    // register site, but the import is retained so a Phase B commit
+    // can wire per-arm variadic registrations without a WIT churn.
     import duckdb:extension/runtime@4.0.0;
     import duckdb:extension/runtime-ext@4.0.0;
     import duckdb:extension/logging@4.0.0;
@@ -288,6 +408,7 @@ fn lib_rs(
     catalog_extension: &str,
     version: &str,
     functions: &[&(FnKind, String)],
+    sig_map: &HashMap<String, ScalarSig>,
 ) -> String {
     let mut scalar_names: Vec<&str> = functions
         .iter()
@@ -305,24 +426,49 @@ fn lib_rs(
     // provider method name.
     let mut scalar_name_arms = String::new();
     let mut scalar_register_calls = String::new();
+    let mut missing_sig_count = 0usize;
     for (idx, name) in scalar_names.iter().enumerate() {
         let arm_idx = idx as u32;
         let escaped = name.replace('"', "\\\"");
         scalar_name_arms.push_str(&format!(
             "        {arm_idx} => Some(\"{escaped}\"),\n"
         ));
-        // Phase A dynlink registers every scalar as VARARGS<Blob>
-        // via `runtime-ext.register-scalar-ex` — the catalog carries
-        // no per-fn arity or per-arg logical-type information (the
-        // interface DB does; the dynlink flow deliberately consumes
-        // only the catalog), so accepting variadic input at
-        // registration time is the correct opaque discipline
-        // (mirrors sqlite emit's `num_args: -1`). Callback-side
-        // marshalling ferries every arg through the CBOR envelope
-        // regardless of the physical logical-type it entered as.
-        // TODO(phase-B): thread arity + per-arg logical-type from
-        // `datalink-shim-codegen-core::interface_db` once catalog
-        // carries the shape (Phase B roadmap #834).
+
+        // Per-fn arg list: look up the sqlite signature, map each
+        // token to a `Logicaltype` variant. When the DB is absent or
+        // a name is missing, fall back to arity-1 Blob (a single
+        // opaque arg) so the emit still produces a valid crate — the
+        // provider dispatch keys on name, so the arg-count mismatch
+        // is a compile-time-registration issue, not a call-time
+        // marshalling one.
+        let (args_expr, return_lit) = if let Some(sig) = sig_map.get(*name) {
+            let mut args = String::from("vec![\n");
+            for (i, tok) in sig.param_tokens.iter().enumerate() {
+                let lit = token_to_logicaltype_lit(tok);
+                args.push_str(&format!(
+                    "                runtime::Funcarg {{ name: Some(\"arg{i}\".into()), logical: {lit} }},\n"
+                ));
+            }
+            args.push_str("            ]");
+            let ret_lit = token_to_logicaltype_lit(&sig.return_token);
+            (args, ret_lit)
+        } else {
+            missing_sig_count += 1;
+            (
+                String::from(
+                    "vec![\n                runtime::Funcarg { name: Some(\"arg0\".into()), logical: Logicaltype::Blob },\n            ]",
+                ),
+                "Logicaltype::Blob",
+            )
+        };
+
+        // Base scalar-registry.register path (as opposed to
+        // `runtime-ext.register-scalar-ex`, which is the additive
+        // 2.2.0 variadic surface). The `runtime-ext` import is kept
+        // in world.wit as a future opt-in when a specific arm needs
+        // varargs; the default emit uses the base register call so
+        // DuckDB binds the SQL at parse time against the correct
+        // arity + arg logicaltypes.
         scalar_register_calls.push_str(&format!(
             r#"    {{
         let handle = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -330,24 +476,30 @@ fn lib_rs(
             .lock()
             .expect("scalar handle mutex poisoned")
             .insert(handle, {arm_idx}usize);
-        let args: Vec<runtime_ext::Funcarg> = Vec::new();
-        let opts = runtime_ext::Funcopts {{
+        let callback = runtime::ScalarCallback::new(handle);
+        let args: Vec<runtime::Funcarg> = {args_expr};
+        let opts = runtime::Funcopts {{
             description: Some("{escaped} (sqlink-shim-codegen --dynlink)".into()),
             tags: vec!["{escaped}".into()],
             attributes: Funcflags::DETERMINISTIC | Funcflags::STATELESS,
         }};
-        runtime_ext::register_scalar_ex(
+        registry.register(
             "{escaped}",
             &args,
-            Some(&Logicaltype::Blob),
-            &Logicaltype::Blob,
-            runtime_ext::NullHandling::Default,
-            handle,
+            &{return_lit},
+            callback,
             Some(&opts),
         )?;
     }}
 "#,
         ));
+    }
+    if missing_sig_count > 0 {
+        eprintln!(
+            "[duckdb-dynlink-emit] warning: {missing_sig_count} scalar(s) had no shim-interface \
+             signature (arity-1 Blob fallback used). If `--interface` was passed, this indicates \
+             the catalog and DB are out of sync."
+        );
     }
 
     let extension_root = extension_root.to_string();
@@ -866,12 +1018,28 @@ fn handle_table() -> &'static std::sync::Mutex<std::collections::HashMap<u32, us
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 
 fn register_scalars() -> Result<(), Duckerror> {{
-    // We register via `runtime-ext.register-scalar-ex` (top-level
-    // interface function, not a capability resource) so the
-    // capability handshake the base `runtime.get-capability` path
-    // performs is not needed here. The `requires` field of
-    // `Loadresult` still asks the host to activate Scalar so the
-    // register calls succeed.
+    // Acquire the base scalar-registry capability from the host.
+    // Fix (#834 followup): the previous implementation used
+    // `runtime-ext.register-scalar-ex` with an empty arg list
+    // (`args: Vec::new()` + `varargs: Some(&Logicaltype::Blob)`)
+    // — variadic-Blob for every scalar. That erased the per-fn
+    // arity + arg logicaltypes DuckDB needs at bind time (e.g.
+    // `st_distance(GEOMETRY, GEOMETRY) -> DOUBLE` bound as
+    // `st_distance(BLOB...) -> BLOB`, so callers threading typed
+    // arguments couldn't overload-resolve). The base
+    // `runtime.scalar-registry.register` path emits the actual
+    // arity + per-arg + return logicaltype from the sibling
+    // shim-interface DB (see `emit_dynlink::load_scalar_sigs`).
+    let capability = runtime::get_capability(Capabilitykind::Scalar)
+        .ok_or_else(|| Duckerror::Internal("host did not expose scalar capability".into()))?;
+    let registry = match capability {{
+        runtime::Capability::Scalar(r) => r,
+        _ => {{
+            return Err(Duckerror::Internal(
+                "scalar capability returned unexpected variant".into(),
+            ));
+        }}
+    }};
 {scalar_register_calls}    Ok(())
 }}
 
