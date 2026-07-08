@@ -229,9 +229,19 @@ pub fn paramshape_to_logicaltype(p: &ParamShape) -> String {
         | ParamShape::ListListPrim(_)
         | ParamShape::ListListRecord { .. } => "types::Logicaltype::Text".to_string(),
         ParamShape::Enum { .. } => "types::Logicaltype::Int64".to_string(),
-        ParamShape::WitValueRecord { kebab_name, .. } => {
-            let n = kebab_name.replace('"', "\\\"");
-            format!("types::Logicaltype::Complex(\"{n}\".into())")
+        ParamShape::WitValueRecord { kebab_name: _, .. } => {
+            // WIT-value records ferry as JSON strings via
+            // `Duckvalue::Complex { type_expr, json }`. The
+            // REGISTRATION-time logical type just needs to give
+            // DuckDB a resolvable SQL type — VARCHAR matches the
+            // JSON payload and, crucially, is a valid SQL ident
+            // that DuckDB can parse in `SELECT CAST(NULL AS
+            // VARCHAR) AS x` (the ducklink core's type resolver).
+            // The record's SEMANTIC identity is preserved at
+            // runtime by `Complexvalue.type_expr` (which carries
+            // the full `<pkg>@<ver>/<iface>/<kebab>` symbolic),
+            // not by this logical-type name.
+            "types::Logicaltype::Complex(\"VARCHAR\".into())".to_string()
         }
         ParamShape::OptionNone => "types::Logicaltype::Text".to_string(),
     }
@@ -305,11 +315,14 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
                 "types::Logicaltype::Text".to_string()
             }
         },
-        RetShape::WitValueRecord { kebab_name, .. }
-        | RetShape::OptionWitValueRecord { kebab_name, .. }
-        | RetShape::FirstWitValueRecord { kebab_name, .. } => {
-            let n = kebab_name.replace('"', "\\\"");
-            format!("types::Logicaltype::Complex(\"{n}\".into())")
+        RetShape::WitValueRecord { kebab_name: _, .. }
+        | RetShape::OptionWitValueRecord { kebab_name: _, .. }
+        | RetShape::FirstWitValueRecord { kebab_name: _, .. } => {
+            // See ParamShape::WitValueRecord above — VARCHAR is
+            // the resolvable-by-DuckDB stand-in for the JSON
+            // wit-value payload; runtime `Complexvalue.type_expr`
+            // preserves the record's semantic identity.
+            "types::Logicaltype::Complex(\"VARCHAR\".into())".to_string()
         }
         // #690: `result<_, E>` mutator returns surface as SQL NULL;
         // pick a neutral declared type so the planner sees a
