@@ -673,7 +673,7 @@ fn values_to_colvec(values: Vec<Duckvalue>) -> Result<column_types::Colvec, Duck
     // Discriminator: which arm we picked, populated on first
     // non-NULL row. Repeated per-arm buffers avoid an enum tag
     // in the hot path and let the compiler prove exhaustiveness.
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum Arm {{
         Unknown,
         Boolean,
