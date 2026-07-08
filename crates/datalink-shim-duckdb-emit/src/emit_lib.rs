@@ -31,6 +31,60 @@ use crate::handle_table;
 use crate::lifecycle;
 use crate::register;
 
+/// Peel a WIT type-text into raw identifiers. Skips wrapper
+/// keywords (`list`/`option`/`result`/`tuple`/`borrow`) and
+/// primitives so the caller sees only named types (records,
+/// resources, enums, variants, flags, aliases).
+///
+/// Mirrors `datalink-shim-sqlite-emit`'s helper of the same name;
+/// used by the transitive `additional_derives_ignore` walker so a
+/// record whose field references an already-ignored type also
+/// lands in the ignore list.
+fn extract_wit_type_idents(
+    type_text: &str,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    fn flush(buf: &mut String, out: &mut std::collections::BTreeSet<String>) {
+        if buf.is_empty() {
+            return;
+        }
+        let ident = std::mem::take(buf);
+        if matches!(
+            ident.as_str(),
+            "bool"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "s8"
+                | "s16"
+                | "s32"
+                | "s64"
+                | "f32"
+                | "f64"
+                | "char"
+                | "string"
+                | "list"
+                | "option"
+                | "result"
+                | "tuple"
+                | "borrow"
+        ) {
+            return;
+        }
+        out.insert(ident);
+    }
+    let mut buf = String::new();
+    for c in type_text.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            buf.push(c);
+        } else {
+            flush(&mut buf, out);
+        }
+    }
+    flush(&mut buf, out);
+}
+
 /// Generate `src/lib.rs`.
 pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     let primary = plan
@@ -179,6 +233,55 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
             derives_ignore.insert(f.kebab_name.clone());
         }
     }
+    // Transitively propagate `additional_derives_ignore` up
+    // through primary-shim records. Mirrors sqlite-emit's #794
+    // fix. wit-bindgen applies the requested derives to EVERY
+    // generated Rust type — a record whose field type references
+    // an already-ignored ident (canonical trigger: a record whose
+    // field is a `geometry` / `raster` / `topology` resource
+    // handle, or an option/list wrapping one) can't compile with
+    // `serde::Serialize + Deserialize` applied. Add the parent
+    // record to the ignore list too and loop until fixed point.
+    let mut all_ignore_candidates: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for r in &records {
+        all_ignore_candidates.push((r.kebab_name.clone(), r.fields.clone()));
+    }
+    for pkg in &shim_packages {
+        if !emit_wit::package_belongs_to_primary(&pkg.ns_name, primary) {
+            continue;
+        }
+        for r in &pkg.records {
+            all_ignore_candidates.push((
+                r.kebab_name.clone(),
+                r.fields.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
+            ));
+        }
+    }
+    loop {
+        let mut added = false;
+        for (name, fields) in &all_ignore_candidates {
+            if derives_ignore.contains(name) {
+                continue;
+            }
+            let mut hits_ignored = false;
+            for (_fname, ftype) in fields {
+                let mut idents: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                extract_wit_type_idents(ftype, &mut idents);
+                if idents.iter().any(|id| derives_ignore.contains(id)) {
+                    hits_ignored = true;
+                    break;
+                }
+            }
+            if hits_ignored {
+                derives_ignore.insert(name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
     let derives_ignore_lits: String = derives_ignore
         .iter()
         .map(|n| format!("            \"{}\",\n", n))
@@ -248,6 +351,18 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
     // UDTF WIT modules — typically `pg_table` / `pg_dump` /
     // mobilitydb temporal-join modules.
     for entry in &udtf_entries {
+        used_aliases
+            .entry(entry.shape.wit_module.clone())
+            .or_insert_with(|| entry.shape.wit_package.clone());
+    }
+    // Window function WIT modules — typically `pg_cluster`
+    // (postgis-clustering: st_cluster_dbscan et al) plus any
+    // per-partition scalars whose dispatch bodies live in the
+    // window arm. Mirrors sqlite-emit's window_entries pass;
+    // without this the emitted arms reference `pg_cluster::*`
+    // (etc.) with no matching `use` line and the crate fails
+    // to build with `cannot find module or crate 'pg_cluster'`.
+    for entry in &window_entries {
         used_aliases
             .entry(entry.shape.wit_module.clone())
             .or_insert_with(|| entry.shape.wit_package.clone());
