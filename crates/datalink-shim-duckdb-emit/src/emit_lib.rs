@@ -557,12 +557,20 @@ use bindings::exports::duckdb::extension::guest;
     helpers_block.push_str(&render_tuple_list_mixed_helpers(&tuple_mixed_sigs));
 
     // Per-record wit-value helpers — only for records referenced
-    // by a wired param or return.
+    // by a wired param or return AND not blocked by the transitive
+    // derives_ignore walk. Records with resource-typed fields
+    // (canonical trigger: `pixel-vec-entry { geom: geometry }`)
+    // sit in `derives_ignore` because wit-bindgen can't emit serde
+    // derives on them; consequently the JSON-codec helpers
+    // (`serde_json::from_str::<T>`) can't compile for them either.
+    // Skip helper emission for those records — dispatch uses the
+    // upstream binding directly for their scalar arms.
     let referenced_records =
         collect_referenced_records(&scalar_entries, &aggregate_entries);
     let helper_records: Vec<RecordType> = records
         .iter()
         .filter(|r| referenced_records.contains(&r.kebab_name))
+        .filter(|r| !derives_ignore.contains(&r.kebab_name))
         .cloned()
         .collect();
     helpers_block.push_str(&render_wit_value_helpers(&helper_records));
