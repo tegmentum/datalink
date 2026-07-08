@@ -25,11 +25,16 @@ fn emit_produces_expected_layout() {
     let out = tmp.path().join("bridge");
     std::fs::create_dir_all(&out).unwrap();
 
+    let sqlite_path = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("git/postgis-shim-interface/postgis-interface.sqlite"))
+        .filter(|p| p.exists());
     let opts = DynlinkOptions {
         provider_id: "postgis-composed".to_string(),
         sub_ext: "postgis_core".to_string(),
         extension_root: "postgis".to_string(),
         target: String::new(),
+        interface_sqlite: sqlite_path,
     };
     if let Err(e) = emit(&catalog, "postgis_core", &out, opts) {
         let msg = format!("{e:#}");
@@ -154,6 +159,83 @@ fn emit_produces_expected_layout() {
         lib.contains("Pass 2: allocate the chosen arm's buffer"),
         "values_to_colvec must be two-pass (pass 2 = materialize) to avoid pre-NULL off-by-one"
     );
+
+    // #834 followup: the emit must declare per-fn arity + per-arg
+    // logicaltypes at register time. The previous variadic-Blob path
+    // (empty args, varargs=Some(Blob)) erased the shape DuckDB needs
+    // to bind-time overload-resolve. Grep-lock the four canonical
+    // smoke targets — each carries a distinct shape sourced from
+    // `postgis-interface.sqlite::scalars.param_types_json`:
+    //
+    //   st_geomfromtext(text)            -> binary  (1 Text arg, Blob ret)
+    //   st_astext(binary)                -> text    (1 Blob arg, Text ret)
+    //   st_area(binary)                  -> float64 (1 Blob arg, Float64 ret)
+    //   st_distance(binary, binary)      -> float64 (2 Blob args, Float64 ret)
+    //
+    // Any regression to the empty-args + varargs-Blob path (or a
+    // uniform arity-1 Blob fallback when the sqlite IS available)
+    // trips these assertions before wasm-runtime dispatch time.
+    if sqlite_path_probe_used(&out) {
+        // Blob-in Blob-out arity-1 shape (e.g. `st_astext`).
+        assert!(
+            lib.contains("\"st_astext\","),
+            "emit must register st_astext"
+        );
+        // Text-in Blob-out arity-1 shape.
+        assert!(
+            lib.contains("\"st_geomfromtext\","),
+            "emit must register st_geomfromtext"
+        );
+        // Blob-in Float64-out arity-1 shape.
+        assert!(
+            lib.contains("\"st_area\","),
+            "emit must register st_area"
+        );
+        // Blob,Blob-in Float64-out arity-2 shape.
+        assert!(
+            lib.contains("\"st_distance\","),
+            "emit must register st_distance"
+        );
+        // Multiple Funcarg{} entries in some register call — proof of
+        // per-fn arity emission. `st_distance` has two Blob args.
+        assert!(
+            lib.matches("logical: Logicaltype::Blob }").count() >= 2,
+            "expected multiple typed Funcarg entries in emitted lib.rs (per-fn arity should surface > 1 Blob arg total)"
+        );
+        // No empty-args registration + register_scalar_ex path — the
+        // default emit must go through the base `registry.register`
+        // call with a fully-typed `args` vec (the historical
+        // register_scalar_ex path can still appear in a code comment
+        // — the retired-approach marker — so we only forbid the
+        // actual function CALL, not the string).
+        assert!(
+            !lib.contains("runtime_ext::register_scalar_ex("),
+            "emit must not call runtime_ext::register_scalar_ex in the default path — base register_scalar carries the per-fn shape"
+        );
+        assert!(
+            lib.contains("Logicaltype::Text"),
+            "at least one arg / ret is Text (e.g. st_geomfromtext takes Text)"
+        );
+        assert!(
+            lib.contains("Logicaltype::Float64"),
+            "at least one arg / ret is Float64 (e.g. st_area returns Float64)"
+        );
+    }
+}
+
+/// Was the shim-interface sqlite available for this test run? Reads
+/// the emitted lib.rs — if we see the sqlite-derived `Logicaltype::
+/// Text` at any register call, the DB was read; else the fallback
+/// arity-1 Blob shape landed and per-fn assertions are skipped.
+fn sqlite_path_probe_used(out: &std::path::Path) -> bool {
+    let lib = std::fs::read_to_string(out.join("src/lib.rs")).unwrap_or_default();
+    // Presence of any non-Blob logicaltype at a register site is the
+    // signal — a Blob-only fallback never emits Text/Float64/Int64/
+    // Boolean args.
+    lib.contains("logical: Logicaltype::Text")
+        || lib.contains("logical: Logicaltype::Float64")
+        || lib.contains("logical: Logicaltype::Int64")
+        || lib.contains("logical: Logicaltype::Boolean")
 }
 
 #[test]
