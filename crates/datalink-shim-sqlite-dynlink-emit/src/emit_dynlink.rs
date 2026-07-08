@@ -1,17 +1,27 @@
 //! Dynlink-mode sqlite bridge emitter (Phase A, §A.4 Option 1).
 //!
-//! Emits a bridge crate that dispatches every SQL arm through
+//! Emits a bridge crate that dispatches every SQL scalar through
 //! `compose:dynlink/linker` — CBOR envelope in / CBOR envelope out
 //! against a resident provider identified by `opts.provider_id` —
 //! instead of the wac-plug-linked WIT interfaces the sibling
 //! `datalink-shim-sqlite-emit` produces.
 //!
-//! Following §A.4 Option 1, every scalar arm is emitted with an
-//! opaque BLOB payload discipline: each argument is marshalled as
-//! a byte string sourced from the SQL value's blob (or the
-//! UTF-8 bytes of a text value), and the return is unwrapped as
-//! bytes rewrapped as `sql-value { blob }`. The provider owns the
-//! per-arm type inference; the bridge is a pure CBOR tunnel.
+//! The bridge maps onto the declarative `sqlite:extension@1.0.0`
+//! contract (fresh recon, `/Users/zacharywhitley/git/sqlink/sqlite-wit/
+//! wit/sqlite-extension/*.wit`):
+//!
+//!   * `metadata.describe() -> manifest` — the guest advertises
+//!     every scalar it wants registered; the host installs the
+//!     sqlite3 trampolines against its own connection.
+//!   * `scalar-function.call(func-id, args) -> result<sql-value,
+//!     string>` — per-row dispatch keyed by the manifest-assigned
+//!     `func-id`.
+//!
+//! There is **no** imperative `register-*` call on the extension
+//! side (the pre-1.0.0 contract had an `extension` interface with
+//! `register-scalar-function`; that has been retired). This crate's
+//! previous emit forked against the stale contract; the rewrite
+//! matches the shape shipping in `postgis-sqlink-bridge`.
 //!
 //! Wire discipline mirrors
 //! `postgis-wasm/crates/provider/src/envelope.rs`:
@@ -21,16 +31,11 @@
 //! Response { ok:  Option<CborValue>, err: Option<String> }
 //! ```
 //!
-//! The `CborValue` variants are serialised at their bare CBOR
-//! type via a manual `Serialize` — matching the provider-side
-//! envelope. See the deep note on `Response::ok` null-collapse
-//! rehydration in the emitted `call` function.
-//!
-//! Aggregate / table / window / hook exports are stubbed at
-//! Phase A: they surface an "unsupported" error variant on
-//! invocation but keep the world surface structurally complete
-//! so the host's bindgen-generated composite world instantiates
-//! without a missing-export failure.
+//! Aggregate / vtab / collation / hook exports are OMITTED at
+//! Phase A: the `minimal` world exports only `metadata` +
+//! `scalar-function`. Follow-up phases can add
+//! `aggregate-function` / `vtab` / hook exports as their catalog
+//! metadata lands.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,7 +56,7 @@ use crate::DynlinkOptions;
 /// wit/world.wit
 /// wit/deps/compose-dynlink/     (copied from datalink-dynlink)
 /// wit/deps/sys-compose/         (copied from datalink-dynlink)
-/// wit/deps/sqlite-extension/    (copied from ~/git/sqlink/wit/…)
+/// wit/deps/sqlite-extension/    (copied from ~/git/sqlink/sqlite-wit/wit/…)
 /// ```
 pub fn emit_dynlink(
     catalog: &Catalog,
@@ -74,17 +79,10 @@ pub fn emit_dynlink(
         catalog.meta.version.clone()
     };
 
-    // Cargo.toml
     fs::write(out_dir.join("Cargo.toml"), cargo_toml(&crate_name, &version))?;
-
-    // wit/world.wit — imports compose:dynlink/linker + exports the
-    // sqlite:extension contract surface.
     fs::write(out_dir.join("wit/world.wit"), world_wit(&opts.sub_ext))?;
-
-    // wit/deps — copy compose-dynlink + sys-compose + sqlite-extension.
     populate_deps(&out_dir.join("wit/deps"))?;
 
-    // src/lib.rs
     let lib_src = lib_rs(
         &opts.provider_id,
         &opts.extension_root,
@@ -141,7 +139,6 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
 "#,
     )
 }
@@ -157,17 +154,20 @@ fn world_wit(sub_ext: &str) -> String {
 /// Phase A dynlink-mode sqlite bridge.
 ///
 /// The bridge imports `compose:dynlink/linker` for outbound
-/// dispatch to a resident provider and exports the canonical
-/// sqlite:extension contract surface. Scalar registration + the
-/// on-scalar-function callback are the only paths wired to
-/// dispatch; aggregate/collation/hook exports keep structural
-/// parity with the sibling wac-plug bridge but return an
-/// `extension-error` on invocation.
+/// dispatch to a resident provider and exports the declarative
+/// `sqlite:extension@1.0.0` metadata + scalar-function pair.
+/// The host reads `metadata.describe()` at load, installs
+/// sqlite3 trampolines against every advertised scalar, and
+/// routes per-row calls back through `scalar-function.call`.
 world bridge {{
     import compose:dynlink/linker@0.1.0;
 
-    export sqlite:extension/extension;
-    export sqlite:extension/extension-callbacks;
+    // sqlite:extension imports needed by the exports' types.
+    import sqlite:extension/types@1.0.0;
+    import sqlite:extension/policy@1.0.0;
+
+    export sqlite:extension/metadata@1.0.0;
+    export sqlite:extension/scalar-function@1.0.0;
 }}
 "#,
     )
@@ -178,11 +178,8 @@ world bridge {{
 ///
 ///   * `compose:dynlink` + `sys:compose` — from `datalink-dynlink`'s
 ///     WIT tree (the definitive copy for this repo).
-///   * `sqlite:extension` — from `~/git/sqlink/wit/` (contract).
-///
-/// Every copied file passes through `kebab_fix_wit` so identifiers
-/// like `-2d`/`-3d`/`-4d` become `-twod`/`-threed`/`-fourd` — a
-/// wit-bindgen invariant.
+///   * `sqlite:extension` — from `~/git/sqlink/sqlite-wit/wit/…`
+///     (the fresh @1.0.0 contract).
 fn populate_deps(deps_dir: &Path) -> Result<()> {
     // compose-dynlink + sys-compose from datalink-dynlink.
     let dynlink_root = std::env::var("DATALINK_DYNLINK_WIT")
@@ -207,10 +204,6 @@ fn populate_deps(deps_dir: &Path) -> Result<()> {
     }
     let compose_dst = deps_dir.join("compose-dynlink");
     fs::create_dir_all(&compose_dst)?;
-    // Only copy the package + linker + endpoint files. The
-    // upstream world.wit references sqlite:extension worlds that
-    // aren't part of this bridge — the emit crate synthesises its
-    // own world.wit at wit/world.wit.
     for name in ["package.wit", "linker.wit", "endpoint.wit"] {
         let f = compose_dynlink_from.join(name);
         if f.is_file() {
@@ -219,53 +212,41 @@ fn populate_deps(deps_dir: &Path) -> Result<()> {
     }
     copy_tree_kebab_fixed(&sys_compose_from, &deps_dir.join("sys-compose"))?;
 
-    // sqlite:extension contract package.
+    // sqlite:extension contract package. `SQLINK_WIT` should point
+    // at the sqlite-wit tree (defaults to
+    // `~/git/sqlink/sqlite-wit/wit/sqlite-extension/`); we copy the
+    // whole tree since `policy` uses `http.method` from `host-spi`
+    // and `metadata` uses `types + policy`, so trimming is fragile.
+    // The `worlds/` subdirectory (if any) is skipped — the bridge
+    // synthesises its own world at `wit/world.wit`.
     let sqlite_from = std::env::var("SQLINK_WIT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(home).join("git/sqlink/wit")
+            PathBuf::from(home).join("git/sqlink/sqlite-wit/wit/sqlite-extension")
         });
-    // The sqlink repo keeps sqlite-extension.wit at the top level.
-    // Copy it into deps/sqlite-extension/extension.wit — the
-    // subdirectory name matches the `sqlite:extension` package the
-    // world imports from.
-    let sqlite_dst = deps_dir.join("sqlite-extension");
-    fs::create_dir_all(&sqlite_dst)?;
-    let src_extension = sqlite_from.join("sqlite-extension.wit");
-    if !src_extension.is_file() {
+    if !sqlite_from.is_dir() {
         return Err(anyhow!(
             "sqlite:extension WIT source missing: {} (set SQLINK_WIT)",
-            src_extension.display()
+            sqlite_from.display()
         ));
     }
-    copy_kebab_fixed(&src_extension, &sqlite_dst.join("extension.wit"))?;
-    // Prepend a package declaration if the source didn't carry
-    // one — the sqlink top-level sqlite-extension.wit relies on
-    // being included into a world file's package scope, but
-    // wit-bindgen's dep-package resolver requires the dependency
-    // package to declare its own name.
-    fixup_sqlite_package_decl(&sqlite_dst.join("extension.wit"))?;
-    Ok(())
-}
-
-/// Ensure the copied sqlite-extension.wit declares
-/// `package sqlite:extension;` at the top. The upstream file at
-/// `~/git/sqlink/wit/sqlite-extension.wit` has no package header
-/// because it's spliced into world files that declare the
-/// `sqlink:wasm` package; when the file is copied under
-/// `wit/deps/sqlite-extension/` here, wit-bindgen resolves the
-/// `sqlite:extension/…` import path against this file and needs
-/// a matching package declaration to pick it up.
-fn fixup_sqlite_package_decl(path: &Path) -> Result<()> {
-    let text = fs::read_to_string(path)?;
-    if text.trim_start().starts_with("package ") {
-        return Ok(());
+    let sqlite_dst = deps_dir.join("sqlite-extension");
+    fs::create_dir_all(&sqlite_dst)?;
+    for entry in fs::read_dir(&sqlite_from)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let src = entry.path();
+        if ty.is_file() {
+            // Skip the upstream world file — the bridge world
+            // lives at wit/world.wit and is synthesised above.
+            if src.file_name().and_then(|s| s.to_str()) == Some("world.wit") {
+                continue;
+            }
+            let dst = sqlite_dst.join(entry.file_name());
+            copy_kebab_fixed(&src, &dst)?;
+        }
     }
-    let mut out = String::with_capacity(text.len() + 40);
-    out.push_str("package sqlite:extension;\n\n");
-    out.push_str(&text);
-    fs::write(path, out)?;
     Ok(())
 }
 
@@ -303,10 +284,12 @@ fn readme(crate_name: &str, provider_id: &str, sub_ext: &str, target: &str) -> S
          \n\
          Phase A dynlink-mode sqlite bridge for `{sub_ext}` (target `{target}`).\n\
          \n\
-         The bridge imports only `compose:dynlink/linker` and dispatches SQL\n\
-         arms as CBOR envelopes through the resident provider `{provider_id}`.\n\
-         Scalar registration is wired end-to-end; aggregates / collations /\n\
-         hooks return an `extension-error` variant at Phase A scope.\n"
+         Exports the declarative `sqlite:extension@1.0.0` metadata + scalar-\n\
+         function contract. `metadata.describe()` advertises every scalar the\n\
+         catalog names; `scalar-function.call(func-id, args)` routes per-row\n\
+         invocations through `compose:dynlink/linker` against the resident\n\
+         provider `{provider_id}`. Aggregate / vtab / hook exports are\n\
+         deferred to a follow-up.\n"
     )
 }
 
@@ -329,25 +312,32 @@ fn lib_rs(
     scalar_names.sort();
     scalar_names.dedup();
 
-    // Build the scalar-name → function-id assignment table. Ids
-    // start at 1 (0 is reserved as a sentinel for
-    // "not-yet-registered"). Every scalar advertised by the catalog
-    // gets an id; the host's `on-scalar-function` callback carries
-    // the id back so the bridge can look up the method to invoke.
+    // Build the func-id ↔ name lookup and the ScalarFunctionSpec
+    // list body for `metadata.describe()`. Ids start at 1 (id 0 is
+    // reserved as a manifest sentinel).
     let mut scalar_id_arms = String::new();
-    let mut scalar_name_arms = String::new();
-    let mut scalar_register_calls = String::new();
+    let mut scalar_specs = String::new();
     for (idx, name) in scalar_names.iter().enumerate() {
         let id = (idx + 1) as u64;
         let escaped = name.replace('"', "\\\"");
         scalar_id_arms.push_str(&format!(
-            "        \"{escaped}\" => Some({id}),\n"
-        ));
-        scalar_name_arms.push_str(&format!(
             "        {id} => Some(\"{escaped}\"),\n"
         ));
-        scalar_register_calls.push_str(&format!(
-            "        register_scalar(db, \"{escaped}\", -1, {id})?;\n"
+        // Phase A dynlink advertises every scalar with num_args=-1
+        // (variadic). The catalog carries no arity info; declaring
+        // -1 lets sqlite route calls of any arity through
+        // `scalar-function.call`, where the provider can inspect
+        // args.len() and reject if needed. TODO(phase-B): thread
+        // arity from `datalink-shim-codegen-core::interface_db`
+        // once the catalog carries the shape.
+        scalar_specs.push_str(&format!(
+            r#"            ScalarFunctionSpec {{
+                id: {id},
+                name: "{escaped}".to_string(),
+                num_args: -1,
+                func_flags: FunctionFlags::DETERMINISTIC,
+            }},
+"#,
         ));
     }
 
@@ -357,13 +347,8 @@ fn lib_rs(
     format!(
         r##"//! Auto-generated by `datalink_shim_sqlite_dynlink_emit::emit_dynlink`
 //! (Phase A, opaque-blob scalar dispatch). Do NOT edit by hand — regenerate.
-#![no_std]
 #![allow(unused_imports, dead_code)]
 #![allow(unsafe_op_in_unsafe_fn)]
-extern crate alloc;
-use alloc::format;
-use alloc::string::{{String, ToString}};
-use alloc::vec::Vec;
 
 mod bindings {{
     wit_bindgen::generate!({{
@@ -373,13 +358,11 @@ mod bindings {{
     }});
 }}
 
-use bindings::exports::sqlite::extension::extension::{{
-    self as ext_export, Guest as ExtensionGuest, ExtensionError, SqlValue, ValueType,
-    FunctionFlags,
+use bindings::exports::sqlite::extension::metadata::{{
+    Guest as MetadataGuest, Manifest, ScalarFunctionSpec,
 }};
-use bindings::exports::sqlite::extension::extension_callbacks::{{
-    self as cb_export, Guest as CallbacksGuest, AuthAction, AuthResult, UpdateType,
-}};
+use bindings::exports::sqlite::extension::scalar_function::Guest as ScalarFunctionGuest;
+use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
 
 use bindings::compose::dynlink::linker;
 
@@ -496,7 +479,7 @@ impl<'de> serde::Deserialize<'de> for ResponseValue {{
                         ResponseValue::Bytes(b.into_vec())
                     }}
                     "List" => ResponseValue::List(m.next_value()?),
-                    other => return Err(A::Error::custom(alloc::format!("unknown tag: {{}}", other))),
+                    other => return Err(A::Error::custom(format!("unknown tag: {{}}", other))),
                 }};
                 Ok(v)
             }}
@@ -508,12 +491,12 @@ impl<'de> serde::Deserialize<'de> for ResponseValue {{
 fn encode_request(args: Vec<CborValue>) -> Result<Vec<u8>, String> {{
     let mut out = Vec::new();
     ciborium::into_writer(&Request {{ version: 1, args }}, &mut out)
-        .map_err(|e| alloc::format!("cbor encode: {{}}", e))?;
+        .map_err(|e| format!("cbor encode: {{}}", e))?;
     Ok(out)
 }}
 
 fn decode_response(bytes: &[u8]) -> Result<Response, String> {{
-    ciborium::from_reader(bytes).map_err(|e| alloc::format!("cbor decode: {{}}", e))
+    ciborium::from_reader(bytes).map_err(|e| format!("cbor decode: {{}}", e))
 }}
 
 fn call(method: &str, args: Vec<CborValue>) -> Result<ResponseValue, String> {{
@@ -521,104 +504,47 @@ fn call(method: &str, args: Vec<CborValue>) -> Result<ResponseValue, String> {{
     let payload = encode_request(args)?;
     let bytes = inst
         .invoke(&method.to_string(), &payload)
-        .map_err(|e| alloc::format!("{{}}: invoke: {{:?}}", method, e))?;
+        .map_err(|e| format!("{{}}: invoke: {{:?}}", method, e))?;
     let resp = decode_response(&bytes)?;
     if let Some(err) = resp.err {{
-        return Err(alloc::format!("{{}}: {{}}", method, err));
+        return Err(format!("{{}}: {{}}", method, err));
     }}
     Ok(resp.ok.unwrap_or(ResponseValue::Null))
 }}
 
 // -----------------------------------------------------------
-// SQL value marshalling helpers — opaque-blob discipline.
+// SqlValue marshalling — variant discipline per the @1.0.0
+// contract. The `wit-value` arm is Phase-A-out-of-scope; the
+// bridge treats it as null in both directions.
 // -----------------------------------------------------------
 
 fn sqlv_to_cbor(v: &SqlValue) -> CborValue {{
-    match v.value_type {{
-        ValueType::Null => CborValue::Null,
-        ValueType::Integer => v.int_value.map(CborValue::Int).unwrap_or(CborValue::Null),
-        ValueType::Float => v.float_value.map(CborValue::Float).unwrap_or(CborValue::Null),
-        ValueType::Text => v.text_value.clone().map(CborValue::Text).unwrap_or(CborValue::Null),
-        ValueType::Blob => v.blob_value.clone().map(CborValue::Bytes).unwrap_or(CborValue::Null),
+    match v {{
+        SqlValue::Null => CborValue::Null,
+        SqlValue::Integer(i) => CborValue::Int(*i),
+        SqlValue::Real(f) => CborValue::Float(*f),
+        SqlValue::Text(t) => CborValue::Text(t.clone()),
+        SqlValue::Blob(b) => CborValue::Bytes(b.clone()),
+        SqlValue::WitValue(_) => CborValue::Null,
     }}
 }}
 
 fn response_to_sqlv(v: ResponseValue) -> SqlValue {{
     match v {{
-        ResponseValue::Null => SqlValue {{
-            value_type: ValueType::Null,
-            int_value: None,
-            float_value: None,
-            text_value: None,
-            blob_value: None,
-        }},
-        ResponseValue::Bool(b) => SqlValue {{
-            value_type: ValueType::Integer,
-            int_value: Some(if b {{ 1 }} else {{ 0 }}),
-            float_value: None,
-            text_value: None,
-            blob_value: None,
-        }},
-        ResponseValue::Int(i) => SqlValue {{
-            value_type: ValueType::Integer,
-            int_value: Some(i),
-            float_value: None,
-            text_value: None,
-            blob_value: None,
-        }},
-        ResponseValue::Float(f) => SqlValue {{
-            value_type: ValueType::Float,
-            int_value: None,
-            float_value: Some(f),
-            text_value: None,
-            blob_value: None,
-        }},
-        ResponseValue::Text(t) => SqlValue {{
-            value_type: ValueType::Text,
-            int_value: None,
-            float_value: None,
-            text_value: Some(t),
-            blob_value: None,
-        }},
-        ResponseValue::Bytes(b) => SqlValue {{
-            value_type: ValueType::Blob,
-            int_value: None,
-            float_value: None,
-            text_value: None,
-            blob_value: Some(b),
-        }},
-        ResponseValue::List(_) => SqlValue {{
-            value_type: ValueType::Null,
-            int_value: None,
-            float_value: None,
-            text_value: None,
-            blob_value: None,
-        }},
+        ResponseValue::Null => SqlValue::Null,
+        ResponseValue::Bool(b) => SqlValue::Integer(if b {{ 1 }} else {{ 0 }}),
+        ResponseValue::Int(i) => SqlValue::Integer(i),
+        ResponseValue::Float(f) => SqlValue::Real(f),
+        ResponseValue::Text(t) => SqlValue::Text(t),
+        ResponseValue::Bytes(b) => SqlValue::Blob(b),
+        ResponseValue::List(_) => SqlValue::Null,
     }}
 }}
 
 fn scalar_name_by_id(id: u64) -> Option<&'static str> {{
     match id {{
-{scalar_name_arms}        _ => None,
-    }}
-}}
-
-fn scalar_id_by_name(name: &str) -> Option<u64> {{
-    match name {{
 {scalar_id_arms}        _ => None,
     }}
-}}
-
-fn register_scalar(db: u64, name: &str, num_args: i32, function_id: u64)
-    -> Result<u64, ExtensionError>
-{{
-    ext_export::register_scalar_function(
-        db,
-        &name.to_string(),
-        num_args,
-        FunctionFlags::DETERMINISTIC,
-        function_id,
-    )
 }}
 
 // -----------------------------------------------------------
@@ -627,65 +553,41 @@ fn register_scalar(db: u64, name: &str, num_args: i32, function_id: u64)
 
 struct Component;
 
-impl ExtensionGuest for Component {{
-    fn register_scalar_function(
-        _db: u64,
-        _name: String,
-        _num_args: i32,
-        _func_flags: FunctionFlags,
-        _function_id: u64,
-    ) -> Result<u64, ExtensionError> {{
-        // A dynlink bridge does not itself host the `extension`
-        // interface — every method returns an error because
-        // registration is orchestrated by the host during
-        // `sqlite3_extension_init`. Kept as a stub so the world
-        // exports a matching Guest impl.
-        Err(ExtensionError {{
-            code: 1,
-            message: "sqlite dynlink bridge: extension registration is host-orchestrated"
-                .to_string(),
-        }})
+impl MetadataGuest for Component {{
+    fn describe() -> Manifest {{
+        let scalar_functions: Vec<ScalarFunctionSpec> = vec![
+{scalar_specs}        ];
+        Manifest {{
+            name: EXTENSION_ROOT.to_string(),
+            version: CATALOG_VERSION.to_string(),
+            scalar_functions,
+            aggregate_functions: vec![],
+            collations: vec![],
+            vtabs: vec![],
+            dot_commands: vec![],
+            has_authorizer: false,
+            has_update_hook: false,
+            has_commit_hook: false,
+            has_wal_hook: false,
+            wal_hook_id: 0,
+            declared_capabilities: vec![],
+            optional_capabilities: vec![],
+            preferred_prefix: None,
+            prefix_expansion: None,
+            typed_values: vec![],
+        }}
     }}
-    fn unregister_function(_handle: u64) -> Result<(), ExtensionError> {{ Ok(()) }}
-    fn register_aggregate_function(
-        _db: u64, _name: String, _num_args: i32,
-        _func_flags: FunctionFlags, _function_id: u64,
-    ) -> Result<u64, ExtensionError> {{
-        Err(ExtensionError {{ code: 1, message: "aggregate: not supported (Phase A)".to_string() }})
-    }}
-    fn register_collation(_db: u64, _name: String, _collation_id: u64) -> Result<u64, ExtensionError> {{
-        Err(ExtensionError {{ code: 1, message: "collation: not supported (Phase A)".to_string() }})
-    }}
-    fn unregister_collation(_handle: u64) -> Result<(), ExtensionError> {{ Ok(()) }}
-    fn set_update_hook(_db: u64, _hook_id: u64) -> Result<u64, ExtensionError> {{
-        Err(ExtensionError {{ code: 1, message: "update-hook: not supported (Phase A)".to_string() }})
-    }}
-    fn remove_update_hook(_handle: u64) -> Result<(), ExtensionError> {{ Ok(()) }}
-    fn set_commit_hook(_db: u64, _hook_id: u64) -> Result<u64, ExtensionError> {{
-        Err(ExtensionError {{ code: 1, message: "commit-hook: not supported (Phase A)".to_string() }})
-    }}
-    fn remove_commit_hook(_handle: u64) -> Result<(), ExtensionError> {{ Ok(()) }}
-    fn set_rollback_hook(_db: u64, _hook_id: u64) -> Result<u64, ExtensionError> {{
-        Err(ExtensionError {{ code: 1, message: "rollback-hook: not supported (Phase A)".to_string() }})
-    }}
-    fn remove_rollback_hook(_handle: u64) -> Result<(), ExtensionError> {{ Ok(()) }}
-    fn set_busy_timeout(_db: u64, _ms: i32) -> Result<(), ExtensionError> {{ Ok(()) }}
-    fn set_authorizer(_db: u64, _auth_id: u64) -> Result<u64, ExtensionError> {{
-        Err(ExtensionError {{ code: 1, message: "authorizer: not supported (Phase A)".to_string() }})
-    }}
-    fn remove_authorizer(_handle: u64) -> Result<(), ExtensionError> {{ Ok(()) }}
 }}
 
-impl CallbacksGuest for Component {{
-    fn on_scalar_function(function_id: u64, args: Vec<SqlValue>) -> Result<SqlValue, String> {{
-        let name = scalar_name_by_id(function_id)
-            .ok_or_else(|| alloc::format!("unknown function id {{}}", function_id))?;
-        // If any argument is NULL, propagate NULL — matches the
-        // datafission-emit sibling's default null-propagation
-        // discipline. Providers that need to observe explicit NULL
-        // arguments will need a follow-up Phase to opt in per-arm.
-        if args.iter().any(|v| matches!(v.value_type, ValueType::Null)) {{
-            return Ok(response_to_sqlv(ResponseValue::Null));
+impl ScalarFunctionGuest for Component {{
+    fn call(func_id: u64, args: Vec<SqlValue>) -> Result<SqlValue, String> {{
+        let name = scalar_name_by_id(func_id)
+            .ok_or_else(|| format!("unknown function id {{}}", func_id))?;
+        // SQL-style null propagation. Providers that need to
+        // observe explicit NULL arguments will need a follow-up
+        // Phase to opt in per-arm.
+        if args.iter().any(|v| matches!(v, SqlValue::Null)) {{
+            return Ok(SqlValue::Null);
         }}
         // WIT SQL name → provider method: snake_case → kebab-case.
         let method = name.replace('_', "-");
@@ -693,29 +595,6 @@ impl CallbacksGuest for Component {{
         let resp = call(&method, cbor_args)?;
         Ok(response_to_sqlv(resp))
     }}
-
-    fn on_aggregate_step(_function_id: u64, _context_id: u64, _args: Vec<SqlValue>) {{}}
-    fn on_aggregate_finalize(_function_id: u64, _context_id: u64)
-        -> Result<SqlValue, String> {{
-        Err("aggregate: not supported (Phase A)".to_string())
-    }}
-    fn on_collation_compare(_collation_id: u64, _a: String, _b: String) -> i32 {{ 0 }}
-    fn on_update(_hook_id: u64, _op: UpdateType, _database: String, _table: String, _rowid: i64) {{}}
-    fn on_commit(_hook_id: u64) -> bool {{ false }}
-    fn on_rollback(_hook_id: u64) {{}}
-    fn on_authorize(
-        _auth_id: u64, _action: AuthAction, _arg1: Option<String>,
-        _arg2: Option<String>, _database: Option<String>, _trigger: Option<String>,
-    ) -> AuthResult {{ AuthResult::Ok }}
-}}
-
-/// Convenience helper for a future `sqlite3_extension_init`
-/// bootstrap: registers every scalar the catalog carries. Not
-/// invoked by the emitted world (the host wires registration on
-/// LOAD), but kept for symmetry with the wac-plug bridge's
-/// helper.
-fn register_all_scalars(db: u64) -> Result<(), ExtensionError> {{
-{scalar_register_calls}    Ok(())
 }}
 
 bindings::export!(Component with_types_in bindings);

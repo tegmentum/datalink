@@ -63,4 +63,79 @@ fn emit_produces_expected_layout() {
         world.contains("export duckdb:extension/callback-dispatch@4.0.0"),
         "world.wit missing callback-dispatch export:\n{world}"
     );
+
+    // Fix #1-#2 verification: the emitted lib.rs must reference the
+    // ACTUAL @4.0.0 Duckvalue variant arm names (Int8/Int16/Int32/
+    // Int64/Uint8/…/Float32/Float64/Text) and the ACTUAL Loadresult
+    // field names (version: Option, requires: Vec<Capabilitykind>).
+    // Any regression to the pre-1.0 arm names (Tinyint / Smallint /
+    // Integer / Bigint / Float / Double / Varchar) or to the stale
+    // Loadresult `extras` field would fail cargo check on the
+    // emitted crate; catching it here means we don't have to build
+    // the wasm target to notice.
+    let lib = std::fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    for arm in [
+        "Duckvalue::Int8(",
+        "Duckvalue::Int16(",
+        "Duckvalue::Int32(",
+        "Duckvalue::Int64(",
+        "Duckvalue::Uint8(",
+        "Duckvalue::Uint16(",
+        "Duckvalue::Uint32(",
+        "Duckvalue::Uint64(",
+        "Duckvalue::Float32(",
+        "Duckvalue::Float64(",
+        "Duckvalue::Text(",
+        "Duckvalue::Blob(",
+        "Duckvalue::Boolean(",
+        "Duckvalue::Null",
+    ] {
+        assert!(
+            lib.contains(arm),
+            "emitted lib.rs missing Duckvalue arm `{arm}` — WIT variant name mismatch"
+        );
+    }
+    for stale in [
+        "Duckvalue::Tinyint",
+        "Duckvalue::Smallint",
+        "Duckvalue::Integer",
+        "Duckvalue::Bigint",
+        "Duckvalue::Utinyint",
+        "Duckvalue::Usmallint",
+        "Duckvalue::Uinteger",
+        "Duckvalue::Ubigint",
+        "Duckvalue::Float(",
+        "Duckvalue::Double(",
+        "Duckvalue::Varchar",
+    ] {
+        assert!(
+            !lib.contains(stale),
+            "emitted lib.rs still references stale Duckvalue arm `{stale}`"
+        );
+    }
+    assert!(
+        lib.contains("version: Some(CATALOG_VERSION.to_string())"),
+        "Loadresult.version must be Option<String>, not String"
+    );
+    assert!(
+        lib.contains("requires: vec![Capabilitykind::"),
+        "Loadresult.requires must be Vec<Capabilitykind>"
+    );
+    assert!(
+        !lib.contains("extras: Vec::new()"),
+        "Loadresult must not carry a stale `extras` field"
+    );
+    // Fix #5 verification: load() must actually register scalars.
+    assert!(
+        lib.contains("runtime::get_capability(Capabilitykind::Scalar)"),
+        "load() must call runtime::get_capability(Scalar) to register scalars"
+    );
+    assert!(
+        lib.contains("registry.register("),
+        "load() must invoke scalar-registry.register — comment-only stubs are a regression"
+    );
+    assert!(
+        lib.contains("runtime::ScalarCallback::new(handle)"),
+        "each registered scalar must build a ScalarCallback::new(handle)"
+    );
 }

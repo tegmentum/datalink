@@ -54,14 +54,68 @@ fn emit_produces_expected_layout() {
         assert!(p.exists(), "expected file missing: {}", p.display());
     }
 
-    // World file must import compose:dynlink/linker.
+    // World file must import compose:dynlink/linker and export
+    // the declarative `metadata` + `scalar-function` pair (per
+    // the @1.0.0 contract). The pre-1.0 imperative `extension` +
+    // `extension-callbacks` shape is retired.
     let world = std::fs::read_to_string(out.join("wit/world.wit")).unwrap();
     assert!(
         world.contains("import compose:dynlink/linker@0.1.0"),
         "world.wit missing compose:dynlink/linker import:\n{world}"
     );
     assert!(
-        world.contains("export sqlite:extension/extension"),
-        "world.wit missing sqlite:extension/extension export:\n{world}"
+        world.contains("export sqlite:extension/metadata@1.0.0"),
+        "world.wit missing sqlite:extension/metadata export:\n{world}"
     );
+    assert!(
+        world.contains("export sqlite:extension/scalar-function@1.0.0"),
+        "world.wit missing sqlite:extension/scalar-function export:\n{world}"
+    );
+    assert!(
+        !world.contains("sqlite:extension/extension-callbacks"),
+        "world.wit must not reference the stale extension-callbacks interface"
+    );
+
+    // Fix #3 + #6 verification: the emitted lib.rs must implement
+    // the declarative `MetadataGuest::describe` + `ScalarFunctionGuest::call`
+    // pair — not the pre-1.0 imperative `register_scalar_function`
+    // model. `SqlValue` must be pattern-matched as a WIT variant
+    // (SqlValue::Integer(...), SqlValue::Blob(...)) rather than
+    // the stale `SqlValue { value_type: ValueType::* }` record.
+    let lib = std::fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    assert!(
+        lib.contains("impl MetadataGuest for Component"),
+        "lib.rs must impl MetadataGuest (metadata.describe)"
+    );
+    assert!(
+        lib.contains("impl ScalarFunctionGuest for Component"),
+        "lib.rs must impl ScalarFunctionGuest (scalar-function.call)"
+    );
+    assert!(
+        lib.contains("ScalarFunctionSpec {"),
+        "describe() must populate ScalarFunctionSpec entries"
+    );
+    for arm in [
+        "SqlValue::Null",
+        "SqlValue::Integer(",
+        "SqlValue::Real(",
+        "SqlValue::Text(",
+        "SqlValue::Blob(",
+    ] {
+        assert!(
+            lib.contains(arm),
+            "emitted lib.rs missing SqlValue arm `{arm}` — WIT variant name mismatch"
+        );
+    }
+    for stale in [
+        "register_scalar_function",
+        "ExtensionError",
+        "on_scalar_function",
+        "value_type: ValueType::",
+    ] {
+        assert!(
+            !lib.contains(stale),
+            "emitted lib.rs still references stale pre-1.0 API `{stale}`"
+        );
+    }
 }
