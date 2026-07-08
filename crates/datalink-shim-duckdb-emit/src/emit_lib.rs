@@ -108,6 +108,55 @@ pub fn lib_rs(plan: &BridgePlan, crate_name: &str) -> Result<String> {
         .filter(|r| emit_wit::package_belongs_to_primary(&r.package, primary))
         .collect();
 
+    // Mirror sqlite-emit's #794 fix: records whose field types
+    // reference a resource kebab (or transitively a
+    // resource-containing record) can't ride the JSON codec —
+    // wit-bindgen strips serde on the resource handle, so
+    // `serde_json::from_str::<PixelVecEntry>(…)` fails to compile
+    // when pixel-vec-entry has a `geometry` field. Filter them
+    // out before dispatch classifies functions against them; the
+    // scalars that touched them then fall through as unwired
+    // (better: `Duckerror::Unsupported`) instead of emitting
+    // references to helpers we can't produce.
+    let resource_names: std::collections::BTreeSet<String> = shim_packages
+        .iter()
+        .flat_map(|p| p.resources.iter().map(|r| r.kebab_name.clone()))
+        .collect();
+    let mut blocked_records: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    loop {
+        let mut added = false;
+        for r in &records {
+            if blocked_records.contains(&r.kebab_name) {
+                continue;
+            }
+            let mut hits = false;
+            for (_fname, ftype) in &r.fields {
+                let mut idents: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                extract_wit_type_idents(ftype, &mut idents);
+                if idents
+                    .iter()
+                    .any(|id| resource_names.contains(id) || blocked_records.contains(id))
+                {
+                    hits = true;
+                    break;
+                }
+            }
+            if hits {
+                blocked_records.insert(r.kebab_name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    let records: Vec<RecordType> = records
+        .into_iter()
+        .filter(|r| !blocked_records.contains(&r.kebab_name))
+        .collect();
+
     let (scalar_entries, scalar_unwired) =
         interface_db::build_full(plan, &shim_wit_dir, &records)?;
 
