@@ -1,0 +1,21 @@
+[package]
+name = "datalink-shim-duckdb-dynlink-emit"
+version = "0.1.0"
+edition = "2021"
+description = "Dynlink-mode duckdb-target emitter for the shim-bridge codegen. Consumes a `spatial-catalog.toml` extension surface (leaves or umbrellas) and emits a `wasm32-wasip2` cdylib bridge crate that imports `compose:dynlink/linker@0.1.0` and exports the canonical `duckdb:extension@4.0.0` guest + callback-dispatch surface, routing every dispatch through the resident provider identified by `provider_id`. Phase A sibling of `datalink-shim-sqlite-dynlink-emit`."
+license = "Apache-2.0"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "datalink_shim_duckdb_dynlink_emit"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-shim-codegen-core = { path = "../datalink-shim-codegen-core" }
+anyhow = "1"
+sha2 = "0.10"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
