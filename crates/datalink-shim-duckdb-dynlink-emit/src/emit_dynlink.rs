@@ -190,6 +190,22 @@ pub fn emit_dynlink(
     fs::write(out_dir.join("wit/world.wit"), world_wit(&opts.sub_ext))?;
     populate_deps(&out_dir.join("wit/deps"))?;
 
+    // Build the scalar alias→canonical map from `catalog.aliases`.
+    // The catalog carries name-mangling aliases (e.g.
+    // `st_geomfromtext` → `st_geom_from_text`) as first-class
+    // `[[aliases]]` entries so both SQL spellings resolve to the
+    // same provider WIT method. The bridge exposes both forms to
+    // DuckDB (they're both in `leaf.scalars`), but the provider only
+    // matches the WIT-canonical (long) form. Without translation, a
+    // call to `st_geomfromtext(...)` reaches the provider as method
+    // `st-geomfromtext` and fails with `unknown method`.
+    let scalar_aliases: Vec<(String, String)> = catalog
+        .aliases
+        .iter()
+        .filter(|a| a.kind == "scalar")
+        .map(|a| (a.alias.clone(), a.canonical.clone()))
+        .collect();
+
     let lib_src = lib_rs(
         &opts.provider_id,
         &opts.extension_root,
@@ -197,6 +213,7 @@ pub fn emit_dynlink(
         &version,
         functions.iter().collect::<Vec<_>>().as_slice(),
         &sig_map,
+        &scalar_aliases,
     );
     fs::write(out_dir.join("src/lib.rs"), lib_src)?;
 
@@ -409,6 +426,7 @@ fn lib_rs(
     version: &str,
     functions: &[&(FnKind, String)],
     sig_map: &HashMap<String, ScalarSig>,
+    scalar_aliases: &[(String, String)],
 ) -> String {
     let mut scalar_names: Vec<&str> = functions
         .iter()
@@ -417,6 +435,26 @@ fn lib_rs(
         .collect();
     scalar_names.sort();
     scalar_names.dedup();
+
+    // Emit the compact→canonical alias table as a `match` arm body
+    // consumed by the `canonical_for` helper below. Only aliases
+    // that appear as scalars in this bridge's dispatch set contribute
+    // an arm — if the alias isn't a name we register with DuckDB,
+    // there's no dispatch site that could reach it and the arm would
+    // be dead code. Aliases whose canonical form is missing from the
+    // dispatch set are dropped too (there's no arm to route to).
+    let scalar_name_set: std::collections::BTreeSet<&str> =
+        scalar_names.iter().copied().collect();
+    let mut alias_arms = String::new();
+    for (alias, canonical) in scalar_aliases {
+        if scalar_name_set.contains(alias.as_str())
+            && scalar_name_set.contains(canonical.as_str())
+        {
+            let a = alias.replace('"', "\\\"");
+            let c = canonical.replace('"', "\\\"");
+            alias_arms.push_str(&format!("        \"{a}\" => \"{c}\",\n"));
+        }
+    }
 
     // Build the arm_idx ↔ name lookup. `arm_idx` starts at 0
     // and is dense over the sorted scalar name set; the runtime
@@ -998,6 +1036,21 @@ fn scalar_name_by_arm_idx(arm: usize) -> Option<&'static str> {{
     }}
 }}
 
+/// SQL-name aliasing: translate a compact-form SQL name (e.g.
+/// `st_geomfromtext`) to its WIT-canonical (long) form
+/// (`st_geom_from_text`) before kebab-casing to the provider
+/// method name. The catalog carries both spellings as scalars in
+/// `leaf.scalars` (both must register with DuckDB so callers can
+/// use either), and as first-class `[[aliases]]` entries. The
+/// provider dispatch only matches the WIT-canonical form; the
+/// bridge's `dispatch_call_scalar` calls `canonical_for(name)` so
+/// both spellings route to the same provider arm.
+fn canonical_for(name: &str) -> &str {{
+    match name {{
+{alias_arms}        other => other,
+    }}
+}}
+
 // ────────────────────────────────────────────────────────────
 // Handle table + register block.
 //
@@ -1078,8 +1131,13 @@ fn dispatch_call_scalar(
     if args.iter().any(|v| matches!(v, Duckvalue::Null)) {{
         return Ok(Duckvalue::Null);
     }}
-    // WIT SQL name → provider method: snake_case → kebab-case.
-    let method = name.replace('_', "-");
+    // Alias translation: SQL name → WIT-canonical → provider method
+    // (kebab-case). Compact-form SQL names (e.g. `st_geomfromtext`)
+    // route through `canonical_for` to their long form
+    // (`st_geom_from_text`) before kebab-casing; non-alias names
+    // pass through unchanged. See `canonical_for` above.
+    let canonical = canonical_for(name);
+    let method = canonical.replace('_', "-");
     let cbor_args: Vec<CborValue> = args.iter().map(duckv_to_cbor).collect();
     let resp = call(&method, cbor_args)?;
     Ok(response_to_duckv(resp))
