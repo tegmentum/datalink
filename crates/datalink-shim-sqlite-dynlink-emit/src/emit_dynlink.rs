@@ -518,27 +518,40 @@ fn call(method: &str, args: Vec<CborValue>) -> Result<ResponseValue, String> {{
 // bridge treats it as null in both directions.
 // -----------------------------------------------------------
 
-fn sqlv_to_cbor(v: &SqlValue) -> CborValue {{
-    match v {{
+fn sqlv_to_cbor(v: &SqlValue) -> Result<CborValue, String> {{
+    Ok(match v {{
         SqlValue::Null => CborValue::Null,
         SqlValue::Integer(i) => CborValue::Int(*i),
         SqlValue::Real(f) => CborValue::Float(*f),
         SqlValue::Text(t) => CborValue::Text(t.clone()),
         SqlValue::Blob(b) => CborValue::Bytes(b.clone()),
-        SqlValue::WitValue(_) => CborValue::Null,
-    }}
+        // WitValue is Phase-A-out-of-scope. Prior code silently
+        // downgraded it to CBOR null, which lied to the provider
+        // (an explicit-typed argument became indistinguishable
+        // from a real NULL). Surface an explicit error instead so
+        // callers see a diagnostic on the SQL side.
+        SqlValue::WitValue(_) => {{
+            return Err("bridge: WitValue arg not supported in dynlink Phase A".to_string());
+        }}
+    }})
 }}
 
-fn response_to_sqlv(v: ResponseValue) -> SqlValue {{
-    match v {{
+fn response_to_sqlv(v: ResponseValue) -> Result<SqlValue, String> {{
+    Ok(match v {{
         ResponseValue::Null => SqlValue::Null,
         ResponseValue::Bool(b) => SqlValue::Integer(if b {{ 1 }} else {{ 0 }}),
         ResponseValue::Int(i) => SqlValue::Integer(i),
         ResponseValue::Float(f) => SqlValue::Real(f),
         ResponseValue::Text(t) => SqlValue::Text(t),
         ResponseValue::Bytes(b) => SqlValue::Blob(b),
-        ResponseValue::List(_) => SqlValue::Null,
-    }}
+        // A list-shaped response has no SQLite scalar sqlvalue
+        // arm. Prior code silently returned SqlValue::Null, hiding
+        // a shape mismatch behind an implicit NULL. Return an
+        // explicit error so the SQL side sees a diagnostic.
+        ResponseValue::List(_) => {{
+            return Err("bridge: list-shaped response not supported".to_string());
+        }}
+    }})
 }}
 
 fn scalar_name_by_id(id: u64) -> Option<&'static str> {{
@@ -591,9 +604,12 @@ impl ScalarFunctionGuest for Component {{
         }}
         // WIT SQL name → provider method: snake_case → kebab-case.
         let method = name.replace('_', "-");
-        let cbor_args: Vec<CborValue> = args.iter().map(sqlv_to_cbor).collect();
+        let cbor_args: Vec<CborValue> = args
+            .iter()
+            .map(sqlv_to_cbor)
+            .collect::<Result<Vec<_>, String>>()?;
         let resp = call(&method, cbor_args)?;
-        Ok(response_to_sqlv(resp))
+        response_to_sqlv(resp)
     }}
 }}
 
