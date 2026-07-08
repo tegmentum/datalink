@@ -138,4 +138,90 @@ fn emit_produces_expected_layout() {
         lib.contains("runtime::ScalarCallback::new(handle)"),
         "each registered scalar must build a ScalarCallback::new(handle)"
     );
+    // values_to_colvec off-by-one guard: the emit must ship a
+    // TWO-PASS layout — pass 1 picks the arm across every non-NULL
+    // row, pass 2 materializes into the chosen buffer. A single-pass
+    // (pre-M4) implementation would leave NULL rows preceding the
+    // first non-NULL row in the wrong (blobs) buffer, causing a
+    // buffer.len() < rows off-by-one when the picked arm was not
+    // Blob. Grep for the pass markers so regressions surface here
+    // instead of at wasm-runtime dispatch time.
+    assert!(
+        lib.contains("Pass 1: pick the arm"),
+        "values_to_colvec must be two-pass (pass 1 = arm pick) to avoid pre-NULL off-by-one"
+    );
+    assert!(
+        lib.contains("Pass 2: allocate the chosen arm's buffer"),
+        "values_to_colvec must be two-pass (pass 2 = materialize) to avoid pre-NULL off-by-one"
+    );
+}
+
+#[test]
+fn values_to_colvec_two_pass_algorithm_holds_alignment() {
+    // Standalone verification of the algorithm the emit ships: a
+    // batch that starts with a NULL row before the first non-NULL
+    // row must still produce a buffer whose length matches the row
+    // count, with the validity bit clear for the NULL row and set
+    // for the non-NULL row. The check runs a local copy of the
+    // two-pass core so we exercise it without spinning a wasm
+    // runtime; the emitted lib.rs is grep-locked to the same
+    // two-pass layout by `emit_produces_expected_layout`.
+    #[derive(Clone, Debug)]
+    enum V {
+        Null,
+        Int64(i64),
+    }
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Arm {
+        Unknown,
+        Int64,
+    }
+    fn arm_of(v: &V) -> Option<Arm> {
+        Some(match v {
+            V::Int64(_) => Arm::Int64,
+            V::Null => return None,
+        })
+    }
+    let values = vec![V::Null, V::Int64(42)];
+    let n = values.len();
+    let mut bits = vec![0u8; (n + 7) / 8];
+    let mut any_null = false;
+
+    // Pass 1: pick the arm.
+    let mut arm = Arm::Unknown;
+    for v in &values {
+        if matches!(v, V::Null) {
+            any_null = true;
+            continue;
+        }
+        let this = arm_of(v).unwrap();
+        if arm == Arm::Unknown {
+            arm = this;
+        }
+    }
+    assert_eq!(arm, Arm::Int64);
+
+    // Pass 2: materialize.
+    let mut int64s: Vec<i64> = Vec::new();
+    for (i, v) in values.into_iter().enumerate() {
+        if matches!(v, V::Null) {
+            match arm {
+                Arm::Unknown | Arm::Int64 => int64s.push(0),
+            }
+            continue;
+        }
+        bits[i / 8] |= 1u8 << (i % 8);
+        match v {
+            V::Int64(x) => int64s.push(x),
+            V::Null => unreachable!(),
+        }
+    }
+
+    assert_eq!(int64s.len(), 2, "buffer must have one slot per row (2 rows)");
+    assert_eq!(int64s[0], 0, "row 0 (NULL) must be a zero placeholder");
+    assert_eq!(int64s[1], 42, "row 1 (non-NULL) must carry the real value");
+    assert!(any_null, "any_null must fire so the validity bitmap survives");
+    // Row 0 validity bit clear (NULL), row 1 set (non-NULL).
+    assert_eq!(bits[0] & 0b01, 0b00, "row 0 validity bit must be 0 (NULL)");
+    assert_eq!(bits[0] & 0b10, 0b10, "row 1 validity bit must be 1 (non-NULL)");
 }

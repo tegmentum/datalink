@@ -656,14 +656,21 @@ fn materialize_row(args: &[column_types::Colvec], i: usize, out: &mut Vec<Duckva
 }}
 
 /// Lower a `Vec<Duckvalue>` (per-row scalar returns) into a
-/// typed `Colvec`. The column arm is picked from the first
-/// non-NULL row's Duckvalue variant; every subsequent row must
-/// match that arm or a `Duckerror::Internal` is returned
-/// (rather than silently dropping the row to NULL — the old
-/// blob-only path lost every non-Blob/non-Text primitive
-/// result). A colvec of all-NULLs is lowered as Blob (chosen
-/// arbitrarily: no data buffer is ever addressed since the
-/// validity bitmap zeros every row).
+/// typed `Colvec`. Uses a TWO-PASS approach so that NULL rows
+/// preceding the first non-NULL row still land in the eventual
+/// arm's buffer as zero placeholders (single-pass "pick on first
+/// non-NULL" left the pre-arm nulls in `blobs`, giving a
+/// buffer.len() < rows off-by-one when the picked arm was not
+/// Blob — every subsequent lookup was misaligned).
+///
+/// Pass 1 walks `&values` to determine the arm (and rejects
+/// heterogeneous batches / unsupported Decimal/Interval/Uuid/
+/// Complex arms). Pass 2 consumes `values` and pushes real
+/// values or zero placeholders into that arm's buffer so the
+/// buffer index matches the row index; the validity bitmap
+/// carries the actual NULL rows. A colvec of all-NULLs is
+/// lowered as Blob (chosen arbitrarily: no data buffer is ever
+/// addressed since the validity bitmap zeros every row).
 fn values_to_colvec(values: Vec<Duckvalue>) -> Result<column_types::Colvec, Duckerror> {{
     let n = values.len();
     let rows = n as u32;
@@ -683,25 +690,6 @@ fn values_to_colvec(values: Vec<Duckvalue>) -> Result<column_types::Colvec, Duck
         Text, Blob,
         Date, Time, Timestamp, Timestamptz,
     }}
-
-    let mut arm = Arm::Unknown;
-    let mut booleans: Vec<bool> = Vec::new();
-    let mut int8s: Vec<i8> = Vec::new();
-    let mut int16s: Vec<i16> = Vec::new();
-    let mut int32s: Vec<i32> = Vec::new();
-    let mut int64s: Vec<i64> = Vec::new();
-    let mut uint8s: Vec<u8> = Vec::new();
-    let mut uint16s: Vec<u16> = Vec::new();
-    let mut uint32s: Vec<u32> = Vec::new();
-    let mut uint64s: Vec<u64> = Vec::new();
-    let mut float32s: Vec<f32> = Vec::new();
-    let mut float64s: Vec<f64> = Vec::new();
-    let mut texts: Vec<String> = Vec::new();
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
-    let mut dates: Vec<i32> = Vec::new();
-    let mut times: Vec<i64> = Vec::new();
-    let mut timestamps: Vec<i64> = Vec::new();
-    let mut timestamptzs: Vec<i64> = Vec::new();
 
     fn arm_of(v: &Duckvalue) -> Option<Arm> {{
         Some(match v {{
@@ -738,11 +726,52 @@ fn values_to_colvec(values: Vec<Duckvalue>) -> Result<column_types::Colvec, Duck
         ))
     }}
 
-    for (i, v) in values.into_iter().enumerate() {{
+    // ---- Pass 1: pick the arm across every non-NULL row. ----
+    let mut arm = Arm::Unknown;
+    for (i, v) in values.iter().enumerate() {{
         if matches!(v, Duckvalue::Null) {{
             any_null = true;
-            // Push a placeholder so the buffer index tracks the
-            // row index; the validity bit stays 0.
+            continue;
+        }}
+        // Refuse unsupported (Decimal/Interval/Uuid/Complex)
+        // returns explicitly — the old code silently NULLed them.
+        let this_arm = arm_of(v).ok_or_else(|| Duckerror::Internal(format!(
+            "values_to_colvec: unsupported column arm for row {{}} (Decimal/Interval/Uuid/Complex \
+             lowering is not yet implemented in the dynlink emit)",
+            i,
+        )))?;
+        if arm == Arm::Unknown {{
+            arm = this_arm;
+        }} else if arm != this_arm {{
+            return Err(mismatch(&arm, v));
+        }}
+    }}
+
+    // ---- Pass 2: allocate the chosen arm's buffer at exact
+    // length and materialize (real values for non-NULL rows,
+    // zero placeholders for NULL rows).
+    let mut booleans: Vec<bool> = Vec::new();
+    let mut int8s: Vec<i8> = Vec::new();
+    let mut int16s: Vec<i16> = Vec::new();
+    let mut int32s: Vec<i32> = Vec::new();
+    let mut int64s: Vec<i64> = Vec::new();
+    let mut uint8s: Vec<u8> = Vec::new();
+    let mut uint16s: Vec<u16> = Vec::new();
+    let mut uint32s: Vec<u32> = Vec::new();
+    let mut uint64s: Vec<u64> = Vec::new();
+    let mut float32s: Vec<f32> = Vec::new();
+    let mut float64s: Vec<f64> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut dates: Vec<i32> = Vec::new();
+    let mut times: Vec<i64> = Vec::new();
+    let mut timestamps: Vec<i64> = Vec::new();
+    let mut timestamptzs: Vec<i64> = Vec::new();
+
+    for (i, v) in values.into_iter().enumerate() {{
+        if matches!(v, Duckvalue::Null) {{
+            // Placeholder so the buffer index tracks the row
+            // index; the validity bit stays 0.
             match arm {{
                 Arm::Unknown | Arm::Blob => blobs.push(Vec::new()),
                 Arm::Boolean => booleans.push(false),
@@ -764,18 +793,6 @@ fn values_to_colvec(values: Vec<Duckvalue>) -> Result<column_types::Colvec, Duck
             }}
             continue;
         }}
-        // Refuse unsupported (Decimal/Interval/Uuid/Complex)
-        // returns explicitly — the old code silently NULLed them.
-        let this_arm = arm_of(&v).ok_or_else(|| Duckerror::Internal(format!(
-            "values_to_colvec: unsupported column arm for row {{}} (Decimal/Interval/Uuid/Complex \
-             lowering is not yet implemented in the dynlink emit)",
-            i,
-        )))?;
-        if arm == Arm::Unknown {{
-            arm = this_arm;
-        }} else if arm != this_arm {{
-            return Err(mismatch(&arm, &v));
-        }}
         bits[i / 8] |= 1u8 << (i % 8);
         match v {{
             Duckvalue::Boolean(b) => booleans.push(b),
@@ -795,7 +812,8 @@ fn values_to_colvec(values: Vec<Duckvalue>) -> Result<column_types::Colvec, Duck
             Duckvalue::Time(x) => times.push(x),
             Duckvalue::Timestamp(x) => timestamps.push(x),
             Duckvalue::Timestamptz(x) => timestamptzs.push(x),
-            // Null / unsupported: already handled above.
+            // Null / unsupported: already handled above (or
+            // rejected in pass 1).
             _ => unreachable!("arm_of admitted a variant we didn't push"),
         }}
     }}
