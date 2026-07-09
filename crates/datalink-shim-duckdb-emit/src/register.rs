@@ -360,6 +360,33 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
 // `shim_has_topology_resource` gating already used to gate helper
 // preludes). A shim with none of those resources gets an empty body
 // (only `Ok(())`).
+//
+// ── Collision-tolerant registration ──
+//
+// The DuckDB spatial extension pre-registers `GEOMETRY` (and, when
+// its spatial-geography variant is loaded, `GEOGRAPHY`). If our
+// bridge is loaded on a host where that extension is already
+// present, an unconditional `register_logical_type` returns `Err`
+// and — under the original `.map_err(...)?` pattern — aborts
+// `Guest::load()` before any scalars register. Nothing lands and
+// every subsequent `st_*` call fails with "function does not
+// exist".
+//
+// The catalog contract at ~/git/ducklink/wit/duckdb-extension/
+// catalog.wit exposes only `register-logical-type`, `register-
+// cast`, and `register-macro` — no probe (no `type-exists` or
+// `find-logical-type`). So we cannot ask before we insert. The
+// fallback is to treat `register_logical_type` failure as
+// non-fatal: log the reason via eprintln, skip the paired
+// implicit casts (the pre-existing type already brings its own
+// casts, or the SQL surface will surface a fresh error at bind
+// time), and continue on to the next type + register_scalars.
+//
+// The paired `register_cast` calls are also downgraded to
+// best-effort: they run only when the type registration
+// succeeded, and their own `Err` is likewise logged-and-continued
+// so a partially-shared catalog doesn't wipe out an otherwise
+// functional shim.
 pub fn render_logical_types(
     has_geometry: bool,
     has_raster: bool,
@@ -380,47 +407,71 @@ pub fn render_logical_types(
     let mut s = String::new();
     s.push_str(LOGICAL_TYPE_REGISTER_PRELUDE);
 
+    // Register each type + its paired identity casts as an atomic
+    // group. If `register_logical_type` fails (e.g. the DuckDB
+    // spatial extension already owns GEOMETRY), the paired casts
+    // are skipped and we move on to the next type. The wit
+    // contract (see comment above the fn) has no probe, so this
+    // Err-based branch is the only signal available.
     for name in &types_list {
         s.push_str(&format!(
-            r##"    catalog::register_logical_type(&catalog::LogicalType {{
+            r##"    match catalog::register_logical_type(&catalog::LogicalType {{
         name: "{name}".into(),
         physical: "BLOB".into(),
-    }})
-    .map_err(|e| types::Duckerror::Internal(format!(
-        "register-logical-type {name}: {{}}", e
-    )))?;
+    }}) {{
+        Ok(_handle) => {{
 "##,
         ));
-    }
-
-    // Implicit casts <T> <-> BLOB. Callback is identity — the physical
-    // representation is a BLOB either way, only the logical tag differs.
-    // The allocated handle lands in `identity_cast_handles()` so
-    // `call_cast` returns the Duckvalue unchanged for these handles.
-    for name in &types_list {
+        // Implicit casts <T> <-> BLOB. Callback is identity — the
+        // physical representation is a BLOB either way, only the
+        // logical tag differs. The allocated handle lands in
+        // `identity_cast_handles()` so `call_cast` returns the
+        // Duckvalue unchanged for these handles.
         for (from_ty, to_ty) in [(*name, "BLOB"), ("BLOB", *name)] {
             s.push_str(&format!(
-                r##"    {{
-        let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        identity_cast_handles()
-            .lock()
-            .expect("identity cast handles mutex poisoned")
-            .insert(handle);
-        let callback = runtime::CastCallback::new(handle);
-        let spec = catalog::CastSpec {{
-            from: "{from_ty}".into(),
-            to: "{to_ty}".into(),
-            kind: catalog::CastKind::Implicit,
-        }};
-        catalog::register_cast(&spec, callback).map_err(|e| {{
-            types::Duckerror::Internal(format!(
-                "register-cast({from_ty} -> {to_ty}): {{}}", e
-            ))
-        }})?;
-    }}
+                r##"            {{
+                let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                identity_cast_handles()
+                    .lock()
+                    .expect("identity cast handles mutex poisoned")
+                    .insert(handle);
+                let callback = runtime::CastCallback::new(handle);
+                let spec = catalog::CastSpec {{
+                    from: "{from_ty}".into(),
+                    to: "{to_ty}".into(),
+                    kind: catalog::CastKind::Implicit,
+                }};
+                // Best-effort: a Err here (typically because
+                // the host already has this cast wired via a
+                // pre-loaded spatial ext) is non-fatal — the
+                // pre-existing cast covers the surface.
+                if let Err(e) = catalog::register_cast(&spec, callback) {{
+                    eprintln!(
+                        "[shim-duckdb-emit] register-cast({from_ty} -> {to_ty}) skipped: {{}}",
+                        e
+                    );
+                }}
+            }}
 "##,
             ));
         }
+        s.push_str(&format!(
+            r##"        }}
+        Err(e) => {{
+            // catalog.wit @4.0.0 has no probe function, so a
+            // failing register_logical_type is our only signal
+            // that the type is already owned by another
+            // extension (typically DuckDB's spatial ext). Log
+            // and skip the paired casts — the pre-existing
+            // owner's own casts remain in place.
+            eprintln!(
+                "[shim-duckdb-emit] register-logical-type {name} skipped (already registered?): {{}}",
+                e
+            );
+        }}
+    }}
+"##,
+        ));
     }
 
     s.push_str("    Ok(())\n}\n");
