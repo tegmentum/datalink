@@ -217,7 +217,7 @@ pub fn emit_dynlink(
     // `datalink-shim-duckdb-emit::register::render_logical_types`
     // convention.
     let primary_type_names: std::collections::BTreeSet<&str> =
-        ["geometry", "geography", "raster", "topology"]
+        ["geometry", "geography", "raster", "topology", "topogeometry"]
             .into_iter()
             .collect();
     let types_present = catalog.types_for(&leaves);
@@ -227,6 +227,19 @@ pub fn emit_dynlink(
         .filter(|t| primary_type_names.contains(t.name.as_str()))
         .map(|t| t.name.to_uppercase())
         .collect();
+    // #79-followup: box2d / box3d are PostGIS BLOB-backed bounding-
+    // box types. The catalog doesn't (yet) enumerate them as
+    // `[[types]] kind = "logical"`, but the shim exposes bbox-taking
+    // scalars (`box2d(GEOMETRY)`, `st_astext(box2d(...))`, etc.) so
+    // the DuckDB binder needs a resolvable type entry. Inject them
+    // unconditionally when GEOMETRY is present — they always ride
+    // with the geometry surface. Mirrors the sibling
+    // `datalink-shim-duckdb-emit::register::render_logical_types`
+    // static-emit path (has_geometry branch adds BOX2D/BOX3D).
+    if logical_types.iter().any(|n| n == "GEOMETRY") {
+        logical_types.push("BOX2D".into());
+        logical_types.push("BOX3D".into());
+    }
     logical_types.sort();
     logical_types.dedup();
 

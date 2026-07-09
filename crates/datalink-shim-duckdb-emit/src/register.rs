@@ -396,6 +396,15 @@ pub fn render_logical_types(
     if has_geometry {
         types_list.push("GEOMETRY");
         types_list.push("GEOGRAPHY");
+        // #79-followup: box2d / box3d are PostGIS BLOB-backed
+        // bounding-box types. Register alongside GEOMETRY/
+        // GEOGRAPHY so the DuckDB binder resolves calls like
+        // `st_astext(box2d('BOX(0 0, 1 1)'::GEOMETRY))` and other
+        // bbox-taking functions in the shim catalog. Matches the
+        // uppercase convention used for the sibling names above
+        // (DuckDB resolves type-name lookups case-insensitively).
+        types_list.push("BOX2D");
+        types_list.push("BOX3D");
     }
     if has_raster {
         types_list.push("RASTER");
