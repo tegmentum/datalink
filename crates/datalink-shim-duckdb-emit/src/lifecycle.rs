@@ -38,6 +38,7 @@ pub fn render(
     has_tables: bool,
     has_casts: bool,
     has_windows: bool,
+    has_logical_types: bool,
 ) -> String {
     let primary = plan
         .extensions
@@ -49,6 +50,15 @@ pub fn render(
         .first()
         .map(|e| e.version.as_str())
         .unwrap_or("0.1.0");
+    // #64 / #67: register logical types (GEOMETRY / GEOGRAPHY / etc.)
+    // and their implicit BLOB casts BEFORE any function registration so
+    // the DuckDB binder can resolve `st_area(GEOMETRY)` -> `st_area(BLOB)`
+    // via the implicit cast when scalar_registry.register runs.
+    let logical_type_call = if has_logical_types {
+        "        register_logical_types()?;\n"
+    } else {
+        ""
+    };
     let aggregate_call = if has_aggregates {
         "        register_aggregates()?;\n"
     } else {
@@ -73,7 +83,7 @@ pub fn render(
         r##"
 impl guest::Guest for {bridge_struct} {{
     fn load() -> Result<types::Loadresult, types::Duckerror> {{
-        register_scalars()?;
+{logical_type_call}        register_scalars()?;
 {aggregate_call}{table_call}{cast_call}{window_call}        Ok(types::Loadresult {{
             name: "{primary}".into(),
             version: Some("{version}".into()),

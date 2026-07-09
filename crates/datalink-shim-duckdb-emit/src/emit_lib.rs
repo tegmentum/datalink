@@ -635,6 +635,17 @@ use bindings::exports::duckdb::extension::guest;
         .iter()
         .any(|e| !e.cast_rewrites.is_empty());
 
+    // #64 / #67: logical-type surface. Emit `register_logical_types()`
+    // (and route `call_cast` through the identity-cast shortcut) when
+    // the primary shim's WIT declares any physical-BLOB-backed spatial
+    // resource (geometry/raster/topology). Without this, DuckDB's
+    // binder cannot resolve `st_area('POLYGON EMPTY'::GEOMETRY)` etc.
+    // because scalars catalog with a BLOB signature and no implicit
+    // cast between GEOMETRY and BLOB is registered.
+    let has_logical_types = shim_has_geometry_resource
+        || shim_has_raster_resource
+        || shim_has_topology_resource;
+
     s.push_str(handle_table::render());
     s.push_str(&lifecycle::render(
         &bridge_struct,
@@ -643,6 +654,7 @@ use bindings::exports::duckdb::extension::guest;
         !udtf_entries.is_empty(),
         has_casts,
         !window_entries.is_empty(),
+        has_logical_types,
     ));
 
     // call_scalar dispatch: build the per-arm match
@@ -824,17 +836,52 @@ impl callback_dispatch::Guest for {bridge_struct} {{
             // forward looks up arm_idx via the existing lookup.
             // One arm-index space; cast is just an alternate entry
             // point for the same scalar body.
+            //
+            // #64 / #67: identity-cast handles (GEOMETRY/GEOGRAPHY/
+            // RASTER/TOPOLOGY <-> BLOB) short-circuit to Ok(value)
+            // because the physical representation is a BLOB either
+            // way. Registered by `register_logical_types()`.
             String::from(
                 "    fn call_cast(\n\
                  \x20       handle: u32,\n\
                  \x20       value: types::Duckvalue,\n\
                  \x20   ) -> Result<types::Duckvalue, types::Duckerror> {\n\
+                 \x20       if identity_cast_handles()\n\
+                 \x20           .lock()\n\
+                 \x20           .expect(\"identity cast handles mutex poisoned\")\n\
+                 \x20           .contains(&handle)\n\
+                 \x20       {\n\
+                 \x20           return Ok(value);\n\
+                 \x20       }\n\
                  \x20       <Self as callback_dispatch::Guest>::call_scalar(\n\
                  \x20           handle,\n\
                  \x20           alloc::vec![value],\n\
                  \x20           types::Invokeinfo { rowindex: None, iswindow: false },\n\
                  \x20       )\n\
                  \x20   }\n",
+            )
+        } else if has_logical_types {
+            // No cast_rewrites in the IR, but the shim registers
+            // logical-type identity casts (#64 / #67). Route those
+            // handles through the identity shortcut; everything else
+            // is Unsupported so the failure mode stays diagnosable.
+            format!(
+                "    fn call_cast(\n\
+                 \x20       handle: u32,\n\
+                 \x20       value: types::Duckvalue,\n\
+                 \x20   ) -> Result<types::Duckvalue, types::Duckerror> {{\n\
+                 \x20       if identity_cast_handles()\n\
+                 \x20           .lock()\n\
+                 \x20           .expect(\"identity cast handles mutex poisoned\")\n\
+                 \x20           .contains(&handle)\n\
+                 \x20       {{\n\
+                 \x20           return Ok(value);\n\
+                 \x20       }}\n\
+                 \x20       Err(types::Duckerror::Unsupported(\n\
+                 \x20           format!(\"{primary}: cast handle not registered (no cast_rewrites in IR)\")\n\
+                 \x20       ))\n\
+                 \x20   }}\n",
+                primary = primary,
             )
         } else {
             format!(
@@ -850,6 +897,22 @@ impl callback_dispatch::Guest for {bridge_struct} {{
             )
         },
     ));
+
+    // register_logical_types() body (#64 / #67). Emitted only when the
+    // primary shim's WIT declares a physical-BLOB-backed spatial
+    // resource (geometry/raster/topology); otherwise lifecycle::load
+    // skips the call. Registers GEOMETRY / GEOGRAPHY / RASTER /
+    // TOPOLOGY as `catalog::LogicalType { physical: "BLOB" }` and
+    // installs implicit identity casts to/from BLOB so the DuckDB
+    // binder can resolve `st_area('POLYGON EMPTY'::GEOMETRY)` against
+    // the catalogued `st_area(BLOB)` signature.
+    if has_logical_types {
+        s.push_str(&register::render_logical_types(
+            shim_has_geometry_resource,
+            shim_has_raster_resource,
+            shim_has_topology_resource,
+        ));
+    }
 
     // register_scalars() body. Threading `scalar_entries` here
     // lets register::render mirror build_scalar_arms's sql_name

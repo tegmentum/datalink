@@ -331,6 +331,106 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
     }
 }
 
+// ─── Logical type registration (#64 / #67) ───
+//
+// PostGIS scalar functions catalog with parameter types `BLOB` because
+// the codegen collapses `ParamShape::Blob | Geom | Geog | Raster |
+// Topology` to `Logicaltype::Blob`. Callers write SQL such as
+// `st_area('POLYGON EMPTY'::GEOMETRY)`; the DuckDB binder sees
+// `st_area(GEOMETRY)` and cannot match the catalogued `st_area(BLOB)`
+// signature unless an implicit cast between GEOMETRY and BLOB is
+// registered.
+//
+// This helper emits a `register_logical_types()` body invoked by
+// `Guest::load()` BEFORE `register_scalars()`. It:
+//
+//   1. Registers each shim's physical-BLOB-backed logical types
+//      (GEOMETRY / GEOGRAPHY on postgis; RASTER / TOPOLOGY when the
+//      shim exposes them) via `catalog::register_logical_type`.
+//   2. Registers implicit casts <T> <-> BLOB for each of those types.
+//      The cast callback is an identity operation — the physical
+//      representation is unchanged, only the logical tag. Each
+//      allocated handle lands in `identity_cast_handles()` so
+//      `call_cast` shortcuts it into `Ok(value)` without touching
+//      the scalar `handle_table`.
+//
+// The set of types is driven by `caller-supplied booleans` derived
+// from the primary shim's WIT surface (matches the
+// `shim_has_geometry_resource` / `shim_has_raster_resource` /
+// `shim_has_topology_resource` gating already used to gate helper
+// preludes). A shim with none of those resources gets an empty body
+// (only `Ok(())`).
+pub fn render_logical_types(
+    has_geometry: bool,
+    has_raster: bool,
+    has_topology: bool,
+) -> String {
+    let mut types_list: Vec<&'static str> = Vec::new();
+    if has_geometry {
+        types_list.push("GEOMETRY");
+        types_list.push("GEOGRAPHY");
+    }
+    if has_raster {
+        types_list.push("RASTER");
+    }
+    if has_topology {
+        types_list.push("TOPOLOGY");
+    }
+
+    let mut s = String::new();
+    s.push_str(LOGICAL_TYPE_REGISTER_PRELUDE);
+
+    for name in &types_list {
+        s.push_str(&format!(
+            r##"    catalog::register_logical_type(&catalog::LogicalType {{
+        name: "{name}".into(),
+        physical: "BLOB".into(),
+    }})
+    .map_err(|e| types::Duckerror::Internal(format!(
+        "register-logical-type {name}: {{}}", e
+    )))?;
+"##,
+        ));
+    }
+
+    // Implicit casts <T> <-> BLOB. Callback is identity — the physical
+    // representation is a BLOB either way, only the logical tag differs.
+    // The allocated handle lands in `identity_cast_handles()` so
+    // `call_cast` returns the Duckvalue unchanged for these handles.
+    for name in &types_list {
+        for (from_ty, to_ty) in [(*name, "BLOB"), ("BLOB", *name)] {
+            s.push_str(&format!(
+                r##"    {{
+        let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        identity_cast_handles()
+            .lock()
+            .expect("identity cast handles mutex poisoned")
+            .insert(handle);
+        let callback = runtime::CastCallback::new(handle);
+        let spec = catalog::CastSpec {{
+            from: "{from_ty}".into(),
+            to: "{to_ty}".into(),
+            kind: catalog::CastKind::Implicit,
+        }};
+        catalog::register_cast(&spec, callback).map_err(|e| {{
+            types::Duckerror::Internal(format!(
+                "register-cast({from_ty} -> {to_ty}): {{}}", e
+            ))
+        }})?;
+    }}
+"##,
+            ));
+        }
+    }
+
+    s.push_str("    Ok(())\n}\n");
+    s
+}
+
+const LOGICAL_TYPE_REGISTER_PRELUDE: &str = r##"
+fn register_logical_types() -> Result<(), types::Duckerror> {
+"##;
+
 // ─── Aggregate registration ───
 //
 // Mirrors `render` but against `Capabilitykind::Aggregate` and

@@ -87,6 +87,21 @@ fn window_handle_table() -> &'static std::sync::Mutex<std::collections::HashMap<
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+// Identity cast handles (#64/#67): a set of `u32` handles registered by
+// `register_logical_types()` for the physical-BLOB-backed logical types
+// (GEOMETRY, GEOGRAPHY, RASTER, TOPOLOGY) whose `register-cast`
+// callbacks are identity operations. When `call_cast` receives one of
+// these handles it returns the Duckvalue unchanged instead of routing
+// into the scalar dispatch. Keeps the identity-cast surface separate
+// from the wired scalar `handle_table` so the (handle -> arm_index)
+// map isn't polluted with sentinel slots.
+fn identity_cast_handles() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<u32>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
 static NEXT_HANDLE: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(1);
 
