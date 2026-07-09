@@ -206,6 +206,30 @@ pub fn emit_dynlink(
         .map(|a| (a.alias.clone(), a.canonical.clone()))
         .collect();
 
+    // #64 / #67: primary spatial logical types the bridge should
+    // announce to DuckDB. The catalog carries every logical type
+    // (`[[types]] kind = "logical"`) but only the top-level
+    // containers (GEOMETRY / GEOGRAPHY / RASTER / TOPOLOGY) need
+    // paired BLOB casts — element types like `point` / `polygon`
+    // never appear as first-class SQL column types on the wire.
+    // Names are uppercased to match the SQL parser's binder
+    // (`::GEOMETRY`, `::GEOGRAPHY`) and the sibling
+    // `datalink-shim-duckdb-emit::register::render_logical_types`
+    // convention.
+    let primary_type_names: std::collections::BTreeSet<&str> =
+        ["geometry", "geography", "raster", "topology"]
+            .into_iter()
+            .collect();
+    let types_present = catalog.types_for(&leaves);
+    let mut logical_types: Vec<String> = types_present
+        .iter()
+        .filter(|t| t.kind == "logical")
+        .filter(|t| primary_type_names.contains(t.name.as_str()))
+        .map(|t| t.name.to_uppercase())
+        .collect();
+    logical_types.sort();
+    logical_types.dedup();
+
     let lib_src = lib_rs(
         &opts.provider_id,
         &opts.extension_root,
@@ -214,6 +238,7 @@ pub fn emit_dynlink(
         functions.iter().collect::<Vec<_>>().as_slice(),
         &sig_map,
         &scalar_aliases,
+        &logical_types,
     );
     fs::write(out_dir.join("src/lib.rs"), lib_src)?;
 
@@ -301,6 +326,13 @@ world bridge {{
     import duckdb:extension/runtime@4.0.0;
     import duckdb:extension/runtime-ext@4.0.0;
     import duckdb:extension/logging@4.0.0;
+
+    // #64 / #67: `catalog.register-logical-type` + `register-cast`
+    // are how the bridge announces spatial types (GEOMETRY /
+    // GEOGRAPHY / RASTER / TOPOLOGY) to the DuckDB binder so
+    // callers can write `'x'::GEOGRAPHY` and typed scalars can
+    // overload-resolve against BLOB-signature registrations.
+    import duckdb:extension/catalog@4.0.0;
 
     export duckdb:extension/guest@4.0.0;
     export duckdb:extension/callback-dispatch@4.0.0;
@@ -427,6 +459,7 @@ fn lib_rs(
     functions: &[&(FnKind, String)],
     sig_map: &HashMap<String, ScalarSig>,
     scalar_aliases: &[(String, String)],
+    logical_types: &[String],
 ) -> String {
     let mut scalar_names: Vec<&str> = functions
         .iter()
@@ -543,6 +576,97 @@ fn lib_rs(
     let extension_root = extension_root.to_string();
     let catalog_extension = catalog_extension.to_string();
 
+    // #64 / #67: build the `register_logical_types()` fn body + the
+    // paired identity-cast machinery. When the catalog declares no
+    // primary spatial type, `logical_types` is empty and every one
+    // of these expands to `""` — the emitted lib.rs then mirrors
+    // the pre-fix behaviour (no logical-type call, `call_cast`
+    // stays Unsupported).
+    let has_logical_types = !logical_types.is_empty();
+    let (
+        logical_types_fn,
+        identity_cast_helpers,
+        logical_types_load_call,
+        call_cast_body,
+    ) = if has_logical_types {
+        let mut body = String::from(
+            "\nfn register_logical_types() -> Result<(), Duckerror> {\n",
+        );
+        for name in logical_types {
+            // Best-effort register. When another extension (e.g.
+            // DuckDB's built-in spatial ext) already owns the type,
+            // `register_logical_type` returns Err — we log and skip
+            // the paired casts. catalog.wit @4.0.0 has no probe.
+            let esc = name.replace('"', "\\\"");
+            body.push_str(&format!(
+                "    match catalog::register_logical_type(&catalog::LogicalType {{ name: \"{esc}\".into(), physical: \"BLOB\".into() }}) {{\n",
+            ));
+            body.push_str("        Ok(_) => {\n");
+            for (from_ty, to_ty) in [
+                (esc.clone(), "BLOB".to_string()),
+                ("BLOB".to_string(), esc.clone()),
+            ] {
+                body.push_str(&format!(
+                    "            {{\n\
+                     \x20               let handle = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);\n\
+                     \x20               identity_cast_handles().lock().expect(\"identity cast handles mutex poisoned\").insert(handle);\n\
+                     \x20               let callback = runtime::CastCallback::new(handle);\n\
+                     \x20               let spec = catalog::CastSpec {{ from: \"{from_ty}\".into(), to: \"{to_ty}\".into(), kind: catalog::CastKind::Implicit }};\n\
+                     \x20               if let Err(e) = catalog::register_cast(&spec, callback) {{\n\
+                     \x20                   eprintln!(\"[dynlink-emit] register-cast({from_ty} -> {to_ty}) skipped: {{}}\", e);\n\
+                     \x20               }}\n\
+                     \x20           }}\n",
+                ));
+            }
+            body.push_str("        }\n");
+            body.push_str(&format!(
+                "        Err(e) => {{\n\
+                 \x20           eprintln!(\"[dynlink-emit] register-logical-type {esc} skipped (already owned?): {{}}\", e);\n\
+                 \x20       }}\n",
+            ));
+            body.push_str("    }\n");
+        }
+        body.push_str("    Ok(())\n}\n");
+
+        let helpers = String::from(
+            "\n\
+             fn identity_cast_handles() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {\n\
+             \x20   static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> = std::sync::OnceLock::new();\n\
+             \x20   T.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))\n\
+             }\n",
+        );
+
+        let load_call = String::from(
+            "        // Best-effort: a logical-type failure is\n\
+             \x20       // non-fatal (typically means the host already\n\
+             \x20       // owns the type via a pre-loaded spatial ext).\n\
+             \x20       let _ = register_logical_types();\n",
+        );
+
+        let cast_body = String::from(
+            "        if identity_cast_handles()\n\
+             \x20           .lock()\n\
+             \x20           .expect(\"identity cast handles mutex poisoned\")\n\
+             \x20           .contains(&handle)\n\
+             \x20       {\n\
+             \x20           return Ok(value);\n\
+             \x20       }\n\
+             \x20       Err(Duckerror::Internal(\"call_cast: handle not identity (Phase A)\".to_string()))\n",
+        );
+
+        (body, helpers, load_call, cast_body)
+    } else {
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::from(
+                "        let _ = (handle, value);\n\
+                 \x20       Err(Duckerror::Internal(\"call_cast: unsupported (Phase A)\".to_string()))\n",
+            ),
+        )
+    };
+
     format!(
         r##"//! Auto-generated by `datalink_shim_duckdb_dynlink_emit::emit_dynlink`
 //! (Phase A, opaque-blob scalar dispatch). Do NOT edit by hand — regenerate.
@@ -564,6 +688,7 @@ use bindings::duckdb::extension::types::{{
 }};
 use bindings::duckdb::extension::runtime;
 use bindings::duckdb::extension::runtime_ext;
+use bindings::duckdb::extension::catalog;
 use bindings::exports::duckdb::extension::guest::{{self as guest_export, Guest as GuestGuest, Loadresult}};
 use bindings::exports::duckdb::extension::callback_dispatch::{{
     self as cb_export, Guest as CallbackGuest,
@@ -1067,8 +1192,9 @@ fn handle_table() -> &'static std::sync::Mutex<std::collections::HashMap<u32, us
         std::sync::OnceLock::new();
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }}
-
+{identity_cast_helpers}
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
+{logical_types_fn}
 
 fn register_scalars() -> Result<(), Duckerror> {{
     // Acquire the base scalar-registry capability from the host.
@@ -1104,7 +1230,7 @@ struct Component;
 
 impl GuestGuest for Component {{
     fn load() -> Result<Loadresult, Duckerror> {{
-        register_scalars()?;
+{logical_types_load_call}        register_scalars()?;
         Ok(Loadresult {{
             name: EXTENSION_ROOT.to_string(),
             version: Some(CATALOG_VERSION.to_string()),
@@ -1200,9 +1326,8 @@ impl CallbackGuest for Component {{
         Err(Duckerror::Internal("call_pragma: unsupported (Phase A)".to_string()))
     }}
 
-    fn call_cast(_handle: u32, _value: Duckvalue) -> Result<Duckvalue, Duckerror> {{
-        Err(Duckerror::Internal("call_cast: unsupported (Phase A)".to_string()))
-    }}
+    fn call_cast(handle: u32, value: Duckvalue) -> Result<Duckvalue, Duckerror> {{
+{call_cast_body}    }}
 }}
 
 bindings::export!(Component with_types_in bindings);
