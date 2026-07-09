@@ -34,14 +34,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::spatial_catalog::{Catalog, FnKind, LeavesOverlay};
+use crate::sql_extension_catalog::{Catalog, FnKind, LeavesOverlay};
 use crate::DynlinkOptions;
 
 /// Per-scalar signature loaded from the sibling shim-interface DB.
 ///
 /// `param_tokens` is a list of already-normalised type tokens (one of
 /// `"binary" | "boolean" | "float64" | "int64" | "text"`) — the
-/// `spatial_catalog_emit` ingester collapses every upstream WIT type
+/// `sql_extension_catalog_emit` ingester collapses every upstream WIT type
 /// down to that closed set before writing `scalars.param_types_json`.
 /// `return_token` is one of the same tokens.
 #[derive(Debug, Clone)]
@@ -112,7 +112,7 @@ pub(crate) fn load_scalar_sigs(
 ///
 /// The token set is closed to the 5 values the shim-interface
 /// ingester produces (see `postgis-shim-interface/src/bin/
-/// spatial_catalog_emit/db_ingest.rs::ScalarRow`). Every geometry /
+/// sql_extension_catalog_emit/db_ingest.rs::ScalarRow`). Every geometry /
 /// geography / raster / topogeometry type upstream is collapsed to
 /// `"binary"` (WKB / serialised wire form); every numeric width
 /// collapses to `int64` or `float64`. Unknown tokens fall back to

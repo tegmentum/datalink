@@ -1,7 +1,7 @@
 //! Dynlink-mode sqlite-target emitter for the shim-bridge codegen.
 //!
 //! Phase A sibling of `datalink-shim-duckdb-dynlink-emit`. Consumes
-//! a `spatial-catalog.toml` extension surface (leaves or umbrellas)
+//! a `<extension>-catalog.toml` extension surface (leaves or umbrellas)
 //! and emits a `wasm32-wasip2` cdylib bridge crate whose component:
 //!
 //!   * imports `compose:dynlink/linker@0.1.0` for outbound dispatch
@@ -33,7 +33,7 @@
 //! ```
 
 pub mod emit_dynlink;
-pub mod spatial_catalog;
+pub mod sql_extension_catalog;
 
 pub use emit_dynlink::emit_dynlink;
 
@@ -77,8 +77,8 @@ pub fn emit(
     if opts.target.is_empty() {
         opts.target = target.to_string();
     }
-    let catalog = spatial_catalog::load(catalog_toml)
-        .with_context(|| format!("loading spatial-catalog: {}", catalog_toml.display()))?;
+    let catalog = sql_extension_catalog::load(catalog_toml)
+        .with_context(|| format!("loading extension catalog: {}", catalog_toml.display()))?;
     emit_dynlink(&catalog, None, out_dir, &opts)
 }
 

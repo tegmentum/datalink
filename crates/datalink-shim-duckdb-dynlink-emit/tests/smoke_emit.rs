@@ -1,4 +1,4 @@
-//! Phase A smoke: parse the real spatial-catalog and confirm
+//! Phase A smoke: parse the real extension catalog and confirm
 //! `emit` produces the expected file layout under a temp dir.
 //!
 //! Skips gracefully when the postgis-shim-interface repo isn't
@@ -10,7 +10,7 @@ use datalink_shim_duckdb_dynlink_emit::{emit, DynlinkOptions};
 
 fn catalog_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("git/postgis-shim-interface/spatial-catalog.toml")
+    PathBuf::from(home).join("git/postgis-shim-interface/postgis-catalog.toml")
 }
 
 #[test]

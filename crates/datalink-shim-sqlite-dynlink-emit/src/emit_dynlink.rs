@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::spatial_catalog::{Catalog, FnKind, LeavesOverlay};
+use crate::sql_extension_catalog::{Catalog, FnKind, LeavesOverlay};
 use crate::DynlinkOptions;
 
 /// Emit a Dynlink-mode sqlite bridge crate under `out_dir`.

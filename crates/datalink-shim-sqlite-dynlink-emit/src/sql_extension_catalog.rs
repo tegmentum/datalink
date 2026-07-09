@@ -1,4 +1,4 @@
-//! Parser + resolver for `spatial-catalog.toml`.
+//! Parser + resolver for `<extension>-catalog.toml`.
 //!
 //! Phase A shape (per §A.3 of the Spatial-Catalog Integration
 //! design). The catalog is the authoritative extension surface:
@@ -12,11 +12,6 @@
 //! doesn't need a `.sqlite` interface DB. Every function name it
 //! must advertise + dispatch on is a member of one of the leaves
 //! that a `target` (leaf-id or umbrella-id) expands to.
-//!
-//! This module is intentionally identical to its sibling in
-//! `datalink-shim-sqlite-dynlink-emit`. The dispatch shape is
-//! target-agnostic; only the emit surface (`emit_dynlink.rs`) is
-//! target-specific.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -39,6 +34,7 @@ pub struct Catalog {
     #[serde(default, rename = "umbrellas")]
     pub umbrellas_vec: Vec<Umbrella>,
 
+    // Rebuilt at load time (skipped on deserialisation).
     #[serde(skip)]
     pub leaves: HashMap<String, Leaf>,
     #[serde(skip)]
@@ -71,6 +67,9 @@ pub struct TypeEntry {
     pub description: Option<String>,
 }
 
+/// A single leaf. The TOML enum-of-lists shape carries name-only
+/// entries for functions (scalar / aggregate / table / window) and
+/// pre-parsed operator + cast rows.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Leaf {
     pub id: String,
@@ -120,12 +119,22 @@ pub struct Umbrella {
     pub expands_to: Vec<String>,
 }
 
+/// Optional overlay carrying per-leaf schema-interface hints.
+/// The dynlink bridge only needs `resolve-by-id(provider_id)`; the
+/// overlay is a codegen concern for the composed provider and is
+/// accepted here for API symmetry with the design spec (§A.3).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LeavesOverlay {
     #[serde(default)]
     pub schema_interfaces: HashMap<String, Vec<String>>,
 }
 
+/// Categories of functions the emitter enumerates. The dispatch
+/// arm shape is identical for all four in Phase A (opaque blob in /
+/// blob out), so the kind is only carried so callers can tell
+/// scalar arms apart from aggregate / table / window arms when
+/// they matter (e.g. when the target contract has separate scalar
+/// vs. aggregate registries).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FnKind {
     Scalar,
@@ -134,11 +143,13 @@ pub enum FnKind {
     Window,
 }
 
+/// Load a catalog from disk and materialise the flat `leaves` +
+/// `umbrellas` lookup maps.
 pub fn load(path: &Path) -> Result<Catalog> {
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading spatial-catalog: {}", path.display()))?;
+        .with_context(|| format!("reading extension catalog: {}", path.display()))?;
     let mut catalog: Catalog = toml::from_str(&text)
-        .with_context(|| format!("parsing spatial-catalog: {}", path.display()))?;
+        .with_context(|| format!("parsing extension catalog: {}", path.display()))?;
     catalog.leaves = catalog
         .leaves_vec
         .iter()
@@ -153,6 +164,7 @@ pub fn load(path: &Path) -> Result<Catalog> {
     Ok(catalog)
 }
 
+/// Load the optional leaves-overlay TOML.
 pub fn load_leaves_overlay(path: &Path) -> Result<LeavesOverlay> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading leaves overlay: {}", path.display()))?;
@@ -162,6 +174,9 @@ pub fn load_leaves_overlay(path: &Path) -> Result<LeavesOverlay> {
 }
 
 impl Catalog {
+    /// Expand an umbrella-or-leaf target id into its constituent
+    /// leaf ids. Umbrellas expand to their `expands_to` list; leaves
+    /// map to a single-element vec; unknown ids error.
     pub fn resolve(&self, target: &str) -> Result<Vec<String>> {
         if let Some(leaves) = self.umbrellas.get(target) {
             return Ok(leaves.clone());
@@ -175,6 +190,8 @@ impl Catalog {
         ))
     }
 
+    /// Union of every function of every requested kind across the
+    /// resolved leaves. Returned deduped + sorted (BTreeSet).
     pub fn functions_for(&self, leaves: &[String]) -> BTreeSet<(FnKind, String)> {
         let mut out = BTreeSet::new();
         for leaf_id in leaves {
@@ -197,6 +214,7 @@ impl Catalog {
         out
     }
 
+    /// Every type owned by any of the resolved leaves.
     pub fn types_for(&self, leaves: &[String]) -> Vec<&TypeEntry> {
         let mut owning: BTreeSet<&str> = BTreeSet::new();
         for leaf_id in leaves {
@@ -212,6 +230,7 @@ impl Catalog {
             .collect()
     }
 
+    /// Aliases whose canonical form equals `canonical`.
     pub fn aliases_for_canonical(&self, canonical: &str) -> Vec<&Alias> {
         self.aliases
             .iter()
