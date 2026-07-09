@@ -84,6 +84,12 @@ pub fn render(
 impl guest::Guest for {bridge_struct} {{
     fn load() -> Result<types::Loadresult, types::Duckerror> {{
 {logical_type_call}        register_scalars()?;
+        // #65: every scalar is also registered as a single-row TVF
+        // so DuckDB's FROM-clause dispatcher can find it. Emission
+        // is unconditional because every bridge has scalars; the
+        // emitted body probes for the table capability and skips
+        // (with a diagnostic) when it isn't advertised.
+        register_scalar_tvfs()?;
 {aggregate_call}{table_call}{cast_call}{window_call}        Ok(types::Loadresult {{
             name: "{primary}".into(),
             version: Some("{version}".into()),

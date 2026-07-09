@@ -805,6 +805,24 @@ impl callback_dispatch::Guest for {bridge_struct} {{
         handle: u32,
         args: Vec<types::Duckvalue>,
     ) -> Result<types::Resultset, types::Duckerror> {{
+        // #65: scalar-as-TVF fast path. DuckDB routes a FROM-clause
+        // invocation of a scalar (`SELECT * FROM st_geom_from_text(
+        // 'POINT(1 2)') AS t(g)`) through the table-function namespace.
+        // `register_scalar_tvfs()` slots each scalar's TVF handle into
+        // the SAME `handle_table` `call_scalar` reads, so a handle
+        // that resolves in `handle_table` (rather than
+        // `table_handle_table`) is a scalar TVF — forward through
+        // `call_scalar` and wrap the single Duckvalue into a one-row
+        // one-column resultset.
+        let is_scalar_tvf = handle_table()
+            .lock()
+            .expect("scalar handle mutex poisoned")
+            .contains_key(&handle);
+        if is_scalar_tvf {{
+            let ctx = types::Invokeinfo {{ rowindex: Some(0), iswindow: false }};
+            let v = <Self as callback_dispatch::Guest>::call_scalar(handle, args, ctx)?;
+            return Ok(alloc::vec![alloc::vec![v]]);
+        }}
         let arm_idx = table_handle_table()
             .lock()
             .expect("table handle mutex poisoned")
@@ -919,6 +937,13 @@ impl callback_dispatch::Guest for {bridge_struct} {{
     // dedupe (so the handle→arm_idx map points at real arms) and
     // derive per-arg Logicaltype widths from the ParamShape IR.
     s.push_str(&register::render(plan, &scalar_entries)?);
+
+    // #65: register each scalar ALSO as a single-row table
+    // function so DuckDB's FROM-clause dispatcher (which routes
+    // through the table-function namespace) can find it. The TVF
+    // handles land in the SAME scalar `handle_table`; `call_table`
+    // detects them and forwards through `call_scalar`.
+    s.push_str(&register::render_scalar_tvfs(plan, &scalar_entries)?);
 
     // register_aggregates() body. Emitted only when any aggregate
     // entry was classified; otherwise lifecycle::load skips the

@@ -904,6 +904,158 @@ fn register_tables() -> Result<(), types::Duckerror> {
     };
 "##;
 
+// ─── Scalar-as-TVF (single-row table function) registration (#65) ───
+//
+// DuckDB's binder routes a scalar invocation in a FROM clause
+// (e.g. `SELECT * FROM st_geom_from_text('POINT(1 2)') AS t(geom)`)
+// through the TABLE-FUNCTION namespace, NOT the scalar namespace.
+// A bridge that registers scalars only against `scalar-registry`
+// therefore errors with `Table Function with name X is not in
+// catalog`, even when the same function exists as a scalar.
+//
+// This helper mirrors `render` but registers each scalar as a
+// SINGLE-ROW TVF against `Capabilitykind::Table`. Each registration
+// allocates a fresh `u32` handle and slots `handle -> arm_idx`
+// into the SAME `handle_table` the scalar dispatch reads. The
+// `call_table` arm detects a scalar-TVF handle by presence in
+// `handle_table` and forwards through `call_scalar`, wrapping the
+// resulting `Duckvalue` into a one-row / one-column `Resultset`.
+//
+// The output column is named after the scalar (its `sql_name`)
+// and typed from `RetShape` via `retshape_to_logicaltype`, so
+// `FROM st_geom_from_text('POINT(1 2)') AS t(g)` sees a single
+// row `(g)` of the return type.
+//
+// Best-effort registration: if a scalar's SQL name collides with
+// a previously-registered UDTF (or another scalar TVF), the host
+// returns Err and we log-and-continue rather than aborting
+// `Guest::load()` — the same pattern `render_logical_types` uses
+// for pre-existing catalog entries.
+pub fn render_scalar_tvfs(
+    _plan: &BridgePlan,
+    scalar_entries: &[(DispatchEntry, bool)],
+) -> Result<String> {
+    let mut s = String::new();
+    s.push_str(SCALAR_TVF_REGISTER_PRELUDE);
+
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut arm_idx: usize = 0;
+    for (entry, _fallible) in scalar_entries {
+        if !seen.insert(entry.sql_name.clone()) {
+            // Mirror `render`'s first-writer-wins so arm_idx
+            // aligns with the scalar match arms.
+            continue;
+        }
+        push_scalar_tvf_registration(
+            &mut s,
+            arm_idx,
+            &entry.sql_name,
+            &entry.shape.params,
+            &entry.shape.ret,
+        );
+        arm_idx += 1;
+    }
+
+    s.push_str("    Ok(())\n}\n");
+    Ok(s)
+}
+
+const SCALAR_TVF_REGISTER_PRELUDE: &str = r##"
+fn register_scalar_tvfs() -> Result<(), types::Duckerror> {
+    // Best-effort probe: a host that doesn't expose the table
+    // capability leaves the scalar-first surface working via
+    // `call_scalar`; the FROM-clause path is opt-in from the
+    // host side, so skipping here is non-fatal.
+    let capability = match runtime::get_capability(types::Capabilitykind::Table) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "[shim-duckdb-emit] scalar-TVF registration skipped: \
+                 host did not expose table capability"
+            );
+            return Ok(());
+        }
+    };
+    let registry = match capability {
+        runtime::Capability::Table(r) => r,
+        _ => {
+            return Err(types::Duckerror::Internal(
+                "table capability returned unexpected variant (scalar TVF)".into(),
+            ));
+        }
+    };
+"##;
+
+fn push_scalar_tvf_registration(
+    out: &mut String,
+    arm_idx: usize,
+    sql_name: &str,
+    params: &[ParamShape],
+    ret: &RetShape,
+) {
+    let mut args_block = String::new();
+    for (i, p) in params.iter().enumerate() {
+        let logical = paramshape_to_logicaltype(p);
+        args_block.push_str(&format!(
+            "            runtime::Funcarg {{\n\
+             \x20               name: Some(\"arg{i}\".into()),\n\
+             \x20               logical: {logical},\n\
+             \x20           }},\n",
+            i = i,
+            logical = logical,
+        ));
+    }
+    let ret_logical = retshape_to_logicaltype(ret);
+    let sql_name_lit = sql_name.replace('"', "\\\"");
+    // Column name is the scalar's SQL name — a FROM-clause like
+    // `FROM st_geom_from_text('POINT(1 2)') AS t(g)` renames it
+    // via the aliasing list anyway; the default column name is
+    // just a stable identifier.
+    let col_name = sql_name_lit.clone();
+    out.push_str(&format!(
+        r##"    {{
+        let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Slot the TVF handle into the SCALAR handle table (same
+        // arm-index space) so `call_table`'s scalar-TVF fast path
+        // can forward to `call_scalar` without a second lookup.
+        handle_table()
+            .lock()
+            .expect("scalar handle mutex poisoned")
+            .insert(handle, {arm_idx}usize);
+        let callback = runtime::TableCallback::new(handle);
+        let args: Vec<runtime::Funcarg> = vec![
+{args_block}        ];
+        let columns: Vec<runtime::Columndef> = vec![
+            runtime::Columndef {{
+                name: "{col_name}".into(),
+                logical: {ret_logical},
+            }},
+        ];
+        // Best-effort: a duplicate registration (e.g. the same
+        // name is already a UDTF) is non-fatal.
+        if let Err(e) = registry.register(
+            "{sql_name_lit}",
+            &args,
+            &columns,
+            callback,
+            None,
+        ) {{
+            eprintln!(
+                "[shim-duckdb-emit] register scalar TVF {sql_name_lit} skipped: {{}}",
+                e
+            );
+        }}
+    }}
+"##,
+        arm_idx = arm_idx,
+        sql_name_lit = sql_name_lit,
+        col_name = col_name,
+        args_block = args_block,
+        ret_logical = ret_logical,
+    ));
+}
+
 // ─── Cast registration (#624) ───
 //
 // Per-cast `catalog::register-cast` against the `duckdb:extension`
