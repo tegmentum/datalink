@@ -719,9 +719,22 @@ fn lib_rs(
 
         (body, helpers, load_call, cast_body)
     } else {
+        // Even when no logical types are advertised, `call_cast_col`
+        // is emitted unconditionally and references
+        // `identity_cast_handles()`. Keep the helper defined (as an
+        // empty set) so the reference compiles; the set stays empty
+        // so `contains(&handle)` always returns false and we fall
+        // through to the "unsupported" error path.
+        let helpers = String::from(
+            "\n\
+             fn identity_cast_handles() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {\n\
+             \x20   static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> = std::sync::OnceLock::new();\n\
+             \x20   T.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))\n\
+             }\n",
+        );
         (
             String::new(),
-            String::new(),
+            helpers,
             String::new(),
             String::from(
                 "        let _ = (handle, value);\n\
