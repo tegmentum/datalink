@@ -595,6 +595,68 @@ fn lib_rs(
     // of these expands to `""` — the emitted lib.rs then mirrors
     // the pre-fix behaviour (no logical-type call, `call_cast`
     // stays Unsupported).
+    // #79-followup (postgis-shim BLOB↔GEOMETRY ambiguity):
+    // DuckDB 1.5+ natively provides `GEOMETRY`, `GEOGRAPHY`, `BOX2D`,
+    // and `BOX3D` types plus a family of `st_*(GEOMETRY) -> …` scalar
+    // overloads. The shim registers its own overloads with `BLOB`
+    // parameters (WKB carriers).
+    //
+    // Registering the shim's logical-type aliases via `CREATE TYPE
+    // <NAME> AS BLOB` (the mechanism `catalog::register_logical_type`
+    // uses on the DuckDB-wasm target) causes DuckDB to auto-add
+    // implicit BLOB↔<NAME> casts with equal cost to the direct
+    // BLOB→BLOB match. That makes the binder unable to disambiguate
+    // `st_astext(BLOB)` against `st_astext(GEOMETRY)` — every call
+    // becomes an ambiguous "no function matches" error at bind time,
+    // even for scalars whose only registered overload is `(BLOB)`.
+    // The identity casts we then register (Implicit or Explicit) do
+    // not help — the CREATE TYPE side of the alias registration is
+    // itself the source of the ambiguity.
+    //
+    // Fix (minimal, tractable within the surface budget): skip the
+    // shim's own logical-type + identity-cast registration entirely.
+    // The dispatch side keeps working:
+    //
+    //   * `SELECT ST_AsText('POINT(1 2)'::GEOMETRY)` — DuckDB's
+    //     native GEOMETRY handles the `expr::GEOMETRY` surface and
+    //     the native `st_astext(GEOMETRY) -> VARCHAR` returns the
+    //     right value.
+    //   * `SELECT ST_AsText(st_geomfromtext('POINT(1 2)'))` — the
+    //     shim's `st_geomfromtext(TEXT) -> BLOB` returns BLOB and
+    //     the shim's `st_astext(BLOB) -> VARCHAR` binds directly
+    //     (no ambiguity: the shim's BLOB alias family is unregistered
+    //     so nothing competes with a plain BLOB → BLOB match).
+    //   * `SELECT ST_MakePoint(1.0, 2.0)` — the shim's
+    //     `st_makepoint(FLOAT64, FLOAT64) -> BLOB` binds directly.
+    //
+    // Known regression (accepted trade-off): SQL that uses
+    // shim-specific spatial-type aliases (`::BOX2D`, `::TOPOGEOMETRY`,
+    // `::RASTER`) fails to resolve the type name because we no longer
+    // register those aliases. This costs ~16 test-cases in the
+    // spatial-catalog smoke suite. The blocking 218-case
+    // binder_error_no_function_matches_overload cluster (the entire
+    // shim's scalar surface) is unblocked, so net verified count is
+    // strictly higher than the pre-fix state.
+    //
+    // Follow-up: a proper fix registers each alias with a physical
+    // type OTHER than BLOB (or gates registration behind a probe of
+    // DuckDB's own type catalog) so CREATE TYPE doesn't spawn
+    // implicit BLOB↔<alias> casts. Requires either a new WIT surface
+    // in `catalog.wit` or a physical-type registry on the runtime
+    // side.
+    // Emit best-effort explicit casts for the type-aliases we would
+    // have registered. We deliberately do NOT call
+    // `catalog::register_logical_type` here — DuckDB's CREATE TYPE
+    // machinery installs its own implicit BLOB↔<alias> casts that
+    // collide with the shim's BLOB overloads at bind time (see the
+    // long comment above). Registering only the casts skips the
+    // CREATE TYPE step; when the target type already exists (DuckDB
+    // 1.5+ ships native GEOMETRY / GEOGRAPHY / BOX2D / BOX3D) the
+    // cast resolves against the native type and `::GEOMETRY` /
+    // `::BOX2D` / etc. from a shim-returned BLOB works via the
+    // identity trampoline. When the target type is unknown to
+    // DuckDB (RASTER, TOPOGEOMETRY on stock DuckDB) the register_cast
+    // call fails; we log and continue.
     let has_logical_types = !logical_types.is_empty();
     let (
         logical_types_fn,
@@ -606,38 +668,26 @@ fn lib_rs(
             "\nfn register_logical_types() -> Result<(), Duckerror> {\n",
         );
         for name in logical_types {
-            // Best-effort register. When another extension (e.g.
-            // DuckDB's built-in spatial ext) already owns the type,
-            // `register_logical_type` returns Err — we log and skip
-            // the paired casts. catalog.wit @4.0.0 has no probe.
             let esc = name.replace('"', "\\\"");
             body.push_str(&format!(
-                "    match catalog::register_logical_type(&catalog::LogicalType {{ name: \"{esc}\".into(), physical: \"BLOB\".into() }}) {{\n",
+                "    // {esc} — cast-only registration (see emit_dynlink.rs comment).\n"
             ));
-            body.push_str("        Ok(_) => {\n");
             for (from_ty, to_ty) in [
                 (esc.clone(), "BLOB".to_string()),
                 ("BLOB".to_string(), esc.clone()),
             ] {
                 body.push_str(&format!(
-                    "            {{\n\
-                     \x20               let handle = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);\n\
-                     \x20               identity_cast_handles().lock().expect(\"identity cast handles mutex poisoned\").insert(handle);\n\
-                     \x20               let callback = runtime::CastCallback::new(handle);\n\
-                     \x20               let spec = catalog::CastSpec {{ from: \"{from_ty}\".into(), to: \"{to_ty}\".into(), kind: catalog::CastKind::Implicit }};\n\
-                     \x20               if let Err(e) = catalog::register_cast(&spec, callback) {{\n\
-                     \x20                   eprintln!(\"[dynlink-emit] register-cast({from_ty} -> {to_ty}) skipped: {{}}\", e);\n\
-                     \x20               }}\n\
-                     \x20           }}\n",
+                    "    {{\n\
+                     \x20       let handle = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);\n\
+                     \x20       identity_cast_handles().lock().expect(\"identity cast handles mutex poisoned\").insert(handle);\n\
+                     \x20       let callback = runtime::CastCallback::new(handle);\n\
+                     \x20       let spec = catalog::CastSpec {{ from: \"{from_ty}\".into(), to: \"{to_ty}\".into(), kind: catalog::CastKind::Explicit }};\n\
+                     \x20       if let Err(e) = catalog::register_cast(&spec, callback) {{\n\
+                     \x20           eprintln!(\"[dynlink-emit] register-cast({from_ty} -> {to_ty}) skipped: {{}}\", e);\n\
+                     \x20       }}\n\
+                     \x20   }}\n",
                 ));
             }
-            body.push_str("        }\n");
-            body.push_str(&format!(
-                "        Err(e) => {{\n\
-                 \x20           eprintln!(\"[dynlink-emit] register-logical-type {esc} skipped (already owned?): {{}}\", e);\n\
-                 \x20       }}\n",
-            ));
-            body.push_str("    }\n");
         }
         body.push_str("    Ok(())\n}\n");
 
@@ -650,9 +700,9 @@ fn lib_rs(
         );
 
         let load_call = String::from(
-            "        // Best-effort: a logical-type failure is\n\
-             \x20       // non-fatal (typically means the host already\n\
-             \x20       // owns the type via a pre-loaded spatial ext).\n\
+            "        // Best-effort: a cast-registration failure is\n\
+             \x20       // non-fatal (typically means the target alias\n\
+             \x20       // is unknown to DuckDB stock, e.g. RASTER).\n\
              \x20       let _ = register_logical_types();\n",
         );
 
@@ -1325,10 +1375,21 @@ impl CallbackGuest for Component {{
     }}
 
     fn call_cast_col(
-        _handle: u32,
-        _arg: bindings::duckdb::extension::column_types::Colvec,
+        handle: u32,
+        arg: bindings::duckdb::extension::column_types::Colvec,
     ) -> Result<bindings::duckdb::extension::column_types::Colvec, Duckerror> {{
-        Err(Duckerror::Internal("call_cast_col: unsupported (Phase A)".to_string()))
+        // Identity casts (GEOMETRY↔BLOB / BOX2D↔BLOB / ...) are
+        // physical-representation-preserving: the source and target
+        // are both physically BLOB, only the logical tag differs.
+        // Return the input column unchanged.
+        if identity_cast_handles()
+            .lock()
+            .expect("identity cast handles mutex poisoned")
+            .contains(&handle)
+        {{
+            return Ok(arg);
+        }}
+        Err(Duckerror::Internal("call_cast_col: handle not identity (Phase A)".to_string()))
     }}
 
     fn call_table(_handle: u32, _args: Vec<Duckvalue>) -> Result<Resultset, Duckerror> {{
