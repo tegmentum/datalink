@@ -510,6 +510,20 @@ fn lib_rs(
     // provider method name.
     let mut scalar_name_arms = String::new();
     let mut scalar_register_calls = String::new();
+    // #65 (dynlink port): emit a paired single-row TVF registration
+    // for every scalar. See `render_scalar_tvfs` in
+    // `datalink-shim-duckdb-emit::register` for the original fix and
+    // the `register_scalar_tvfs()` fn body below for the rationale.
+    // Without this, `SELECT ... FROM st_geomfromtext(...)` (scalar in
+    // FROM position) resolves against DuckDB's table-function
+    // namespace, misses (the scalar registry is a separate namespace),
+    // and errors with `Table Function with name X is not in the
+    // catalog, a function by this name exists in the spatial
+    // extension, but it's of a different type, namely Scalar
+    // Function` — the exact failure pattern that hit ~36 postgis
+    // regression cases post-#65 (compact-form alias family:
+    // `st_geomfromtext`, `st_union`, ...).
+    let mut scalar_tvf_register_calls = String::new();
     let mut missing_sig_count = 0usize;
     for (idx, name) in scalar_names.iter().enumerate() {
         let arm_idx = idx as u32;
@@ -574,6 +588,49 @@ fn lib_rs(
             callback,
             Some(&opts),
         )?;
+    }}
+"#,
+        ));
+
+        // Paired single-row TVF registration (#65 port). Uses the
+        // SAME `arm_idx` — the fresh TVF handle is slotted into the
+        // SAME `handle_table` the scalar dispatch reads, so the
+        // `call_table` fast path can forward through `call_scalar`
+        // via a single lookup. `args_expr` and `return_lit` are the
+        // scalar's own arg + return logicaltypes (reused as-is), and
+        // the single output column is named after the scalar so
+        // `FROM x(...) AS t(g)` still binds cleanly (the AS alias
+        // list renames the default column).
+        scalar_tvf_register_calls.push_str(&format!(
+            r#"    {{
+        let handle = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        handle_table()
+            .lock()
+            .expect("scalar handle mutex poisoned")
+            .insert(handle, {arm_idx}usize);
+        let callback = runtime::TableCallback::new(handle);
+        let args: Vec<runtime::Funcarg> = {args_expr};
+        let columns: Vec<runtime::Columndef> = vec![
+            runtime::Columndef {{
+                name: "{escaped}".into(),
+                logical: {return_lit},
+            }},
+        ];
+        // Best-effort: a duplicate registration (e.g. a name that is
+        // already a UDTF, or a re-load) is non-fatal; the scalar-first
+        // surface keeps working via `call_scalar`.
+        if let Err(e) = registry.register(
+            "{escaped}",
+            &args,
+            &columns,
+            callback,
+            None,
+        ) {{
+            eprintln!(
+                "[dynlink-emit] register scalar TVF {escaped} skipped: {{}}",
+                e
+            );
+        }}
     }}
 "#,
         ));
@@ -1285,6 +1342,54 @@ fn register_scalars() -> Result<(), Duckerror> {{
 {scalar_register_calls}    Ok(())
 }}
 
+// ─── Scalar-as-TVF (single-row table function) registration (#65) ───
+//
+// DuckDB's binder routes a scalar invocation in a FROM clause
+// (e.g. `SELECT * FROM st_geom_from_text('POINT(1 2)') AS t(geom)`)
+// through the TABLE-FUNCTION namespace, NOT the scalar namespace.
+// A bridge that only registers against `scalar-registry` therefore
+// errors with `Table Function with name X is not in the catalog, a
+// function by this name exists in the spatial extension, but it's
+// of a different type, namely Scalar Function` — the exact failure
+// on ~36 postgis regression cases that hit compact-form aliases in
+// FROM position (`FROM ST_GeomFromText(...)`, `FROM ST_Union(...)`).
+//
+// This mirrors the non-dynlink `render_scalar_tvfs` in
+// `datalink-shim-duckdb-emit::register`: for every scalar name, we
+// register a paired single-row TVF against `Capabilitykind::Table`.
+// Each TVF handle gets a fresh `u32` (allocated by NEXT_HANDLE) and
+// is slotted into the SAME `handle_table` the scalar dispatch reads.
+// `call_table`'s scalar-TVF fast path detects a scalar-TVF handle by
+// presence in `handle_table`, forwards through `dispatch_call_scalar`,
+// and wraps the returned `Duckvalue` in a one-row / one-column
+// `Resultset`.
+//
+// Best-effort: a host that doesn't expose the table capability
+// leaves the scalar-first surface working; skipping here is
+// non-fatal. A per-name duplicate (name already registered as a
+// UDTF) is also non-fatal.
+fn register_scalar_tvfs() -> Result<(), Duckerror> {{
+    let capability = match runtime::get_capability(Capabilitykind::Table) {{
+        Some(c) => c,
+        None => {{
+            eprintln!(
+                "[dynlink-emit] scalar-TVF registration skipped: \
+                 host did not expose table capability"
+            );
+            return Ok(());
+        }}
+    }};
+    let registry = match capability {{
+        runtime::Capability::Table(r) => r,
+        _ => {{
+            return Err(Duckerror::Internal(
+                "table capability returned unexpected variant (scalar TVF)".into(),
+            ));
+        }}
+    }};
+{scalar_tvf_register_calls}    Ok(())
+}}
+
 // -----------------------------------------------------------
 // Guest impls.
 // -----------------------------------------------------------
@@ -1294,10 +1399,15 @@ struct Component;
 impl GuestGuest for Component {{
     fn load() -> Result<Loadresult, Duckerror> {{
 {logical_types_load_call}        register_scalars()?;
+        // #65 (dynlink port): paired scalar-as-TVF registration so
+        // FROM-clause invocations of scalars bind against the table
+        // namespace. Best-effort; a host without the table
+        // capability logs and continues.
+        register_scalar_tvfs()?;
         Ok(Loadresult {{
             name: EXTENSION_ROOT.to_string(),
             version: Some(CATALOG_VERSION.to_string()),
-            requires: vec![Capabilitykind::Scalar],
+            requires: vec![Capabilitykind::Scalar, Capabilitykind::Table],
         }})
     }}
     fn reconfigure(_keys: Vec<String>) -> Result<bool, Duckerror> {{ Ok(false) }}
@@ -1392,8 +1502,32 @@ impl CallbackGuest for Component {{
         Err(Duckerror::Internal("call_cast_col: handle not identity (Phase A)".to_string()))
     }}
 
-    fn call_table(_handle: u32, _args: Vec<Duckvalue>) -> Result<Resultset, Duckerror> {{
-        Err(Duckerror::Internal("call_table: unsupported (Phase A)".to_string()))
+    fn call_table(handle: u32, args: Vec<Duckvalue>) -> Result<Resultset, Duckerror> {{
+        // #65 (dynlink port): scalar-as-TVF fast path. DuckDB routes
+        // a FROM-clause invocation of a scalar (`SELECT * FROM
+        // st_geom_from_text('POINT(1 2)') AS t(g)`) through the
+        // table-function namespace. `register_scalar_tvfs()` slotted
+        // each scalar-TVF handle into the SAME `handle_table` the
+        // scalar dispatch reads, so a handle that resolves in
+        // `handle_table` is a scalar TVF — forward through
+        // `dispatch_call_scalar` and wrap the returned `Duckvalue`
+        // into a one-row / one-column resultset.
+        //
+        // No UDTF registrations exist yet in the dynlink emit path,
+        // so a miss on `handle_table` is a legitimate `unknown table
+        // handle` — return an Internal error rather than a stub
+        // "unsupported" so the failure surface is diagnosable.
+        let is_scalar_tvf = handle_table()
+            .lock()
+            .expect("scalar handle mutex poisoned")
+            .contains_key(&handle);
+        if is_scalar_tvf {{
+            let v = dispatch_call_scalar(handle, args)?;
+            return Ok(vec![vec![v]]);
+        }}
+        Err(Duckerror::Internal(format!(
+            "call_table: unknown handle {{}} (no UDTFs in dynlink emit)", handle
+        )))
     }}
 
     fn call_pragma(_handle: u32, _args: Vec<Duckvalue>) -> Result<Option<Duckvalue>, Duckerror> {{
