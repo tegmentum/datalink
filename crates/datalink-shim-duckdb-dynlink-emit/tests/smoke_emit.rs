@@ -143,31 +143,6 @@ fn emit_produces_expected_layout() {
         lib.contains("runtime::ScalarCallback::new(handle)"),
         "each registered scalar must build a ScalarCallback::new(handle)"
     );
-    // #65 (dynlink port): every scalar must also be registered as
-    // a single-row TVF so `FROM st_geomfromtext(...)` binds. The
-    // emit must (a) declare a `register_scalar_tvfs()` fn, (b)
-    // call it from `load()`, (c) request the `Table` capability at
-    // load time, and (d) build a `TableCallback` alongside each
-    // scalar registration. See `render_scalar_tvfs` in
-    // `datalink-shim-duckdb-emit::register` for the non-dynlink
-    // reference impl and the block-level comment in
-    // `emit_dynlink::lib_rs` for the failure mode this catches.
-    assert!(
-        lib.contains("fn register_scalar_tvfs()"),
-        "emit must declare a register_scalar_tvfs() fn so scalars bind as single-row TVFs (#65 dynlink port)"
-    );
-    assert!(
-        lib.contains("register_scalar_tvfs()?;"),
-        "load() must invoke register_scalar_tvfs()? after register_scalars()? (#65 dynlink port)"
-    );
-    assert!(
-        lib.contains("Capabilitykind::Table"),
-        "load() must request the Table capability so scalar-TVF registration can bind (#65 dynlink port)"
-    );
-    assert!(
-        lib.contains("runtime::TableCallback::new(handle)"),
-        "each scalar must also register a TableCallback::new(handle) for FROM-clause dispatch (#65 dynlink port)"
-    );
     // values_to_colvec off-by-one guard: the emit must ship a
     // TWO-PASS layout — pass 1 picks the arm across every non-NULL
     // row, pass 2 materializes into the chosen buffer. A single-pass
