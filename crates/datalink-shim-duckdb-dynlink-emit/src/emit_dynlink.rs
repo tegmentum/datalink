@@ -306,11 +306,33 @@ strip = true
     )
 }
 
-fn world_wit(sub_ext: &str) -> String {
-    let pkg = sub_ext
+/// Convert a snake_case sub-ext name into a kebab-case WIT package
+/// segment that satisfies the component-model rule "each `-`-separated
+/// segment must start with `[a-z]`". Underscores become dashes; digit-
+/// starting segments (`3d`, `2d`, `4d`) get word-form treatment
+/// (`3d` → `threed`, etc.) so `postgis_3d` yields `postgis-threed`
+/// not `postgis-3d` (which wit-bindgen rejects).
+fn kebab_safe_pkg_name(sub_ext: &str) -> String {
+    let raw: String = sub_ext
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>();
+        .collect();
+    raw.split('-')
+        .map(|seg| match seg {
+            "2" => "two".to_string(),
+            "3" => "three".to_string(),
+            "4" => "four".to_string(),
+            "2d" => "twod".to_string(),
+            "3d" => "threed".to_string(),
+            "4d" => "fourd".to_string(),
+            _ => seg.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn world_wit(sub_ext: &str) -> String {
+    let pkg = kebab_safe_pkg_name(sub_ext);
     format!(
         r#"package duckdb-bridge:{pkg}@0.1.0;
 
