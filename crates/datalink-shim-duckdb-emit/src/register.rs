@@ -338,21 +338,16 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
 // Topology` to `Logicaltype::Blob`. Callers write SQL such as
 // `st_area('POLYGON EMPTY'::GEOMETRY)`; the DuckDB binder sees
 // `st_area(GEOMETRY)` and cannot match the catalogued `st_area(BLOB)`
-// signature unless an implicit cast between GEOMETRY and BLOB is
-// registered.
+// signature unless a cast between GEOMETRY and BLOB is available.
 //
 // This helper emits a `register_logical_types()` body invoked by
-// `Guest::load()` BEFORE `register_scalars()`. It:
-//
-//   1. Registers each shim's physical-BLOB-backed logical types
-//      (GEOMETRY / GEOGRAPHY on postgis; RASTER / TOPOLOGY when the
-//      shim exposes them) via `catalog::register_logical_type`.
-//   2. Registers implicit casts <T> <-> BLOB for each of those types.
-//      The cast callback is an identity operation — the physical
-//      representation is unchanged, only the logical tag. Each
-//      allocated handle lands in `identity_cast_handles()` so
-//      `call_cast` shortcuts it into `Ok(value)` without touching
-//      the scalar `handle_table`.
+// `Guest::load()` BEFORE `register_scalars()`. It registers the
+// paired identity casts <T> <-> BLOB for each of the shim's
+// physical-BLOB-backed logical types. The cast callback is an
+// identity operation — the physical representation is a BLOB either
+// way, only the logical tag differs. Each allocated handle lands
+// in `identity_cast_handles()` so `call_cast` shortcuts it into
+// `Ok(value)` without touching the scalar `handle_table`.
 //
 // The set of types is driven by `caller-supplied booleans` derived
 // from the primary shim's WIT surface (matches the
@@ -361,32 +356,56 @@ pub fn retshape_to_logicaltype(r: &RetShape) -> String {
 // preludes). A shim with none of those resources gets an empty body
 // (only `Ok(())`).
 //
-// ── Collision-tolerant registration ──
+// ── #79-followup (postgis-shim BLOB↔GEOMETRY ambiguity) ──
 //
-// The DuckDB spatial extension pre-registers `GEOMETRY` (and, when
-// its spatial-geography variant is loaded, `GEOGRAPHY`). If our
-// bridge is loaded on a host where that extension is already
-// present, an unconditional `register_logical_type` returns `Err`
-// and — under the original `.map_err(...)?` pattern — aborts
-// `Guest::load()` before any scalars register. Nothing lands and
-// every subsequent `st_*` call fails with "function does not
-// exist".
+// DuckDB 1.5+ natively provides `GEOMETRY`, `GEOGRAPHY`, `BOX2D`,
+// and `BOX3D` types plus a family of `st_*(GEOMETRY) -> …` scalar
+// overloads. The shim registers its own overloads with `BLOB`
+// parameters (WKB carriers).
 //
-// The catalog contract at ~/git/ducklink/wit/duckdb-extension/
-// catalog.wit exposes only `register-logical-type`, `register-
-// cast`, and `register-macro` — no probe (no `type-exists` or
-// `find-logical-type`). So we cannot ask before we insert. The
-// fallback is to treat `register_logical_type` failure as
-// non-fatal: log the reason via eprintln, skip the paired
-// implicit casts (the pre-existing type already brings its own
-// casts, or the SQL surface will surface a fresh error at bind
-// time), and continue on to the next type + register_scalars.
+// Registering the shim's logical-type aliases via `CREATE TYPE
+// <NAME> AS BLOB` (the mechanism `catalog::register_logical_type`
+// uses on the DuckDB-wasm target) causes DuckDB to auto-add
+// implicit BLOB↔<NAME> casts with equal cost to the direct
+// BLOB→BLOB match. That makes the binder unable to disambiguate
+// `st_astext(BLOB)` against `st_astext(GEOMETRY)` — every call
+// becomes an ambiguous "no function matches" error at bind time,
+// even for scalars whose only registered overload is `(BLOB)`.
+// The identity casts we then register (Implicit or Explicit) do
+// not help — the CREATE TYPE side of the alias registration is
+// itself the source of the ambiguity.
 //
-// The paired `register_cast` calls are also downgraded to
-// best-effort: they run only when the type registration
-// succeeded, and their own `Err` is likewise logged-and-continued
-// so a partially-shared catalog doesn't wipe out an otherwise
-// functional shim.
+// Fix (parallel to the dynlink-emit fix in a8b50f0): skip the
+// shim's own `catalog::register_logical_type` call and emit only
+// the paired identity casts as `Explicit`. When the target type
+// already exists (DuckDB 1.5+ ships native GEOMETRY / GEOGRAPHY /
+// BOX2D / BOX3D) the cast lands against the native type and
+// `expr::GEOMETRY` from a shim-returned BLOB still works via the
+// identity trampoline. When the target type is unknown to DuckDB
+// (RASTER, TOPOLOGY on stock DuckDB) the `register_cast` call
+// fails; we log and continue.
+//
+// The dispatch side keeps working:
+//
+//   * `SELECT ST_AsText('POINT(1 2)'::GEOMETRY)` — DuckDB's
+//     native GEOMETRY handles the `expr::GEOMETRY` surface and
+//     the native `st_astext(GEOMETRY) -> VARCHAR` returns the
+//     right value.
+//   * `SELECT ST_AsText(st_geomfromtext('POINT(1 2)'))` — the
+//     shim's `st_geomfromtext(TEXT) -> BLOB` returns BLOB and
+//     the shim's `st_astext(BLOB) -> VARCHAR` binds directly
+//     (no ambiguity: the shim's BLOB alias family is unregistered
+//     so nothing competes with a plain BLOB → BLOB match).
+//   * `SELECT ST_MakePoint(1.0, 2.0)` — the shim's
+//     `st_makepoint(FLOAT64, FLOAT64) -> BLOB` binds directly.
+//
+// Known regression (accepted trade-off): SQL that uses shim-
+// specific spatial-type aliases (`::RASTER`, `::TOPOLOGY`) fails
+// to resolve the type name because we no longer register those
+// aliases. Follow-up: register each alias with a physical type
+// OTHER than BLOB (or gate registration behind a probe of DuckDB's
+// own type catalog) so CREATE TYPE doesn't spawn implicit BLOB↔
+// <alias> casts.
 pub fn render_logical_types(
     has_geometry: bool,
     has_raster: bool,
@@ -416,71 +435,59 @@ pub fn render_logical_types(
     let mut s = String::new();
     s.push_str(LOGICAL_TYPE_REGISTER_PRELUDE);
 
-    // Register each type + its paired identity casts as an atomic
-    // group. If `register_logical_type` fails (e.g. the DuckDB
-    // spatial extension already owns GEOMETRY), the paired casts
-    // are skipped and we move on to the next type. The wit
-    // contract (see comment above the fn) has no probe, so this
-    // Err-based branch is the only signal available.
+    // Emit best-effort explicit casts for the type-aliases we would
+    // have registered. We deliberately do NOT call
+    // `catalog::register_logical_type` here — DuckDB's CREATE TYPE
+    // machinery installs its own implicit BLOB↔<alias> casts that
+    // collide with the shim's BLOB overloads at bind time (see the
+    // long comment above). Registering only the casts skips the
+    // CREATE TYPE step; when the target type already exists (DuckDB
+    // 1.5+ ships native GEOMETRY / GEOGRAPHY / BOX2D / BOX3D) the
+    // cast resolves against the native type and `::GEOMETRY` /
+    // `::BOX2D` / etc. from a shim-returned BLOB works via the
+    // identity trampoline. When the target type is unknown to
+    // DuckDB (RASTER, TOPOLOGY on stock DuckDB) the register_cast
+    // call fails; we log and continue.
     for name in &types_list {
         s.push_str(&format!(
-            r##"    match catalog::register_logical_type(&catalog::LogicalType {{
-        name: "{name}".into(),
-        physical: "BLOB".into(),
-    }}) {{
-        Ok(_handle) => {{
-"##,
+            "    // {name} — cast-only registration (see render_logical_types comment).\n"
         ));
-        // Implicit casts <T> <-> BLOB. Callback is identity — the
+        // Identity casts <T> <-> BLOB. Callback is identity — the
         // physical representation is a BLOB either way, only the
         // logical tag differs. The allocated handle lands in
         // `identity_cast_handles()` so `call_cast` returns the
-        // Duckvalue unchanged for these handles.
+        // Duckvalue unchanged for these handles. `Explicit` (not
+        // `Implicit`) is critical: implicit BLOB↔<alias> casts at
+        // equal cost make the binder unable to disambiguate
+        // `st_astext(BLOB)` from `st_astext(GEOMETRY)`.
         for (from_ty, to_ty) in [(*name, "BLOB"), ("BLOB", *name)] {
             s.push_str(&format!(
-                r##"            {{
-                let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                identity_cast_handles()
-                    .lock()
-                    .expect("identity cast handles mutex poisoned")
-                    .insert(handle);
-                let callback = runtime::CastCallback::new(handle);
-                let spec = catalog::CastSpec {{
-                    from: "{from_ty}".into(),
-                    to: "{to_ty}".into(),
-                    kind: catalog::CastKind::Implicit,
-                }};
-                // Best-effort: a Err here (typically because
-                // the host already has this cast wired via a
-                // pre-loaded spatial ext) is non-fatal — the
-                // pre-existing cast covers the surface.
-                if let Err(e) = catalog::register_cast(&spec, callback) {{
-                    eprintln!(
-                        "[shim-duckdb-emit] register-cast({from_ty} -> {to_ty}) skipped: {{}}",
-                        e
-                    );
-                }}
-            }}
-"##,
-            ));
-        }
-        s.push_str(&format!(
-            r##"        }}
-        Err(e) => {{
-            // catalog.wit @4.0.0 has no probe function, so a
-            // failing register_logical_type is our only signal
-            // that the type is already owned by another
-            // extension (typically DuckDB's spatial ext). Log
-            // and skip the paired casts — the pre-existing
-            // owner's own casts remain in place.
+                r##"    {{
+        let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        identity_cast_handles()
+            .lock()
+            .expect("identity cast handles mutex poisoned")
+            .insert(handle);
+        let callback = runtime::CastCallback::new(handle);
+        let spec = catalog::CastSpec {{
+            from: "{from_ty}".into(),
+            to: "{to_ty}".into(),
+            kind: catalog::CastKind::Explicit,
+        }};
+        // Best-effort: an Err here (typically because the target
+        // alias is unknown to stock DuckDB, e.g. RASTER) is
+        // non-fatal — the shim's own scalar surface still binds
+        // directly against BLOB.
+        if let Err(e) = catalog::register_cast(&spec, callback) {{
             eprintln!(
-                "[shim-duckdb-emit] register-logical-type {name} skipped (already registered?): {{}}",
+                "[shim-duckdb-emit] register-cast({from_ty} -> {to_ty}) skipped: {{}}",
                 e
             );
         }}
     }}
 "##,
-        ));
+            ));
+        }
     }
 
     s.push_str("    Ok(())\n}\n");
