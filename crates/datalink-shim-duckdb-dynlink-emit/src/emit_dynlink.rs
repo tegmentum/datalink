@@ -50,6 +50,27 @@ pub(crate) struct ScalarSig {
     pub return_token: String,
 }
 
+/// Per-aggregate signature loaded from `aggregates` in the shim-interface DB.
+///
+/// Aggregates carry only `param_types_json` — the return type is
+/// domain-dependent and the DB doesn't record it. The dynlink emit
+/// registers every aggregate with a Blob return (opaque blob-return);
+/// the provider is free to encode a non-blob final value via the
+/// CBOR envelope's tagged variants.
+#[derive(Debug, Clone)]
+pub(crate) struct AggregateSig {
+    pub param_tokens: Vec<String>,
+}
+
+/// Per-table-function signature loaded from `table_functions` in the
+/// shim-interface DB. Same shape as aggregates — no return schema; the
+/// dynlink emit declares a single BLOB output column, and the provider
+/// streams rows through the CBOR envelope's List-of-Bytes response.
+#[derive(Debug, Clone)]
+pub(crate) struct TableSig {
+    pub param_tokens: Vec<String>,
+}
+
 /// Load `SELECT name, param_types_json, return_type FROM scalars
 /// WHERE extension = ?` into a name→signature map.
 ///
@@ -102,6 +123,92 @@ pub(crate) fn load_scalar_sigs(
         eprintln!(
             "[duckdb-dynlink-emit] warning: {multi_overload_count} scalar(s) with >1 overload \
              group; using the first (Phase A behaviour). Multi-overload dispatch lands in Phase B."
+        );
+    }
+    Ok(out)
+}
+
+/// Load `SELECT name, param_types_json FROM aggregates WHERE extension = ?`
+/// UNIONed with the window_functions surface into a name→signature map.
+/// DuckDB doesn't have a separate window-registry — window functions
+/// register through the same `aggregate-registry` capability — so the
+/// dynlink emit folds both categories into the same signature map at
+/// load time.
+pub(crate) fn load_aggregate_sigs(
+    sqlite: &Path,
+    extension: &str,
+) -> Result<HashMap<String, AggregateSig>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        sqlite,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening shim-interface sqlite: {}", sqlite.display()))?;
+    let mut out: HashMap<String, AggregateSig> = HashMap::new();
+    let mut multi_overload_count = 0usize;
+    for source_table in ["aggregates", "window_functions"] {
+        let sql = format!(
+            "SELECT name, param_types_json FROM {source_table} WHERE extension = ?1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([extension], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (name, param_json) = row?;
+            let outer: Vec<Vec<String>> = serde_json::from_str(&param_json)
+                .with_context(|| format!("parsing param_types_json for {source_table}.{name}"))?;
+            if outer.len() > 1 {
+                multi_overload_count += 1;
+            }
+            let param_tokens = outer.into_iter().next().unwrap_or_default();
+            // Aggregates and window functions can share a name (rare but
+            // possible in postgis clustering). Aggregate rows take
+            // precedence — they're the more common surface.
+            out.entry(name).or_insert(AggregateSig { param_tokens });
+        }
+    }
+    if multi_overload_count > 0 {
+        eprintln!(
+            "[duckdb-dynlink-emit] warning: {multi_overload_count} aggregate/window(s) with >1 overload \
+             group; using the first (Phase A behaviour)."
+        );
+    }
+    Ok(out)
+}
+
+/// Load `SELECT name, param_types_json FROM table_functions WHERE extension = ?`
+/// into a name→signature map.
+pub(crate) fn load_table_sigs(
+    sqlite: &Path,
+    extension: &str,
+) -> Result<HashMap<String, TableSig>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        sqlite,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening shim-interface sqlite: {}", sqlite.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT name, param_types_json FROM table_functions WHERE extension = ?1",
+    )?;
+    let rows = stmt.query_map([extension], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out: HashMap<String, TableSig> = HashMap::new();
+    let mut multi_overload_count = 0usize;
+    for row in rows {
+        let (name, param_json) = row?;
+        let outer: Vec<Vec<String>> = serde_json::from_str(&param_json)
+            .with_context(|| format!("parsing param_types_json for table_function {name}"))?;
+        if outer.len() > 1 {
+            multi_overload_count += 1;
+        }
+        let param_tokens = outer.into_iter().next().unwrap_or_default();
+        out.insert(name, TableSig { param_tokens });
+    }
+    if multi_overload_count > 0 {
+        eprintln!(
+            "[duckdb-dynlink-emit] warning: {multi_overload_count} table_function(s) with >1 overload \
+             group; using the first (Phase A behaviour)."
         );
     }
     Ok(out)
@@ -185,6 +292,26 @@ pub fn emit_dynlink(
             HashMap::new()
         }
     };
+    // Phase 9.3.next: aggregate + table-function signatures. Missing
+    // rows fall back to arity-1 Blob (mirrors scalar behaviour).
+    let agg_sig_map = match opts.interface_sqlite.as_deref() {
+        Some(p) => load_aggregate_sigs(p, &catalog.meta.extension).with_context(|| {
+            format!(
+                "loading aggregate signatures from shim-interface: {}",
+                p.display()
+            )
+        })?,
+        None => HashMap::new(),
+    };
+    let table_sig_map = match opts.interface_sqlite.as_deref() {
+        Some(p) => load_table_sigs(p, &catalog.meta.extension).with_context(|| {
+            format!(
+                "loading table_function signatures from shim-interface: {}",
+                p.display()
+            )
+        })?,
+        None => HashMap::new(),
+    };
 
     fs::write(out_dir.join("Cargo.toml"), cargo_toml(&crate_name, &version))?;
     fs::write(out_dir.join("wit/world.wit"), world_wit(&opts.sub_ext))?;
@@ -250,6 +377,8 @@ pub fn emit_dynlink(
         &version,
         functions.iter().collect::<Vec<_>>().as_slice(),
         &sig_map,
+        &agg_sig_map,
+        &table_sig_map,
         &scalar_aliases,
         &logical_types,
     );
@@ -493,6 +622,8 @@ fn lib_rs(
     version: &str,
     functions: &[&(FnKind, String)],
     sig_map: &HashMap<String, ScalarSig>,
+    agg_sig_map: &HashMap<String, AggregateSig>,
+    table_sig_map: &HashMap<String, TableSig>,
     scalar_aliases: &[(String, String)],
     logical_types: &[String],
 ) -> String {
@@ -503,6 +634,27 @@ fn lib_rs(
         .collect();
     scalar_names.sort();
     scalar_names.dedup();
+
+    // Phase 9.3.next: enumerate aggregates, windows, and table
+    // functions from the catalog dispatch set. Aggregates and
+    // windows share the runtime `aggregate-registry` capability
+    // (DuckDB doesn't have a separate window-registry — the engine
+    // treats window = aggregate + frame); table functions land in
+    // the `table-registry` capability.
+    let mut aggregate_names: Vec<&str> = functions
+        .iter()
+        .filter(|(k, _)| *k == FnKind::Aggregate || *k == FnKind::Window)
+        .map(|(_, n)| n.as_str())
+        .collect();
+    aggregate_names.sort();
+    aggregate_names.dedup();
+    let mut table_names: Vec<&str> = functions
+        .iter()
+        .filter(|(k, _)| *k == FnKind::Table)
+        .map(|(_, n)| n.as_str())
+        .collect();
+    table_names.sort();
+    table_names.dedup();
 
     // Emit the compact→canonical alias table as a `match` arm body
     // consumed by the `canonical_for` helper below. Only aliases
@@ -607,6 +759,144 @@ fn lib_rs(
              the catalog and DB are out of sync."
         );
     }
+
+    // ── Aggregate + window emission (Phase 9.3.next) ──
+    //
+    // Windows share the aggregate-registry surface with `is_window`
+    // implicit in the callback shape — DuckDB's engine handles the
+    // OVER clause by re-dispatching the same registered aggregate
+    // over the frame. Both kinds are folded into the same handle
+    // table + arm-idx map (`aggregate_name_by_arm_idx`) so a single
+    // `call_aggregate_col` dispatch arm handles both surfaces.
+    let mut aggregate_name_arms = String::new();
+    let mut aggregate_register_calls = String::new();
+    let mut missing_agg_sig_count = 0usize;
+    for (idx, name) in aggregate_names.iter().enumerate() {
+        let arm_idx = idx as u32;
+        let escaped = name.replace('"', "\\\"");
+        aggregate_name_arms.push_str(&format!(
+            "        {arm_idx} => Some(\"{escaped}\"),\n"
+        ));
+        let args_expr = if let Some(sig) = agg_sig_map.get(*name) {
+            let mut args = String::from("vec![\n");
+            for (i, tok) in sig.param_tokens.iter().enumerate() {
+                let lit = token_to_logicaltype_lit(tok);
+                args.push_str(&format!(
+                    "                runtime::Funcarg {{ name: Some(\"arg{i}\".into()), logical: {lit} }},\n"
+                ));
+            }
+            args.push_str("            ]");
+            args
+        } else {
+            missing_agg_sig_count += 1;
+            String::from(
+                "vec![\n                runtime::Funcarg { name: Some(\"arg0\".into()), logical: Logicaltype::Blob },\n            ]",
+            )
+        };
+        aggregate_register_calls.push_str(&format!(
+            r#"    {{
+        let handle = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        aggregate_handle_table()
+            .lock()
+            .expect("aggregate handle mutex poisoned")
+            .insert(handle, {arm_idx}usize);
+        let callback = runtime::AggregateCallback::new(handle);
+        let args: Vec<runtime::Funcarg> = {args_expr};
+        let opts = runtime::Funcopts {{
+            description: Some("{escaped} (sqlink-shim-codegen --dynlink)".into()),
+            tags: vec!["{escaped}".into()],
+            attributes: Funcflags::DETERMINISTIC | Funcflags::STATELESS,
+        }};
+        registry.register(
+            "{escaped}",
+            &args,
+            &Logicaltype::Blob,
+            callback,
+            Some(&opts),
+        )?;
+    }}
+"#,
+        ));
+    }
+    if missing_agg_sig_count > 0 {
+        eprintln!(
+            "[duckdb-dynlink-emit] warning: {missing_agg_sig_count} aggregate(s) had no \
+             shim-interface signature (arity-1 Blob fallback used)."
+        );
+    }
+
+    // ── Table-function emission (Phase 9.3.next) ──
+    //
+    // Each table-function name registers via `runtime.table-registry`
+    // with a single BLOB output column; `call_table` invokes the
+    // provider through the CBOR envelope and unwraps a List-of-Bytes
+    // response into a per-row Resultset.
+    let mut table_name_arms = String::new();
+    let mut table_register_calls = String::new();
+    let mut missing_table_sig_count = 0usize;
+    for (idx, name) in table_names.iter().enumerate() {
+        let arm_idx = idx as u32;
+        let escaped = name.replace('"', "\\\"");
+        table_name_arms.push_str(&format!(
+            "        {arm_idx} => Some(\"{escaped}\"),\n"
+        ));
+        let args_expr = if let Some(sig) = table_sig_map.get(*name) {
+            let mut args = String::from("vec![\n");
+            for (i, tok) in sig.param_tokens.iter().enumerate() {
+                let lit = token_to_logicaltype_lit(tok);
+                args.push_str(&format!(
+                    "                runtime::Funcarg {{ name: Some(\"arg{i}\".into()), logical: {lit} }},\n"
+                ));
+            }
+            args.push_str("            ]");
+            args
+        } else {
+            missing_table_sig_count += 1;
+            String::from(
+                "vec![\n                runtime::Funcarg { name: Some(\"arg0\".into()), logical: Logicaltype::Blob },\n            ]",
+            )
+        };
+        table_register_calls.push_str(&format!(
+            r#"    {{
+        let handle = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        table_handle_table()
+            .lock()
+            .expect("table handle mutex poisoned")
+            .insert(handle, {arm_idx}usize);
+        let callback = runtime::TableCallback::new(handle);
+        let args: Vec<runtime::Funcarg> = {args_expr};
+        let columns: Vec<runtime::Columndef> = vec![runtime::Columndef {{
+            name: "result".into(),
+            logical: Logicaltype::Blob,
+        }}];
+        registry.register(
+            "{escaped}",
+            &args,
+            &columns,
+            callback,
+            None,
+        )?;
+    }}
+"#,
+        ));
+    }
+    if missing_table_sig_count > 0 {
+        eprintln!(
+            "[duckdb-dynlink-emit] warning: {missing_table_sig_count} table_function(s) had no \
+             shim-interface signature (arity-1 Blob fallback used)."
+        );
+    }
+
+    // Conditional emit of the register + dispatch machinery. When
+    // there are no aggregates / no tables in this bridge, we still
+    // emit the (empty) helper fns so the guest.load() call site
+    // stays uniform.
+    let _has_aggs = !aggregate_names.is_empty();
+    let _has_tables = !table_names.is_empty();
+    let agg_names_nonempty = if aggregate_names.is_empty() { "false" } else { "true" };
+    let table_names_nonempty = if table_names.is_empty() { "false" } else { "true" };
+    let agg_count = aggregate_names.len();
+    let table_count = table_names.len();
 
     let extension_root = extension_root.to_string();
     let catalog_extension = catalog_extension.to_string();
@@ -1290,6 +1580,22 @@ fn handle_table() -> &'static std::sync::Mutex<std::collections::HashMap<u32, us
         std::sync::OnceLock::new();
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }}
+
+// Phase 9.3.next: aggregate + table dispatch handle tables.
+// Kept structurally uniform with the scalar handle_table so a
+// future consolidation into a single enum-tagged table is a
+// one-liner. Empty when the catalog has no aggregates / tables.
+fn aggregate_handle_table() -> &'static std::sync::Mutex<std::collections::HashMap<u32, usize>> {{
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, usize>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}}
+
+fn table_handle_table() -> &'static std::sync::Mutex<std::collections::HashMap<u32, usize>> {{
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, usize>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}}
 {identity_cast_helpers}
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 {logical_types_fn}
@@ -1320,6 +1626,46 @@ fn register_scalars() -> Result<(), Duckerror> {{
 {scalar_register_calls}    Ok(())
 }}
 
+fn register_aggregates() -> Result<(), Duckerror> {{
+    // Best-effort: hosts that don't expose the aggregate capability
+    // still let scalars register (the scalar-only bridges shipped in
+    // Phase A). Log-and-continue so the emit stays useful in both
+    // shapes.
+    let Some(capability) = runtime::get_capability(Capabilitykind::Aggregate) else {{
+        if {agg_names_nonempty} {{
+            eprintln!("[dynlink-emit] host did not expose aggregate capability; skipping {agg_count} aggregate(s)");
+        }}
+        return Ok(());
+    }};
+    let registry = match capability {{
+        runtime::Capability::Aggregate(r) => r,
+        _ => {{
+            return Err(Duckerror::Internal(
+                "aggregate capability returned unexpected variant".into(),
+            ));
+        }}
+    }};
+{aggregate_register_calls}    Ok(())
+}}
+
+fn register_tables() -> Result<(), Duckerror> {{
+    let Some(capability) = runtime::get_capability(Capabilitykind::Table) else {{
+        if {table_names_nonempty} {{
+            eprintln!("[dynlink-emit] host did not expose table capability; skipping {table_count} table-function(s)");
+        }}
+        return Ok(());
+    }};
+    let registry = match capability {{
+        runtime::Capability::Table(r) => r,
+        _ => {{
+            return Err(Duckerror::Internal(
+                "table capability returned unexpected variant".into(),
+            ));
+        }}
+    }};
+{table_register_calls}    Ok(())
+}}
+
 // -----------------------------------------------------------
 // Guest impls.
 // -----------------------------------------------------------
@@ -1329,6 +1675,8 @@ struct Component;
 impl GuestGuest for Component {{
     fn load() -> Result<Loadresult, Duckerror> {{
 {logical_types_load_call}        register_scalars()?;
+        register_aggregates()?;
+        register_tables()?;
         Ok(Loadresult {{
             name: EXTENSION_ROOT.to_string(),
             version: Some(CATALOG_VERSION.to_string()),
@@ -1367,6 +1715,94 @@ fn dispatch_call_scalar(
     Ok(response_to_duckv(resp))
 }}
 
+fn aggregate_name_by_arm_idx(arm: usize) -> Option<&'static str> {{
+    match arm as u32 {{
+{aggregate_name_arms}        _ => None,
+    }}
+}}
+
+fn table_name_by_arm_idx(arm: usize) -> Option<&'static str> {{
+    match arm as u32 {{
+{table_name_arms}        _ => None,
+    }}
+}}
+
+/// Aggregate dispatch (Phase 9.3.next). Whole-group call: the host
+/// hands us every row's arg columns; we lift each row to a CBOR list
+/// and ship the accumulated list-of-lists to the provider under the
+/// aggregate's canonical name. The provider owns the semantic
+/// fold (average, extent, cluster, …); the bridge is a CBOR tunnel.
+fn dispatch_call_aggregate(
+    handle: u32,
+    args: Vec<bindings::duckdb::extension::column_types::Colvec>,
+) -> Result<Duckvalue, Duckerror> {{
+    let arm_idx = aggregate_handle_table()
+        .lock()
+        .expect("aggregate handle mutex poisoned")
+        .get(&handle)
+        .copied()
+        .ok_or_else(|| Duckerror::Internal(format!("unknown aggregate handle {{}}", handle)))?;
+    let name = aggregate_name_by_arm_idx(arm_idx)
+        .ok_or_else(|| Duckerror::Internal(format!("unknown aggregate arm {{}}", arm_idx)))?;
+    let n_rows = validate_colvec_rows(&args)?;
+    let mut rows: Vec<CborValue> = Vec::with_capacity(n_rows);
+    let mut row_buf: Vec<Duckvalue> = Vec::with_capacity(args.len());
+    for i in 0..n_rows {{
+        materialize_row(&args, i, &mut row_buf);
+        // SQL-aggregate NULL-row semantics: rows where any arg is
+        // NULL are skipped (mirrors sum() / avg() defaults).
+        if row_buf.iter().any(|v| matches!(v, Duckvalue::Null)) {{
+            continue;
+        }}
+        let cbor_row: Vec<CborValue> = row_buf.iter().map(duckv_to_cbor).collect();
+        rows.push(CborValue::List(cbor_row));
+    }}
+    if rows.is_empty() {{
+        return Ok(Duckvalue::Null);
+    }}
+    let canonical = canonical_for(name);
+    let method = canonical.replace('_', "-");
+    let resp = call(&method, vec![CborValue::List(rows)])?;
+    Ok(response_to_duckv(resp))
+}}
+
+/// Table-function dispatch (Phase 9.3.next). Single-shot call: the
+/// host hands us the argv values; we ship them through the CBOR
+/// envelope and expect a List-of-Bytes (one BLOB per row) response.
+/// Any other shape is best-effort wrapped as a single Blob row so
+/// the provider stays free to evolve its wire without breaking the
+/// bridge.
+fn dispatch_call_table(
+    handle: u32,
+    args: Vec<Duckvalue>,
+) -> Result<Resultset, Duckerror> {{
+    let arm_idx = table_handle_table()
+        .lock()
+        .expect("table handle mutex poisoned")
+        .get(&handle)
+        .copied()
+        .ok_or_else(|| Duckerror::Internal(format!("unknown table handle {{}}", handle)))?;
+    let name = table_name_by_arm_idx(arm_idx)
+        .ok_or_else(|| Duckerror::Internal(format!("unknown table arm {{}}", arm_idx)))?;
+    let canonical = canonical_for(name);
+    let method = canonical.replace('_', "-");
+    let cbor_args: Vec<CborValue> = args.iter().map(duckv_to_cbor).collect();
+    let resp = call(&method, cbor_args)?;
+    let rows: Vec<Vec<Duckvalue>> = match resp {{
+        ResponseValue::List(items) => items
+            .into_iter()
+            .map(|item| match item {{
+                ResponseValue::Bytes(b) => vec![Duckvalue::Blob(b)],
+                ResponseValue::List(cols) => cols.into_iter().map(response_to_duckv).collect(),
+                other => vec![response_to_duckv(other)],
+            }})
+            .collect(),
+        ResponseValue::Null => Vec::new(),
+        other => vec![vec![response_to_duckv(other)]],
+    }};
+    Ok(rows)
+}}
+
 impl CallbackGuest for Component {{
     fn call_scalar(
         handle: u32,
@@ -1403,10 +1839,10 @@ impl CallbackGuest for Component {{
     }}
 
     fn call_aggregate_col(
-        _handle: u32,
-        _args: Vec<bindings::duckdb::extension::column_types::Colvec>,
+        handle: u32,
+        args: Vec<bindings::duckdb::extension::column_types::Colvec>,
     ) -> Result<Duckvalue, Duckerror> {{
-        Err(Duckerror::Internal("call_aggregate_col: unsupported (Phase A)".to_string()))
+        dispatch_call_aggregate(handle, args)
     }}
 
     fn call_cast_col(
@@ -1427,8 +1863,8 @@ impl CallbackGuest for Component {{
         Err(Duckerror::Internal("call_cast_col: handle not identity (Phase A)".to_string()))
     }}
 
-    fn call_table(_handle: u32, _args: Vec<Duckvalue>) -> Result<Resultset, Duckerror> {{
-        Err(Duckerror::Internal("call_table: unsupported (Phase A)".to_string()))
+    fn call_table(handle: u32, args: Vec<Duckvalue>) -> Result<Resultset, Duckerror> {{
+        dispatch_call_table(handle, args)
     }}
 
     fn call_pragma(_handle: u32, _args: Vec<Duckvalue>) -> Result<Option<Duckvalue>, Duckerror> {{
