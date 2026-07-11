@@ -326,10 +326,24 @@ pub fn emit_dynlink(
     // matches the WIT-canonical (long) form. Without translation, a
     // call to `st_geomfromtext(...)` reaches the provider as method
     // `st-geomfromtext` and fails with `unknown method`.
+    // Scalar aliases feed the `canonical_for` translation the bridge
+    // uses to rewrite compact SQL names into the provider's canonical
+    // WIT method name. Aggregate + table aliases funnel through the
+    // same helper (see `canonical_for` at emit time) so they're
+    // collected together — a bridge that only ships scalars simply
+    // has no aggregate/table aliases to include. Guarded downstream
+    // by "arm registered on this bridge?" so an alias for a name that
+    // doesn't reach the dispatch set contributes zero dead arms.
     let scalar_aliases: Vec<(String, String)> = catalog
         .aliases
         .iter()
-        .filter(|a| a.kind == "scalar")
+        .filter(|a| {
+            a.kind == "scalar"
+                || a.kind == "aggregate"
+                || a.kind == "table"
+                || a.kind == "table_function"
+                || a.kind == "window_function"
+        })
         .map(|a| (a.alias.clone(), a.canonical.clone()))
         .collect();
 
@@ -665,11 +679,25 @@ fn lib_rs(
     // dispatch set are dropped too (there's no arm to route to).
     let scalar_name_set: std::collections::BTreeSet<&str> =
         scalar_names.iter().copied().collect();
+    let aggregate_name_set: std::collections::BTreeSet<&str> =
+        aggregate_names.iter().copied().collect();
+    let table_name_set: std::collections::BTreeSet<&str> =
+        table_names.iter().copied().collect();
     let mut alias_arms = String::new();
+    // Aliases across scalar / aggregate / table kinds fold into one
+    // `canonical_for` match: DuckDB dispatches on bare name and the
+    // bridge translates to the provider's canonical WIT method name.
+    // A given alias is retained iff BOTH sides register with DuckDB
+    // (else the arm is unreachable). Cross-kind mapping is fine —
+    // e.g. `st_dumppoints` (table) → `st_dump_points` (table).
     for (alias, canonical) in scalar_aliases {
-        if scalar_name_set.contains(alias.as_str())
-            && scalar_name_set.contains(canonical.as_str())
-        {
+        let alias_registered = scalar_name_set.contains(alias.as_str())
+            || aggregate_name_set.contains(alias.as_str())
+            || table_name_set.contains(alias.as_str());
+        let canonical_registered = scalar_name_set.contains(canonical.as_str())
+            || aggregate_name_set.contains(canonical.as_str())
+            || table_name_set.contains(canonical.as_str());
+        if alias_registered && canonical_registered {
             let a = alias.replace('"', "\\\"");
             let c = canonical.replace('"', "\\\"");
             alias_arms.push_str(&format!("        \"{a}\" => \"{c}\",\n"));
