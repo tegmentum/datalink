@@ -655,13 +655,50 @@ fn lib_rs(
     // (DuckDB doesn't have a separate window-registry — the engine
     // treats window = aggregate + frame); table functions land in
     // the `table-registry` capability.
+    // Window-only functions are lifted from the `window_functions`
+    // table into the aggregate list too — DuckDB's window path is
+    // aggregate + PARTITION/ORDER frame, so they SHOULD register the
+    // same way. In practice, window-only postgis clustering fns
+    // (st_cluster_dbscan, st_cluster_kmeans, ...) trap the guest at
+    // WindowAggregateExecutor::Sink time — the compose:dynlink
+    // dispatch shape doesn't match what a window-frame call expects
+    // (per-row result stream vs one-shot aggregate).
+    //
+    // Detect and drop them: functions present in `window_functions`
+    // BUT NOT in `aggregates` at the catalog level are window-only
+    // and skipping keeps LOAD-time registration clean + prevents the
+    // downstream guest trap. True aggregate/window duals (same name
+    // in both tables — infrequent) still register under aggregate
+    // semantics.
+    let aggregate_only: std::collections::BTreeSet<&str> = functions
+        .iter()
+        .filter(|(k, _)| *k == FnKind::Aggregate)
+        .map(|(_, n)| n.as_str())
+        .collect();
     let mut aggregate_names: Vec<&str> = functions
         .iter()
-        .filter(|(k, _)| *k == FnKind::Aggregate || *k == FnKind::Window)
+        .filter(|(k, n)| {
+            (*k == FnKind::Aggregate)
+                || (*k == FnKind::Window && aggregate_only.contains(n.as_str()))
+        })
         .map(|(_, n)| n.as_str())
         .collect();
     aggregate_names.sort();
     aggregate_names.dedup();
+    let mut window_only_skipped = 0usize;
+    for (kind, name) in functions.iter() {
+        if *kind == FnKind::Window && !aggregate_only.contains(name.as_str()) {
+            window_only_skipped += 1;
+        }
+    }
+    if window_only_skipped > 0 {
+        eprintln!(
+            "[duckdb-dynlink-emit] note: {window_only_skipped} window-only function(s) \
+             skipped from aggregate registration (compose:dynlink dispatch doesn't yet \
+             support DuckDB's per-row window frame semantics — traps the guest at \
+             WindowAggregateExecutor::Sink). Aggregate-form duals still register."
+        );
+    }
     let mut table_names: Vec<&str> = functions
         .iter()
         .filter(|(k, _)| *k == FnKind::Table)
