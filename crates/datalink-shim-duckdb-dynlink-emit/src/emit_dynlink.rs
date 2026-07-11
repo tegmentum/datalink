@@ -799,12 +799,31 @@ fn lib_rs(
     let mut aggregate_name_arms = String::new();
     let mut aggregate_register_calls = String::new();
     let mut missing_agg_sig_count = 0usize;
+    let mut skipped_agg_collision_count = 0usize;
     for (idx, name) in aggregate_names.iter().enumerate() {
         let arm_idx = idx as u32;
         let escaped = name.replace('"', "\\\"");
         aggregate_name_arms.push_str(&format!(
             "        {arm_idx} => Some(\"{escaped}\"),\n"
         ));
+        // Skip aggregate registration when the same name is ALSO a
+        // scalar — DuckDB rejects a duplicate registration under the
+        // same name and the whole aggregate register call fails at
+        // load time. `st_makeline`, `st_extent`, etc. are dual-role
+        // PostGIS names (scalar for `st_makeline(g1, g2)`, aggregate
+        // for `st_makeline(g) OVER (...)`) that both live in the
+        // interface DB. The scalar form wins for `SELECT
+        // st_makeline(...) FROM t` grammatically; the aggregate can
+        // still be invoked through its `-agg` / `-aggregate` alias
+        // (which the DB carries as a separate name — e.g. `st_makelineagg`).
+        //
+        // Emit the arm-idx name mapping either way so
+        // `aggregate_name_by_arm_idx` stays consistent with the arm
+        // count that the runtime handle table indexes.
+        if scalar_name_set.contains(*name) {
+            skipped_agg_collision_count += 1;
+            continue;
+        }
         let args_expr = if let Some(sig) = agg_sig_map.get(*name) {
             let mut args = String::from("vec![\n");
             for (i, tok) in sig.param_tokens.iter().enumerate() {
@@ -850,6 +869,14 @@ fn lib_rs(
         eprintln!(
             "[duckdb-dynlink-emit] warning: {missing_agg_sig_count} aggregate(s) had no \
              shim-interface signature (arity-1 Blob fallback used)."
+        );
+    }
+    if skipped_agg_collision_count > 0 {
+        eprintln!(
+            "[duckdb-dynlink-emit] note: {skipped_agg_collision_count} aggregate(s) skipped \
+             because a scalar with the same name is already registered (DuckDB rejects \
+             duplicate function names). Use the aggregate's dedicated `-agg` / `-aggregate` \
+             variant to invoke the aggregate form."
         );
     }
 
