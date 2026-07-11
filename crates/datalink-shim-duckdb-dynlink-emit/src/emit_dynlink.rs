@@ -1745,24 +1745,46 @@ fn dispatch_call_aggregate(
     let name = aggregate_name_by_arm_idx(arm_idx)
         .ok_or_else(|| Duckerror::Internal(format!("unknown aggregate arm {{}}", arm_idx)))?;
     let n_rows = validate_colvec_rows(&args)?;
-    let mut rows: Vec<CborValue> = Vec::with_capacity(n_rows);
-    let mut row_buf: Vec<Duckvalue> = Vec::with_capacity(args.len());
+    let n_args = args.len();
+    // Columnar wire shape for aggregate dispatch: each column becomes a
+    // separate positional arg to the provider, containing a FLAT list
+    // of that column's per-row CBOR values. For a single-arg aggregate
+    // like `st_extent(geom)`, the provider sees `args=[List<Bytes>]` —
+    // arg[0] is the flat geometry list, arg[0][0] is a Bytes geometry
+    // (matches the shim's expected shape per the arg-shape checker's
+    // error message on prior versions of this dispatch).
+    //
+    // Previous wire (broken) was `args=[List<List<CborValue>>]` — one
+    // arg containing a list of per-row lists. The shim's arg-type
+    // checker on `st-extent` etc. read `arg[0][0]` as List (a row) and
+    // failed shape mismatch (expected Bytes for the geometry).
+    //
+    // SQL-aggregate NULL-row semantics: skip rows where ANY arg is
+    // NULL (matches sum() / avg() defaults) — do the skip BEFORE
+    // transposing to columns so all columns see the same row subset.
+    let mut cols: Vec<Vec<CborValue>> = (0..n_args)
+        .map(|_| Vec::with_capacity(n_rows))
+        .collect();
+    let mut row_buf: Vec<Duckvalue> = Vec::with_capacity(n_args);
     for i in 0..n_rows {{
         materialize_row(&args, i, &mut row_buf);
-        // SQL-aggregate NULL-row semantics: rows where any arg is
-        // NULL are skipped (mirrors sum() / avg() defaults).
         if row_buf.iter().any(|v| matches!(v, Duckvalue::Null)) {{
             continue;
         }}
-        let cbor_row: Vec<CborValue> = row_buf.iter().map(duckv_to_cbor).collect();
-        rows.push(CborValue::List(cbor_row));
+        for (col_idx, v) in row_buf.iter().enumerate() {{
+            cols[col_idx].push(duckv_to_cbor(v));
+        }}
     }}
-    if rows.is_empty() {{
+    // Empty non-null row set → aggregate is NULL (matches SQL
+    // `SELECT SUM(x) FROM t WHERE 1=0` = NULL). Skip the provider
+    // call so the shim doesn't need to special-case empty inputs.
+    if cols.first().map_or(true, |c| c.is_empty()) {{
         return Ok(Duckvalue::Null);
     }}
     let canonical = canonical_for(name);
     let method = canonical.replace('_', "-");
-    let resp = call(&method, vec![CborValue::List(rows)])?;
+    let cbor_args: Vec<CborValue> = cols.into_iter().map(CborValue::List).collect();
+    let resp = call(&method, cbor_args)?;
     Ok(response_to_duckv(resp))
 }}
 
