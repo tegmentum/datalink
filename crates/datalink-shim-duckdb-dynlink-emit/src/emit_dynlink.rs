@@ -63,12 +63,16 @@ pub(crate) struct AggregateSig {
 }
 
 /// Per-table-function signature loaded from `table_functions` in the
-/// shim-interface DB. Same shape as aggregates — no return schema; the
-/// dynlink emit declares a single BLOB output column, and the provider
-/// streams rows through the CBOR envelope's List-of-Bytes response.
+/// shim-interface DB. `output_columns` carries the row schema
+/// `[(name, type_token), ...]` when the shim's `output_schema` arm
+/// advertised one at extract time — the emit renders it into a
+/// `Vec<Columndef>` at register time. If `None`, the emit falls back
+/// to a single opaque `result BLOB` column (pre-B5 behavior; the
+/// provider is free to stream any BLOB shape).
 #[derive(Debug, Clone)]
 pub(crate) struct TableSig {
     pub param_tokens: Vec<String>,
+    pub output_columns: Option<Vec<(String, String)>>,
 }
 
 /// Load `SELECT name, param_types_json, return_type FROM scalars
@@ -188,22 +192,46 @@ pub(crate) fn load_table_sigs(
     )
     .with_context(|| format!("opening shim-interface sqlite: {}", sqlite.display()))?;
     let mut stmt = conn.prepare(
-        "SELECT name, param_types_json FROM table_functions WHERE extension = ?1",
+        "SELECT name, param_types_json, output_columns_json \
+         FROM table_functions WHERE extension = ?1",
     )?;
     let rows = stmt.query_map([extension], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
     })?;
     let mut out: HashMap<String, TableSig> = HashMap::new();
     let mut multi_overload_count = 0usize;
     for row in rows {
-        let (name, param_json) = row?;
+        let (name, param_json, output_columns_json) = row?;
         let outer: Vec<Vec<String>> = serde_json::from_str(&param_json)
             .with_context(|| format!("parsing param_types_json for table_function {name}"))?;
         if outer.len() > 1 {
             multi_overload_count += 1;
         }
         let param_tokens = outer.into_iter().next().unwrap_or_default();
-        out.insert(name, TableSig { param_tokens });
+        let output_columns = match output_columns_json.as_deref() {
+            Some(s) if !s.is_empty() && s != "[]" => {
+                let cols: Vec<[String; 2]> = serde_json::from_str(s).with_context(|| {
+                    format!("parsing output_columns_json for table_function {name}")
+                })?;
+                Some(
+                    cols.into_iter()
+                        .map(|[n, t]| (n, t))
+                        .collect::<Vec<(String, String)>>(),
+                )
+            }
+            _ => None,
+        };
+        out.insert(
+            name,
+            TableSig {
+                param_tokens,
+                output_columns,
+            },
+        );
     }
     if multi_overload_count > 0 {
         eprintln!(
@@ -932,7 +960,7 @@ fn lib_rs(
         table_name_arms.push_str(&format!(
             "        {arm_idx} => Some(\"{escaped}\"),\n"
         ));
-        let args_expr = if let Some(sig) = table_sig_map.get(*name) {
+        let (args_expr, columns_expr) = if let Some(sig) = table_sig_map.get(*name) {
             let mut args = String::from("vec![\n");
             for (i, tok) in sig.param_tokens.iter().enumerate() {
                 let lit = token_to_logicaltype_lit(tok);
@@ -941,11 +969,32 @@ fn lib_rs(
                 ));
             }
             args.push_str("            ]");
-            args
+            let cols = if let Some(output_cols) = &sig.output_columns {
+                let mut c = String::from("vec![\n");
+                for (col_name, tok) in output_cols {
+                    let lit = token_to_logicaltype_lit(tok);
+                    let escaped_col = col_name.replace('"', "\\\"");
+                    c.push_str(&format!(
+                        "                runtime::Columndef {{ name: \"{escaped_col}\".into(), logical: {lit} }},\n"
+                    ));
+                }
+                c.push_str("            ]");
+                c
+            } else {
+                String::from(
+                    "vec![\n                runtime::Columndef { name: \"result\".into(), logical: Logicaltype::Blob },\n            ]",
+                )
+            };
+            (args, cols)
         } else {
             missing_table_sig_count += 1;
-            String::from(
-                "vec![\n                runtime::Funcarg { name: Some(\"arg0\".into()), logical: Logicaltype::Blob },\n            ]",
+            (
+                String::from(
+                    "vec![\n                runtime::Funcarg { name: Some(\"arg0\".into()), logical: Logicaltype::Blob },\n            ]",
+                ),
+                String::from(
+                    "vec![\n                runtime::Columndef { name: \"result\".into(), logical: Logicaltype::Blob },\n            ]",
+                ),
             )
         };
         table_register_calls.push_str(&format!(
@@ -957,10 +1006,7 @@ fn lib_rs(
             .insert(handle, {arm_idx}usize);
         let callback = runtime::TableCallback::new(handle);
         let args: Vec<runtime::Funcarg> = {args_expr};
-        let columns: Vec<runtime::Columndef> = vec![runtime::Columndef {{
-            name: "result".into(),
-            logical: Logicaltype::Blob,
-        }}];
+        let columns: Vec<runtime::Columndef> = {columns_expr};
         registry.register(
             "{escaped}",
             &args,
