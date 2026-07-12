@@ -37,7 +37,7 @@ pub mod sql_extension_catalog;
 
 pub use emit_dynlink::emit_dynlink;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -53,11 +53,22 @@ use anyhow::{Context, Result};
 ///   package names, provider-crate lookup, and README text.
 /// * `target` — leaf id or umbrella id from the catalog. Determines
 ///   which functions the emitted bridge advertises + dispatches.
+/// * `interface_sqlite` — optional path to the sibling shim-interface
+///   `.sqlite` (e.g. `~/git/postgis-shim-interface/postgis-interface.sqlite`).
+///   When provided, the emitter loads `table_functions.param_types_json`
+///   + `output_columns_json` and emits a per-vtab `connect` schema
+///   arm that advertises the real output columns + arg arity, so
+///   SQL like `WHERE ST_X(point) > 1` resolves against the actual
+///   UDTF column name instead of the opaque `result` fallback. When
+///   `None`, the emitter falls back to the pre-schema-lift shape:
+///   `CREATE TABLE x("result" BLOB, "_arg0..3" HIDDEN)`. Mirrors
+///   the sibling duckdb-dynlink crate's `DynlinkOptions.interface_sqlite`.
 pub struct DynlinkOptions {
     pub provider_id: String,
     pub sub_ext: String,
     pub extension_root: String,
     pub target: String,
+    pub interface_sqlite: Option<PathBuf>,
 }
 
 /// Public entry point.
@@ -98,6 +109,7 @@ mod smoke {
             sub_ext: "sub".into(),
             extension_root: "root".into(),
             target: "t".into(),
+            interface_sqlite: None,
         };
     }
 }

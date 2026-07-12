@@ -54,6 +54,7 @@
 //!
 //! Collation / hook exports remain OMITTED at this phase.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -61,6 +62,122 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::sql_extension_catalog::{Catalog, FnKind, LeavesOverlay};
 use crate::DynlinkOptions;
+
+/// Per-table-function signature loaded from `table_functions` in the
+/// shim-interface DB. Mirrors the sibling
+/// `datalink_shim_duckdb_dynlink_emit::emit_dynlink::TableSig` shape.
+///
+/// `output_columns` carries the row schema `[(name, type_token), ...]`
+/// when the shim's `output_schema` arm advertised one at extract time
+/// — the emit renders it into a per-vtab `CREATE TABLE x(...)` schema
+/// at register time. If `None`, the emit falls back to the pre-schema-
+/// lift shape: `CREATE TABLE x("result" BLOB, "_arg0..3" HIDDEN)`.
+///
+/// `param_tokens` gives the argv arity — one HIDDEN slot per positional
+/// arg is emitted alongside the output columns. Type tokens are drawn
+/// from the closed set the shim-interface ingester produces
+/// (`binary` | `boolean` | `float64` | `int64` | `text`).
+#[derive(Debug, Clone)]
+pub(crate) struct TableSig {
+    pub param_tokens: Vec<String>,
+    pub output_columns: Option<Vec<(String, String)>>,
+}
+
+/// Load `SELECT name, param_types_json, output_columns_json FROM
+/// table_functions WHERE extension = ?` into a name→signature map.
+///
+/// `param_types_json` is a JSON `array-of-arrays`; the current
+/// extension catalogs carry a single overload group per name so we
+/// take element 0. `output_columns_json` is a JSON array of `[name,
+/// type_token]` pairs, absent (or an empty `[]`) for legacy rows
+/// that predate the B5 schema lift.
+pub(crate) fn load_table_sigs(
+    sqlite: &Path,
+    extension: &str,
+) -> Result<HashMap<String, TableSig>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        sqlite,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening shim-interface sqlite: {}", sqlite.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT name, param_types_json, output_columns_json \
+         FROM table_functions WHERE extension = ?1",
+    )?;
+    let rows = stmt.query_map([extension], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut out: HashMap<String, TableSig> = HashMap::new();
+    let mut multi_overload_count = 0usize;
+    for row in rows {
+        let (name, param_json, output_columns_json) = row?;
+        let outer: Vec<Vec<String>> = serde_json::from_str(&param_json)
+            .with_context(|| format!("parsing param_types_json for table_function {name}"))?;
+        if outer.len() > 1 {
+            multi_overload_count += 1;
+        }
+        let param_tokens = outer.into_iter().next().unwrap_or_default();
+        let output_columns = match output_columns_json.as_deref() {
+            Some(s) if !s.is_empty() && s != "[]" => {
+                let cols: Vec<[String; 2]> = serde_json::from_str(s).with_context(|| {
+                    format!("parsing output_columns_json for table_function {name}")
+                })?;
+                Some(
+                    cols.into_iter()
+                        .map(|[n, t]| (n, t))
+                        .collect::<Vec<(String, String)>>(),
+                )
+            }
+            _ => None,
+        };
+        out.insert(
+            name,
+            TableSig {
+                param_tokens,
+                output_columns,
+            },
+        );
+    }
+    if multi_overload_count > 0 {
+        eprintln!(
+            "[sqlite-dynlink-emit] warning: {multi_overload_count} table_function(s) with >1 overload \
+             group; using the first (Phase A behaviour)."
+        );
+    }
+    Ok(out)
+}
+
+/// Map a shim-interface type token to a SQLite column-type keyword
+/// suitable for the `CREATE TABLE x(...)` schema the vtab advertises.
+///
+/// SQLite uses dynamic typing with column-declared "type affinity"
+/// rather than strict types — declaring a column `INTEGER` doesn't
+/// prevent a row from storing a BLOB in it. The mapping below picks
+/// the affinity that best matches the token so the query planner
+/// gets sensible default-collation + sorting behaviour:
+///
+///   * `binary`  → BLOB (BLOB affinity, no coercion)
+///   * `boolean` → INTEGER (SQLite has no BOOL type; 0/1 in an INT)
+///   * `int64`   → INTEGER
+///   * `float64` → REAL
+///   * `text`    → TEXT
+///
+/// Unknown tokens fall back to BLOB, matching the pre-schema-lift
+/// bridge's opaque wire shape.
+fn token_to_sqlite_type(token: &str) -> &'static str {
+    match token {
+        "binary" => "BLOB",
+        "boolean" => "INTEGER",
+        "int64" => "INTEGER",
+        "float64" => "REAL",
+        "text" => "TEXT",
+        _ => "BLOB",
+    }
+}
 
 /// Emit a Dynlink-mode sqlite bridge crate under `out_dir`.
 ///
@@ -140,6 +257,32 @@ pub fn emit_dynlink(
         .map(|a| (a.alias.clone(), a.canonical.clone()))
         .collect();
 
+    // Load per-vtab signatures from the sibling shim-interface DB, if
+    // provided. Every table-function name the catalog surfaces SHOULD
+    // have a matching row so the vtab.connect schema arm advertises
+    // the real output columns + arg arity; when absent (either the DB
+    // wasn't passed, or a specific fn hasn't been extracted with a B5
+    // `output_columns_json`), that fn falls back to the pre-schema-
+    // lift opaque `result BLOB` + 4 hidden slots shape.
+    let table_sig_map = match opts.interface_sqlite.as_deref() {
+        Some(p) => load_table_sigs(p, &catalog.meta.extension).with_context(|| {
+            format!(
+                "loading table_function signatures from shim-interface: {}",
+                p.display()
+            )
+        })?,
+        None => {
+            if has_tables {
+                eprintln!(
+                    "[sqlite-dynlink-emit] warning: no --interface sqlite provided; \
+                     emitting opaque single-BLOB vtab schema for every table_function \
+                     (pre-B5 fallback shape)."
+                );
+            }
+            HashMap::new()
+        }
+    };
+
     let lib_src = lib_rs(
         &opts.provider_id,
         &opts.extension_root,
@@ -147,6 +290,7 @@ pub fn emit_dynlink(
         &version,
         functions.iter().collect::<Vec<_>>().as_slice(),
         &scalar_aliases,
+        &table_sig_map,
     );
     fs::write(out_dir.join("src/lib.rs"), lib_src)?;
 
@@ -398,6 +542,7 @@ fn lib_rs(
     version: &str,
     functions: &[&(FnKind, String)],
     scalar_aliases: &[(String, String)],
+    table_sig_map: &HashMap<String, TableSig>,
 ) -> String {
     let mut scalar_names: Vec<&str> = functions
         .iter()
@@ -686,6 +831,80 @@ impl AggregateGuest for Component {{
         (String::new(), String::new(), "aggregate_functions: vec![],", String::new())
     };
 
+    // ── Per-vtab connect schema arms ──
+    //
+    // For every table_function surfaced above, build a match arm that
+    // returns a `CREATE TABLE x(<real cols>, <hidden argv slots>)`
+    // schema string. Real column names + affinities come from the
+    // shim-interface DB's `table_functions.output_columns_json`;
+    // argv arity comes from `param_types_json`'s length. When the DB
+    // wasn't threaded through (or a specific fn's row is missing /
+    // pre-B5), that arm falls back to the pre-schema-lift shape so a
+    // codegen run without `--interface` still produces a valid crate.
+    //
+    // Schema fallback (both when no sig, and as the final `_` arm for
+    // unknown vtab ids the manifest never advertised): one opaque
+    // `result` BLOB column + four hidden `_arg0..3` slots. The four-
+    // hidden-slot upper bound tracks the max UDTF arity in current
+    // postgis / mobilitydb catalogs (5) — the query planner leaves
+    // unused slots alone and binds the used ones through xBestIndex.
+    let mut vtab_connect_arms = String::new();
+    let mut missing_vtab_sig_count = 0usize;
+    for (idx, name) in table_names.iter().enumerate() {
+        let id = vtab_base_id + idx as u64;
+        let schema = match table_sig_map.get(*name) {
+            Some(sig) => {
+                let mut parts: Vec<String> = Vec::new();
+                let cols = sig.output_columns.as_deref();
+                match cols {
+                    Some(cols) if !cols.is_empty() => {
+                        for (col_name, tok) in cols {
+                            let escaped = col_name.replace('"', "\\\"");
+                            let ty = token_to_sqlite_type(tok);
+                            parts.push(format!("\\\"{escaped}\\\" {ty}"));
+                        }
+                    }
+                    _ => {
+                        // A row with a known arity but no output_schema
+                        // arm — pre-B5 wire shape. Preserve the opaque
+                        // single-BLOB column so the provider's List-of-
+                        // Bytes response still lands somewhere.
+                        parts.push("\\\"result\\\" BLOB".to_string());
+                    }
+                }
+                for i in 0..sig.param_tokens.len() {
+                    parts.push(format!("\\\"_arg{i}\\\" HIDDEN"));
+                }
+                // Every eponymous vtab needs at least one HIDDEN argv
+                // slot — otherwise SQLite can't route positional args
+                // from the SELECT-from-fn(...) syntax. When arity is
+                // zero (unlikely but valid), synthesise one slot so
+                // the query planner still has something to bind.
+                if sig.param_tokens.is_empty() {
+                    parts.push("\\\"_arg0\\\" HIDDEN".to_string());
+                }
+                format!("CREATE TABLE x({})", parts.join(", "))
+            }
+            None => {
+                missing_vtab_sig_count += 1;
+                // Pre-schema-lift fallback shape. Byte-identical to
+                // what the previous emit hard-coded for every vtab.
+                "CREATE TABLE x(\\\"result\\\" BLOB, \
+                 \\\"_arg0\\\" HIDDEN, \\\"_arg1\\\" HIDDEN, \\\"_arg2\\\" HIDDEN, \\\"_arg3\\\" HIDDEN)"
+                    .to_string()
+            }
+        };
+        vtab_connect_arms.push_str(&format!(
+            "                {id} => Ok(\"{schema}\".to_string()),\n"
+        ));
+    }
+    if missing_vtab_sig_count > 0 {
+        eprintln!(
+            "[sqlite-dynlink-emit] warning: {missing_vtab_sig_count} table_function(s) had no \
+             shim-interface signature (opaque single-BLOB vtab schema fallback used)."
+        );
+    }
+
     let (vtab_import, vtab_manifest_local, vtab_manifest_field, vtab_impl_block) = if has_tables {
         let import = "use bindings::exports::sqlite::extension::vtab::{Guest as VtabGuest, IndexInfo, IndexPlan, VtabRow};\nuse bindings::exports::sqlite::extension::metadata::VtabSpec;\n";
         let manifest_local = format!(
@@ -741,19 +960,18 @@ impl VtabGuest for Component {{
         _table_name: String,
         _args: Vec<String>,
     ) -> Result<String, String> {{
-        let _ = vtab_name_by_id(vtab_id)
-            .ok_or_else(|| format!("unknown vtab id {{}}", vtab_id))?;
-        // Single-column BLOB schema. Hidden `_arg0..3` covers up to a
-        // 4-arg UDTF call form; sqlite's query planner leaves unused
-        // slots alone and binds the used ones through xBestIndex. The
-        // catalog carries no per-vtab arity today, so hardcoding 4
-        // hidden slots is a safe upper bound (max postgis / mobilitydb
-        // UDTF arity today is 5 — extend as needed).
-        Ok(
-            "CREATE TABLE x(\"result\" BLOB, \
-             \"_arg0\" HIDDEN, \"_arg1\" HIDDEN, \"_arg2\" HIDDEN, \"_arg3\" HIDDEN)"
-                .to_string(),
-        )
+        // Per-vtab CREATE TABLE schema. Each arm was emitted from
+        // the shim-interface DB's `table_functions.output_columns_json`
+        // + `param_types_json.len()` — real output column names +
+        // affinities, hidden slot per positional argv. The final `_`
+        // arm covers vtab ids the manifest never advertised (unknown
+        // to this bridge — surface as an error so callers see the
+        // mismatch immediately) and functions whose shim-interface row
+        // predates the B5 `output_columns_json` schema (opaque single-
+        // BLOB fallback with 4 hidden argv slots).
+        match vtab_id {{
+{vtab_connect_arms}            _ => Err(format!("unknown vtab id {{}}", vtab_id)),
+        }}
     }}
 
     fn destroy(_vtab_id: u64, _instance_id: u64) -> Result<(), String> {{ Ok(()) }}
