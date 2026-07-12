@@ -127,10 +127,16 @@ pub fn emit_dynlink(
     // Without translation, a call to `st_geomfromtext(...)` reaches
     // the provider as method `st-geomfromtext` and fails with
     // `unknown method`.
+    // Collect scalar + table-function aliases together — both dispatch
+    // paths (`dispatch_call_scalar` for scalars, `dispatch_call_table`
+    // for UDTFs via the vtab arm) run the wire method through
+    // `canonical_for(name).replace('_', '-')`, so the compact-form
+    // spelling of a UDTF (e.g. `st_dumppoints`) needs the same
+    // canonical→WIT-name propagation the scalar path relies on.
     let scalar_aliases: Vec<(String, String)> = catalog
         .aliases
         .iter()
-        .filter(|a| a.kind == "scalar")
+        .filter(|a| a.kind == "scalar" || a.kind == "table_function")
         .map(|a| (a.alias.clone(), a.canonical.clone()))
         .collect();
 
@@ -436,8 +442,17 @@ fn lib_rs(
     // there's no dispatch site that could reach it. Aliases whose
     // canonical form is missing from the dispatch set are dropped
     // too (no arm to route to).
-    let scalar_name_set: std::collections::BTreeSet<&str> =
-        scalar_names.iter().copied().collect();
+    // Include table-function names in the alias arm filter — both
+    // `st_dumppoints` (compact) and `st_dump_points` (canonical) live
+    // in `table_names`, and both need to be in the emitted
+    // `canonical_for` for the UDTF vtab.filter path to route them
+    // through their long form before the kebab-cased method hits the
+    // provider dispatch.
+    let scalar_name_set: std::collections::BTreeSet<&str> = scalar_names
+        .iter()
+        .chain(table_names.iter())
+        .copied()
+        .collect();
     let mut alias_arms = String::new();
     for (alias, canonical) in scalar_aliases {
         if scalar_name_set.contains(alias.as_str())
@@ -728,10 +743,17 @@ impl VtabGuest for Component {{
     ) -> Result<String, String> {{
         let _ = vtab_name_by_id(vtab_id)
             .ok_or_else(|| format!("unknown vtab id {{}}", vtab_id))?;
-        // Single-column BLOB schema. Hidden `_arg0` matches the
-        // table-valued-function call form `f(g1)` — the query
-        // planner binds the argv slot through xBestIndex.
-        Ok("CREATE TABLE x(\"result\" BLOB, \"_arg0\" HIDDEN)".to_string())
+        // Single-column BLOB schema. Hidden `_arg0..3` covers up to a
+        // 4-arg UDTF call form; sqlite's query planner leaves unused
+        // slots alone and binds the used ones through xBestIndex. The
+        // catalog carries no per-vtab arity today, so hardcoding 4
+        // hidden slots is a safe upper bound (max postgis / mobilitydb
+        // UDTF arity today is 5 — extend as needed).
+        Ok(
+            "CREATE TABLE x(\"result\" BLOB, \
+             \"_arg0\" HIDDEN, \"_arg1\" HIDDEN, \"_arg2\" HIDDEN, \"_arg3\" HIDDEN)"
+                .to_string(),
+        )
     }}
 
     fn destroy(_vtab_id: u64, _instance_id: u64) -> Result<(), String> {{ Ok(()) }}
