@@ -100,10 +100,32 @@ pub(crate) fn load_table_sigs(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("opening shim-interface sqlite: {}", sqlite.display()))?;
-    let mut stmt = conn.prepare(
+    // Pre-B5 interface DBs (~/git/*-shim-interface with sqlite files
+    // predating shim-interface-core@f529f5c) don't have the
+    // output_columns_json column. Detect and fall back to the pre-B5
+    // 2-column query so those catalogs still emit valid bridges (they
+    // just get the opaque single-BLOB vtab schema fallback).
+    let has_output_columns: bool = {
+        let mut s = conn.prepare("PRAGMA table_info(table_functions)")?;
+        let mut rows = s.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "output_columns_json" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    let query = if has_output_columns {
         "SELECT name, param_types_json, output_columns_json \
-         FROM table_functions WHERE extension = ?1",
-    )?;
+         FROM table_functions WHERE extension = ?1"
+    } else {
+        "SELECT name, param_types_json, NULL as output_columns_json \
+         FROM table_functions WHERE extension = ?1"
+    };
+    let mut stmt = conn.prepare(query)?;
     let rows = stmt.query_map([extension], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -378,11 +400,15 @@ fn world_wit(sub_ext: &str, has_aggs: bool, has_tables: bool) -> String {
     } else {
         ""
     };
-    let vtab_export = if has_tables {
-        "\n    export sqlite:extension/vtab@1.0.0;"
-    } else {
-        ""
-    };
+    // Always export vtab. The sqlink host wraps every dynlink bridge in
+    // the `tabular` bindings (metadata + scalar-function + vtab), so the
+    // bridge world MUST export vtab even when the catalog surfaces no
+    // table-functions — otherwise wasmtime instantiation fails with
+    // "no exported instance named `sqlite:extension/vtab@1.0.0`" at
+    // load time. When has_tables is false, the emitted VtabGuest impl
+    // is unreachable (vtab_id lookup returns None for every id).
+    let _ = has_tables;
+    let vtab_export = "\n    export sqlite:extension/vtab@1.0.0;";
     format!(
         r#"package sqlite-bridge:{pkg}@0.1.0;
 
@@ -905,7 +931,14 @@ impl AggregateGuest for Component {{
         );
     }
 
-    let (vtab_import, vtab_manifest_local, vtab_manifest_field, vtab_impl_block) = if has_tables {
+    // Always emit the VtabGuest impl + import — vtab is now an
+    // unconditional export (see world_wit's comment). When has_tables
+    // is false, vtab_id_arms/vtab_specs/vtab_connect_arms are all
+    // empty strings, so the emitted impl is structurally valid but
+    // returns "unknown vtab id" for every call (unreachable in
+    // practice: sqlite never dispatches to a vtab the manifest didn't
+    // advertise).
+    let (vtab_import, vtab_manifest_local, vtab_manifest_field, vtab_impl_block) = {
         let import = "use bindings::exports::sqlite::extension::vtab::{Guest as VtabGuest, IndexInfo, IndexPlan, VtabRow};\nuse bindings::exports::sqlite::extension::metadata::VtabSpec;\n";
         let manifest_local = format!(
             "        let vtabs: Vec<VtabSpec> = vec![\n{vtab_specs}        ];\n",
@@ -1138,8 +1171,6 @@ fn response_value_to_cbor(v: ResponseValue) -> CborValue {{
 "##,
         );
         (import.to_string(), manifest_local, manifest_field, impl_block)
-    } else {
-        (String::new(), String::new(), "vtabs: vec![],", String::new())
     };
 
     let extension_root = extension_root.to_string();
