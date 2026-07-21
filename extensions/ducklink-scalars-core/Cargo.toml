@@ -1,0 +1,14 @@
+[package]
+name = "ducklink-scalars-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the two always-available ducklink control-plane scalars: ducklink_version() and ducklink_help(name). Backs the ducklink SQL surface committed in ducklink-extension's STABILITY.md § 1.1 for cross-host conformance."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "ducklink_scalars_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
