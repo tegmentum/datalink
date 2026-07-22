@@ -41,7 +41,7 @@
 extern crate alloc;
 
 pub use datalink_valuemodel::{
-    CapabilityKind, FnDecl, NeutralColVec, NeutralColumn, NeutralType, NeutralValue,
+    CapabilityKind, ColDecl, FnDecl, NeutralColVec, NeutralColumn, NeutralType, NeutralValue,
     NullHandling,
 };
 
@@ -289,6 +289,32 @@ pub trait ExtCore {
         let _ = rows;
         Err(alloc::format!(
             "{}: function index {} is not an aggregate",
+            Self::NAME,
+            idx
+        ))
+    }
+
+    /// Invoke the table-valued function at index `idx` in [`Self::DECLS`]
+    /// with a single input row of neutral arguments; produce zero or more
+    /// output rows, each carrying one [`NeutralValue`] per column in
+    /// [`FnDecl::columns`] order.
+    ///
+    /// The `duckdb:extension` host makes ONE `call_table(handle, args)`
+    /// per call site (`args` is a single argument list, not a batch — the
+    /// TVF's INPUT is one row, its OUTPUT is many). The `Resultset` the
+    /// generated shim returns is exactly this `Vec<Vec<NeutralValue>>`
+    /// with each inner vec marshalled to `Vec<Duckvalue>`.
+    ///
+    /// The default returns an error so scalar-only / scalar+aggregate
+    /// cores need not implement it; [`declare!`](crate::declare) overrides
+    /// it whenever a `table` capability is declared.
+    fn dispatch_table(
+        idx: usize,
+        args: &[NeutralValue],
+    ) -> Result<Vec<Vec<NeutralValue>>, String> {
+        let _ = args;
+        Err(alloc::format!(
+            "{}: function index {} is not a table",
             Self::NAME,
             idx
         ))

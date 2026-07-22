@@ -275,22 +275,60 @@ pub enum CapabilityKind {
     /// makes ONE `call_aggregate`, so the fold runs entirely in-guest and
     /// the state never crosses the WIT boundary (no state marshalling).
     Aggregate,
+    /// A table-valued function: N neutral args in, a set of rows out.
+    /// Each output row carries a value per column declared in
+    /// [`FnDecl::columns`]. On `duckdb:extension` the host calls
+    /// `call_table` and receives a `Resultset` (`list<list<duckvalue>>`).
+    ///
+    /// Design choice — kept `FnDecl` as a flat struct (rather than
+    /// splitting into `enum FnDecl { Scalar/Aggregate/Table(...) }`)
+    /// because `columns` is the ONLY new field a table declaration adds
+    /// on top of the existing scalar/aggregate fields (args/ret/kind);
+    /// the empty-slice default keeps scalar/aggregate declarations
+    /// literal-compatible without an enum-visitor overhaul of every
+    /// existing shim (all six shims iterate `.kind`, `.args`, `.ret`).
+    /// The only downstream callers of `FnDecl { ... }` literals live
+    /// inside `datalink-extcore/src/declare.rs` itself, so the field
+    /// addition is a strictly-local change.
+    Table,
+}
+
+/// One column of a table-valued function's output schema. A `Table`
+/// declaration carries `&'static [ColDecl]` in [`FnDecl::columns`]; the
+/// `duckdb:extension` shim maps each entry to a
+/// `runtime::Columndef { name, logical }` when it registers the TVF.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColDecl {
+    /// The column's SQL-visible name (e.g. `"query_key"`).
+    pub name: &'static str,
+    /// The column's neutral type. Follows the FROZEN closed set; ride
+    /// [`NeutralType::Complex`] for anything outside it.
+    pub ntype: NeutralType,
 }
 
 /// One declared function in an extension's capability table. A
 /// [`slice`](core::slice) of these IS the extension's neutral surface;
 /// both per-DB shims are derived from it, so surface drift between the
 /// two databases becomes structurally impossible.
+///
+/// `columns` and `replacement_scan_extensions` are meaningful only for
+/// [`CapabilityKind::Table`] entries and default to empty for
+/// scalar/aggregate. The struct stays flat (not an enum) because every
+/// consuming shim already iterates `.kind`/`.args`/`.ret`; keeping the
+/// shape the same means only the three literal sites in
+/// `datalink-extcore/src/declare.rs` need updating.
 #[derive(Clone, Debug)]
 pub struct FnDecl {
     /// The SQL-visible function name (e.g. `"aba_validate"`).
     pub name: &'static str,
-    /// The capability kind ([`CapabilityKind::Scalar`] or
-    /// [`CapabilityKind::Aggregate`]).
+    /// The capability kind ([`CapabilityKind::Scalar`],
+    /// [`CapabilityKind::Aggregate`] or [`CapabilityKind::Table`]).
     pub kind: CapabilityKind,
     /// The neutral argument types, in order.
     pub args: &'static [NeutralType],
-    /// The neutral return type.
+    /// The neutral return type. For [`CapabilityKind::Table`] this is
+    /// unused (the per-column types live in `columns`); by convention the
+    /// codegen sets it to [`NeutralType::Complex`] with a `"TABLE"` tag.
     pub ret: NeutralType,
     /// The NULL-argument contract.
     pub null_handling: NullHandling,
@@ -298,4 +336,13 @@ pub struct FnDecl {
     /// Maps to DuckDB `Funcflags::DETERMINISTIC` / SQLite
     /// `FunctionFlags::DETERMINISTIC`.
     pub deterministic: bool,
+    /// Output columns for a [`CapabilityKind::Table`] entry, in declared
+    /// order. Empty for scalar/aggregate.
+    pub columns: &'static [ColDecl],
+    /// For a [`CapabilityKind::Table`] entry: file extensions (no dot,
+    /// lower-case, e.g. `"gb"`, `"gbk"`) the shim should wire to a
+    /// DuckDB replacement scan for this table function. Empty means "no
+    /// replacement scan"; consuming shims that do not support this feature
+    /// (e.g. `sqlite_shim!`) ignore it.
+    pub replacement_scan_extensions: &'static [&'static str],
 }

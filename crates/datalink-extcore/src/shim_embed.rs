@@ -108,10 +108,17 @@ macro_rules! embed_shim {
         pub unsafe fn register_into(
             db: *mut ::libsqlite3_sys::sqlite3,
         ) -> ::core::ffi::c_int {
+            // T5: only Scalar decls belong on the embed path (aggregates
+            // stay on the WIT stateful shim; tables ride the sqlite vtab
+            // shape, unwritten here). Filter defensively so a mixed core
+            // still links its scalars.
             let specs: ::alloc::vec::Vec<ScalarSpec> =
                 <EmbedCore as $crate::ExtCore>::DECLS
                     .iter()
                     .enumerate()
+                    .filter(|(_, decl)| {
+                        matches!(decl.kind, $crate::CapabilityKind::Scalar)
+                    })
                     .map(|(idx, decl)| ScalarSpec {
                         func_id: (idx as u64) + 1,
                         name: <EmbedCore>::SCALAR_NAMES_NUL[idx],

@@ -2,6 +2,21 @@
 //! once, and gets the [`ExtCore`](crate::ExtCore) impl (the `DECLS`
 //! slice + the neutral `dispatch`) for free. The per-DB shims are then
 //! generated from that single declaration.
+//!
+//! The macro exposes four arms — pick whichever fits your core's
+//! capability mix:
+//!
+//! | arm                              | must have         | may have               |
+//! |----------------------------------|-------------------|------------------------|
+//! | scalar-only                      | `+` scalar        | -                      |
+//! | scalar + aggregate               | `+` aggregate     | `*` scalar             |
+//! | pure table (this file, T3)       | `+` table         | -                      |
+//! | mixed (scalar/aggregate/table)   | `+` table         | `*` scalar, `*` agg    |
+//!
+//! Existing scalar-only and scalar+aggregate cores continue to compile
+//! byte-for-byte because their arms come first and their `+` repetition
+//! anchors them (a `table` decl trailing after scalars/aggregates fails
+//! to satisfy either arm and cascades to the table-bearing arms).
 
 /// Map a neutral-type token to a [`NeutralType`](crate::NeutralType).
 /// This is the closed FROZEN set plus the `complex("expr")` escape hatch
@@ -25,14 +40,10 @@ macro_rules! __nullh {
     (called)    => { $crate::NullHandling::Called };
 }
 
-/// Declare an extension core: its name/version and a list of scalar
-/// functions, each with neutral arg types, a neutral return type, a
-/// null-handling contract, a determinism flag, and a body closure over
-/// `&[NeutralValue] -> Result<NeutralValue, String>`.
+/// Declare an extension core: its name/version and a list of scalar,
+/// aggregate, and/or table functions.
 ///
-/// Expands to a `struct Core` implementing
-/// [`ExtCore`](crate::ExtCore). Both shim macros take `Core` and derive
-/// the full per-DB glue from `Core::DECLS` + `Core::dispatch`.
+/// # Scalar-only
 ///
 /// ```ignore
 /// datalink_extcore::declare! {
@@ -44,8 +55,45 @@ macro_rules! __nullh {
 ///         = |args| Ok(NeutralValue::Boolean(logic::validate(args.arg_text(0, "aba")?)));
 /// }
 /// ```
+///
+/// # Scalar + aggregate (aggregate tier)
+///
+/// See the arm below for the fold-declaration shape.
+///
+/// # Table (T3, added for the `blast` / `genome-format` pull-up)
+///
+/// ```ignore
+/// datalink_extcore::declare! {
+///     core = Core;
+///     extension = "range";
+///     version = env!("CARGO_PKG_VERSION");
+///
+///     table range_from_to(int64, int64) -> (v: int64) [deterministic] = |args| {
+///         let start = args.arg_int(0, "range_from_to")?;
+///         let end = args.arg_int(1, "range_from_to")?;
+///         if end < start { return Ok(vec![]); }
+///         Ok((start..end).map(|v| vec![NeutralValue::Int64(v)]).collect())
+///     };
+/// }
+/// ```
+///
+/// A table decl may carry a `replacement_scan` option that wires a file
+/// extension (or list of them) to this TVF via the `duckdb:extension`
+/// `files` interface:
+///
+/// ```ignore
+/// table read_gbk(text) -> (accession: text, sequence: text)
+///     [deterministic, replacement_scan = ["gb", "gbk"]]
+///     = |args| { /* ... */ };
+/// ```
+///
+/// # Mixed (scalar + aggregate + table)
+///
+/// Combine any of `scalar` / `aggregate` / `table`; the mixed arm is
+/// picked automatically as soon as at least one `table ...;` is present.
 #[macro_export]
 macro_rules! declare {
+    // ---- Scalar-only form (unchanged) ----
     (
         core = $core:ident;
         extension = $name:expr;
@@ -73,6 +121,8 @@ macro_rules! declare {
                         ret: $crate::__ntype!($rett),
                         null_handling: $crate::__nullh!($nullh),
                         deterministic: $crate::__declare_det!($detkw),
+                        columns: &[],
+                        replacement_scan_extensions: &[],
                     }
                 ),+
             ];
@@ -158,6 +208,8 @@ macro_rules! declare {
                         ret: $crate::__ntype!($srett),
                         null_handling: $crate::__nullh!($snullh),
                         deterministic: $crate::__declare_det!($sdetkw),
+                        columns: &[],
+                        replacement_scan_extensions: &[],
                     },
                 )*
                 $(
@@ -171,6 +223,8 @@ macro_rules! declare {
                         // the shim never pre-filters: declare Called.
                         null_handling: $crate::NullHandling::Called,
                         deterministic: $crate::__declare_det!($adetkw),
+                        columns: &[],
+                        replacement_scan_extensions: &[],
                     },
                 )+
             ];
@@ -242,6 +296,306 @@ macro_rules! declare {
         impl $core {
             /// NUL-terminated SCALAR function names (DECLS order). Empty for
             /// a pure-aggregate core. Used by the (deferred) embed shim.
+            #[allow(dead_code)]
+            pub const SCALAR_NAMES_NUL: &'static [&'static [u8]] = &[
+                $( ::core::concat!(::core::stringify!($sfname), "\0").as_bytes() ),*
+            ];
+        }
+    };
+
+    // ---- Pure-table form (T3) ----
+    //
+    // Every DECL is a `Table`; `dispatch` returns an error, `dispatch_table`
+    // picks from a closure list indexed 1:1 with DECLS. The optional
+    // `replacement_scan = [...]` list lifts to `FnDecl::replacement_scan_extensions`
+    // for the ducklink shim to wire into the `files` interface.
+    (
+        core = $core:ident;
+        extension = $name:expr;
+        version = $version:expr;
+        $(
+            table $tfname:ident ( $($targt:tt),* $(,)? )
+                -> ( $($tcolname:ident : $tcolt:tt),+ $(,)? )
+                [ $tdetkw:ident $( , replacement_scan = [ $($trsext:expr),+ $(,)? ] )? ]
+                = $tbody:expr ;
+        )+
+    ) => {
+        /// The generated extension core (one per crate). Carries the
+        /// capability table + neutral dispatch; the ducklink shim reads
+        /// this type alone to drive registration + `call_table`.
+        pub struct $core;
+
+        impl $crate::ExtCore for $core {
+            const NAME: &'static str = $name;
+            const VERSION: &'static str = $version;
+            const DECLS: &'static [$crate::FnDecl] = &[
+                $(
+                    $crate::FnDecl {
+                        name: ::core::stringify!($tfname),
+                        kind: $crate::CapabilityKind::Table,
+                        args: &[ $( $crate::__ntype!($targt) ),* ],
+                        // `ret` is unused for Table decls (per-column
+                        // types live in `columns`); a cheap placeholder
+                        // that needs no allocation inside the const.
+                        ret: $crate::NeutralType::Blob,
+                        // Table dispatch always calls the body — the core
+                        // decides how to react to NULL inputs.
+                        null_handling: $crate::NullHandling::Called,
+                        deterministic: $crate::__declare_det!($tdetkw),
+                        columns: &[
+                            $(
+                                $crate::ColDecl {
+                                    name: ::core::stringify!($tcolname),
+                                    ntype: $crate::__ntype!($tcolt),
+                                },
+                            )+
+                        ],
+                        // When `replacement_scan = [...]` is omitted the
+                        // outer `$(...)?` block emits nothing, leaving an
+                        // empty `&[]`. When present the exprs lift into
+                        // `&["gb", "gbk"]` (or whatever was named).
+                        replacement_scan_extensions: &[
+                            $( $( $trsext ),+ )?
+                        ],
+                    },
+                )+
+            ];
+
+            fn dispatch(
+                idx: usize,
+                _args: &[$crate::NeutralValue],
+            ) -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String> {
+                ::core::result::Result::Err(::alloc::format!(
+                    "{}: function index {} is not a scalar", $name, idx
+                ))
+            }
+
+            fn dispatch_table(
+                idx: usize,
+                args: &[$crate::NeutralValue],
+            ) -> ::core::result::Result<
+                ::alloc::vec::Vec<::alloc::vec::Vec<$crate::NeutralValue>>,
+                ::alloc::string::String,
+            > {
+                #[allow(unused_imports)]
+                use $crate::ArgExt as _;
+                let handlers: &[fn(&[$crate::NeutralValue])
+                    -> ::core::result::Result<
+                        ::alloc::vec::Vec<::alloc::vec::Vec<$crate::NeutralValue>>,
+                        ::alloc::string::String,
+                    >] = &[
+                    $( $tbody ),+
+                ];
+                match handlers.get(idx) {
+                    ::core::option::Option::Some(f) => f(args),
+                    ::core::option::Option::None => ::core::result::Result::Err(
+                        ::alloc::format!(
+                            "{}: function index {} is not a table", $name, idx
+                        )
+                    ),
+                }
+            }
+        }
+
+        impl $core {
+            /// NUL-terminated SCALAR function names (DECLS order). Empty
+            /// for a pure-table core.
+            #[allow(dead_code)]
+            pub const SCALAR_NAMES_NUL: &'static [&'static [u8]] = &[];
+        }
+    };
+
+    // ---- Mixed scalar + aggregate + table form ----
+    //
+    // Requires AT LEAST ONE `table ...;` (the `+` on the table block) so
+    // this arm never fires for the existing scalar-only or
+    // scalar+aggregate cores. DECLS layout: scalars, then aggregates,
+    // then tables; each `dispatch*` fn shifts its idx by the counts
+    // before it, exactly as the scalar+aggregate arm does today.
+    (
+        core = $core:ident;
+        extension = $name:expr;
+        version = $version:expr;
+        $(
+            scalar $sfname:ident ( $($sargt:tt),* ) -> $srett:tt
+                [ $snullh:tt , $sdetkw:ident ]
+                = $sbody:expr ;
+        )*
+        $(
+            aggregate $afname:ident ( $($aargt:tt),* ) -> $arett:tt
+                [ $adetkw:ident ]
+            {
+                state = $astate:ty ;
+                init = $ainit:expr ;
+                step = $astep:expr ;
+                finalize = $afinal:expr ;
+            }
+        )*
+        $(
+            table $tfname:ident ( $($targt:tt),* $(,)? )
+                -> ( $($tcolname:ident : $tcolt:tt),+ $(,)? )
+                [ $tdetkw:ident $( , replacement_scan = [ $($trsext:expr),+ $(,)? ] )? ]
+                = $tbody:expr ;
+        )+
+    ) => {
+        pub struct $core;
+
+        impl $crate::ExtCore for $core {
+            const NAME: &'static str = $name;
+            const VERSION: &'static str = $version;
+            const DECLS: &'static [$crate::FnDecl] = &[
+                $(
+                    $crate::FnDecl {
+                        name: ::core::stringify!($sfname),
+                        kind: $crate::CapabilityKind::Scalar,
+                        args: &[ $( $crate::__ntype!($sargt) ),* ],
+                        ret: $crate::__ntype!($srett),
+                        null_handling: $crate::__nullh!($snullh),
+                        deterministic: $crate::__declare_det!($sdetkw),
+                        columns: &[],
+                        replacement_scan_extensions: &[],
+                    },
+                )*
+                $(
+                    $crate::FnDecl {
+                        name: ::core::stringify!($afname),
+                        kind: $crate::CapabilityKind::Aggregate,
+                        args: &[ $( $crate::__ntype!($aargt) ),* ],
+                        ret: $crate::__ntype!($arett),
+                        null_handling: $crate::NullHandling::Called,
+                        deterministic: $crate::__declare_det!($adetkw),
+                        columns: &[],
+                        replacement_scan_extensions: &[],
+                    },
+                )*
+                $(
+                    $crate::FnDecl {
+                        name: ::core::stringify!($tfname),
+                        kind: $crate::CapabilityKind::Table,
+                        args: &[ $( $crate::__ntype!($targt) ),* ],
+                        ret: $crate::NeutralType::Blob,
+                        null_handling: $crate::NullHandling::Called,
+                        deterministic: $crate::__declare_det!($tdetkw),
+                        columns: &[
+                            $(
+                                $crate::ColDecl {
+                                    name: ::core::stringify!($tcolname),
+                                    ntype: $crate::__ntype!($tcolt),
+                                },
+                            )+
+                        ],
+                        replacement_scan_extensions: &[
+                            $( $( $trsext ),+ )?
+                        ],
+                    },
+                )+
+            ];
+
+            fn dispatch(
+                idx: usize,
+                args: &[$crate::NeutralValue],
+            ) -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String> {
+                #[allow(unused_imports)]
+                use $crate::ArgExt as _;
+                let scalars: &[fn(&[$crate::NeutralValue])
+                    -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String>] = &[
+                    $( $sbody ),*
+                ];
+                match scalars.get(idx) {
+                    ::core::option::Option::Some(f) => f(args),
+                    ::core::option::Option::None => ::core::result::Result::Err(
+                        ::alloc::format!("{}: function index {} is not a scalar", $name, idx)
+                    ),
+                }
+            }
+
+            fn dispatch_aggregate(
+                idx: usize,
+                rows: &[&[$crate::NeutralValue]],
+            ) -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String> {
+                #[allow(unused_imports)]
+                use $crate::ArgExt as _;
+                let scalar_count: usize = {
+                    let scalars: &[fn(&[$crate::NeutralValue])
+                        -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String>] = &[
+                        $( $sbody ),*
+                    ];
+                    scalars.len()
+                };
+                let folds: &[fn(&[&[$crate::NeutralValue]])
+                    -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String>] = &[
+                    $(
+                        |rows: &[&[$crate::NeutralValue]]|
+                            -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String>
+                        {
+                            #[allow(unused_imports)]
+                            use $crate::ArgExt as _;
+                            let mut state: $astate = $ainit;
+                            let step = $astep;
+                            for row in rows {
+                                step(&mut state, *row);
+                            }
+                            let finalize = $afinal;
+                            finalize(state)
+                        }
+                    ),*
+                ];
+                match idx.checked_sub(scalar_count).and_then(|a| folds.get(a)) {
+                    ::core::option::Option::Some(f) => f(rows),
+                    ::core::option::Option::None => ::core::result::Result::Err(
+                        ::alloc::format!("{}: function index {} is not an aggregate", $name, idx)
+                    ),
+                }
+            }
+
+            fn dispatch_table(
+                idx: usize,
+                args: &[$crate::NeutralValue],
+            ) -> ::core::result::Result<
+                ::alloc::vec::Vec<::alloc::vec::Vec<$crate::NeutralValue>>,
+                ::alloc::string::String,
+            > {
+                #[allow(unused_imports)]
+                use $crate::ArgExt as _;
+                let scalar_count: usize = {
+                    let scalars: &[fn(&[$crate::NeutralValue])
+                        -> ::core::result::Result<$crate::NeutralValue, ::alloc::string::String>] = &[
+                        $( $sbody ),*
+                    ];
+                    scalars.len()
+                };
+                let agg_count: usize = {
+                    // Every aggregate contributes 1 to the count. A 1-per
+                    // -decl marker sidesteps the `$astate` type referring
+                    // back to its declaration-site closure captures.
+                    #[allow(dead_code)]
+                    const AGG_MARKERS: &[u8] = &[
+                        $( { let _ = ::core::stringify!($afname); 0u8 } ),*
+                    ];
+                    AGG_MARKERS.len()
+                };
+                let handlers: &[fn(&[$crate::NeutralValue])
+                    -> ::core::result::Result<
+                        ::alloc::vec::Vec<::alloc::vec::Vec<$crate::NeutralValue>>,
+                        ::alloc::string::String,
+                    >] = &[
+                    $( $tbody ),+
+                ];
+                match idx
+                    .checked_sub(scalar_count + agg_count)
+                    .and_then(|a| handlers.get(a))
+                {
+                    ::core::option::Option::Some(f) => f(args),
+                    ::core::option::Option::None => ::core::result::Result::Err(
+                        ::alloc::format!("{}: function index {} is not a table", $name, idx)
+                    ),
+                }
+            }
+        }
+
+        impl $core {
+            /// NUL-terminated SCALAR function names (DECLS order). Empty
+            /// for a core with no scalars.
             #[allow(dead_code)]
             pub const SCALAR_NAMES_NUL: &'static [&'static [u8]] = &[
                 $( ::core::concat!(::core::stringify!($sfname), "\0").as_bytes() ),*

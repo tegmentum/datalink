@@ -159,6 +159,11 @@ macro_rules! sqlite_agg_shim {
                                     is_window: true,
                                 });
                             }
+                            // T5: sqlite table-valued functions ride the
+                            // vtab shape (a different port). Skip Table
+                            // decls here so a mixed core still compiles;
+                            // the ducklink shim picks them up.
+                            $crate::CapabilityKind::Table => {}
                         }
                     }
                     Manifest {

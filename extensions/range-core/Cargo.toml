@@ -1,0 +1,14 @@
+[package]
+name = "range-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core exercising `datalink_extcore::declare!`'s TABLE production (T3). Declares one table function, `range_from_to(int64, int64) -> (v: int64)`, as the T6 smoke test for the table-capability pull-up."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "range_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
