@@ -5,14 +5,14 @@
 //! ducklink `extensions/aba-component/src/lib.rs` — the
 //! `guest::Guest` (load/reconfigure/shutdown), the
 //! `callback_dispatch::Guest` (the six call_* arms), the `u32` handle
-//! table, `register_scalars()`, and the `Duckvalue` marshalling —
+//! table, `register_functions()`, and the `Duckvalue` marshalling —
 //! generalized over `Core::DECLS`. Only names/arg-ret-types/bodies
 //! varied across extensions; those all come from the declaration now.
 //!
 //! # Parameterization
 //!
 //! The consuming crate runs its own `wit_bindgen::generate!` (ducklink:
-//! `duckdb:extension@2.2.0`, wit-bindgen 0.41) and passes the resulting
+//! `duckdb:extension@2.2.0`+, wit-bindgen 0.41) and passes the resulting
 //! binding paths in. Nothing here hardcodes the package/version, so the
 //! same macro serves any repo on the `duckdb:extension` contract family.
 //!
@@ -25,6 +25,19 @@
 //! extensions (e.g. `aba_validate(NULL) -> NULL`). For
 //! [`NullHandling::Called`](crate::NullHandling) the generated dispatch
 //! passes the `Duckvalue::Null` through as [`NeutralValue::Null`].
+//!
+//! # Table-valued functions (T4)
+//!
+//! When [`FnDecl::kind`](crate::FnDecl) is
+//! [`CapabilityKind::Table`](crate::CapabilityKind), the generated
+//! `register_functions()` reaches for the `table` capability instead of
+//! `scalar`, converts [`FnDecl::columns`](crate::FnDecl) to
+//! `runtime::Columndef`, and registers a `TableCallback` bound to a
+//! sequential `u32` handle. `callback_dispatch::call_table` then looks
+//! up handle → DECLS-idx and calls [`ExtCore::dispatch_table`](crate::ExtCore::dispatch_table).
+//! If a table decl carries `replacement_scan_extensions`, the OPTIONAL
+//! `files = ...;` parameter's `register_replacement_scan` is invoked
+//! with the `u32` registration-id `table-registry.register` returned.
 
 /// Expand the full ducklink shim for `$core`.
 ///
@@ -36,7 +49,9 @@
 ///     runtime = duckdb::extension::runtime;
 ///     callback_dispatch = exports::duckdb::extension::callback_dispatch;
 ///     guest = exports::duckdb::extension::guest;
-///     export = export;            // the generated export! macro
+///     export = export;
+///     // OPTIONAL — pass when a table decl uses replacement_scan:
+///     // files = duckdb::extension::files;
 /// }
 /// ```
 #[macro_export]
@@ -49,6 +64,7 @@ macro_rules! duckdb_shim {
         callback_dispatch = $cbd:path ;
         guest = $guest:path ;
         export = $export:ident ;
+        $( files = $files:path ; )?
     ) => {
         const _: () = {
             use $crate::ExtCore as _;
@@ -57,6 +73,7 @@ macro_rules! duckdb_shim {
             use $rt as runtime;
             use $cbd as callback_dispatch;
             use $guest as guest;
+            $( use $files as files; )?
 
             type Core = $core;
 
@@ -235,7 +252,7 @@ macro_rules! duckdb_shim {
 
             impl guest::Guest for Extension {
                 fn load() -> Result<types::Loadresult, types::Duckerror> {
-                    register_scalars()?;
+                    register_functions()?;
                     Ok(types::Loadresult {
                         name: <Core as $crate::ExtCore>::NAME.into(),
                         version: Some(<Core as $crate::ExtCore>::VERSION.into()),
@@ -253,6 +270,10 @@ macro_rules! duckdb_shim {
             }
 
             // ---- Handle table (u32 -> DECLS index) ----
+            //
+            // Shared by scalar and table registrations: the host guarantees
+            // it re-hands the same handle to the appropriate call_* arm, so
+            // one map is safe for both kinds.
 
             fn handle_table(
             ) -> &'static ::std::sync::Mutex<::std::collections::HashMap<u32, usize>> {
@@ -349,13 +370,35 @@ macro_rules! duckdb_shim {
                     Ok(from_neutral(res))
                 }
 
+                // major-4 TABLE PATH: the host passes one arg list (the TVF's
+                // INPUT is a single call site, its OUTPUT is many rows). We
+                // resolve handle -> DECLS-idx, run the core's `dispatch_table`,
+                // then marshal each `Vec<NeutralValue>` row into a `Vec<Duckvalue>`.
                 fn call_table(
-                    _handle: u32,
-                    _args: ::std::vec::Vec<types::Duckvalue>,
+                    handle: u32,
+                    args: ::std::vec::Vec<types::Duckvalue>,
                 ) -> Result<types::Resultset, types::Duckerror> {
-                    Err(types::Duckerror::Unsupported(
-                        ::std::format!("{}: no table functions", <Core as $crate::ExtCore>::NAME),
-                    ))
+                    let idx = handle_table()
+                        .lock()
+                        .expect("table handle mutex poisoned")
+                        .get(&handle)
+                        .copied()
+                        .ok_or_else(|| {
+                            types::Duckerror::Internal(::std::format!(
+                                "{}: unknown table handle {}",
+                                <Core as $crate::ExtCore>::NAME,
+                                handle
+                            ))
+                        })?;
+                    let neutral: ::std::vec::Vec<$crate::NeutralValue> =
+                        args.iter().map(to_neutral).collect();
+                    let rows = <Core as $crate::ExtCore>::dispatch_table(idx, &neutral)
+                        .map_err(duckerr)?;
+                    let out: types::Resultset = rows
+                        .into_iter()
+                        .map(|row| row.into_iter().map(from_neutral).collect())
+                        .collect();
+                    Ok(out)
                 }
                 fn call_pragma(
                     _handle: u32,
@@ -377,23 +420,21 @@ macro_rules! duckdb_shim {
 
             $export!(Extension);
 
-            // ---- Registration (transcribed register_scalars) ----
+            // ---- Registration ----
+            //
+            // Iterate DECLS; register scalars via the scalar registry (as
+            // before) and tables via the table registry. Aggregate decls
+            // shouldn't appear on this shim (use `duckdb_agg_shim!`); they
+            // fall through untouched here (a defensive no-op).
+            //
+            // Each decl gets its own `u32` handle; the returned u32 from
+            // `table-registry.register` is the `table-function-handle` used
+            // by the `files` replacement-scan hook.
 
-            fn register_scalars() -> Result<(), types::Duckerror> {
-                let capability = runtime::get_capability(types::Capabilitykind::Scalar)
-                    .ok_or_else(|| {
-                        types::Duckerror::Internal(
-                            "host did not expose scalar capability".into(),
-                        )
-                    })?;
-                let registry = match capability {
-                    runtime::Capability::Scalar(registry) => registry,
-                    _ => {
-                        return Err(types::Duckerror::Internal(
-                            "scalar capability returned unexpected variant".into(),
-                        ))
-                    }
-                };
+            fn register_functions() -> Result<(), types::Duckerror> {
+                let mut scalar_registry: ::std::option::Option<runtime::ScalarRegistry> = None;
+                let mut table_registry: ::std::option::Option<runtime::TableRegistry> = None;
+
                 for (idx, decl) in
                     <Core as $crate::ExtCore>::DECLS.iter().enumerate()
                 {
@@ -401,9 +442,8 @@ macro_rules! duckdb_shim {
                         NEXT_HANDLE.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
                     handle_table()
                         .lock()
-                        .expect("scalar handle mutex poisoned")
+                        .expect("handle mutex poisoned")
                         .insert(handle, idx);
-                    let callback = runtime::ScalarCallback::new(handle);
                     let args: ::std::vec::Vec<runtime::Funcarg> = decl
                         .args
                         .iter()
@@ -412,24 +452,149 @@ macro_rules! duckdb_shim {
                             logical: ntype_to_logical(t),
                         })
                         .collect();
-                    let mut attributes = types::Funcflags::STATELESS;
-                    if decl.deterministic {
-                        attributes |= types::Funcflags::DETERMINISTIC;
+                    match decl.kind {
+                        $crate::CapabilityKind::Scalar => {
+                            let registry = match scalar_registry.as_ref() {
+                                Some(r) => r,
+                                None => {
+                                    let cap = runtime::get_capability(
+                                        types::Capabilitykind::Scalar,
+                                    )
+                                    .ok_or_else(|| {
+                                        types::Duckerror::Internal(
+                                            "host did not expose scalar capability".into(),
+                                        )
+                                    })?;
+                                    let r = match cap {
+                                        runtime::Capability::Scalar(r) => r,
+                                        _ => {
+                                            return Err(types::Duckerror::Internal(
+                                                "scalar capability returned unexpected variant"
+                                                    .into(),
+                                            ))
+                                        }
+                                    };
+                                    scalar_registry = Some(r);
+                                    scalar_registry.as_ref().unwrap()
+                                }
+                            };
+                            let mut attributes = types::Funcflags::STATELESS;
+                            if decl.deterministic {
+                                attributes |= types::Funcflags::DETERMINISTIC;
+                            }
+                            let opts = runtime::Funcopts {
+                                description: Some(::std::format!(
+                                    "{} scalar",
+                                    <Core as $crate::ExtCore>::NAME
+                                )),
+                                tags: ::std::vec![
+                                    <Core as $crate::ExtCore>::NAME.into()
+                                ],
+                                attributes,
+                            };
+                            registry.register(
+                                decl.name,
+                                &args,
+                                &ntype_to_logical(&decl.ret),
+                                runtime::ScalarCallback::new(handle),
+                                Some(&opts),
+                            )?;
+                        }
+                        $crate::CapabilityKind::Table => {
+                            let registry = match table_registry.as_ref() {
+                                Some(r) => r,
+                                None => {
+                                    let cap = runtime::get_capability(
+                                        types::Capabilitykind::Table,
+                                    )
+                                    .ok_or_else(|| {
+                                        types::Duckerror::Internal(
+                                            "host did not expose table capability".into(),
+                                        )
+                                    })?;
+                                    let r = match cap {
+                                        runtime::Capability::Table(r) => r,
+                                        _ => {
+                                            return Err(types::Duckerror::Internal(
+                                                "table capability returned unexpected variant"
+                                                    .into(),
+                                            ))
+                                        }
+                                    };
+                                    table_registry = Some(r);
+                                    table_registry.as_ref().unwrap()
+                                }
+                            };
+                            let columns: ::std::vec::Vec<runtime::Columndef> = decl
+                                .columns
+                                .iter()
+                                .map(|c| runtime::Columndef {
+                                    name: c.name.into(),
+                                    logical: ntype_to_logical(&c.ntype),
+                                })
+                                .collect();
+                            let opts = runtime::Extopts {
+                                description: Some(::std::format!(
+                                    "{} table function",
+                                    <Core as $crate::ExtCore>::NAME
+                                )),
+                                tags: ::std::vec![
+                                    <Core as $crate::ExtCore>::NAME.into()
+                                ],
+                            };
+                            let _reg_id = registry.register(
+                                decl.name,
+                                &args,
+                                &columns,
+                                runtime::TableCallback::new(handle),
+                                Some(&opts),
+                            )?;
+                            // Replacement-scan hook: only fires when the
+                            // decl declares extensions AND the shim was
+                            // invoked with `files = ...;`. The generated
+                            // code that references `files::` is folded
+                            // inside a `$(...)?` guard so the shim still
+                            // compiles when `files=` was omitted.
+                            $(
+                                {
+                                    // Bring `$files` into scope for this block
+                                    // (the outer `use $files as files;` is also
+                                    // guarded, so we do not depend on it here).
+                                    use $files as _files_alias;
+                                    if !decl.replacement_scan_extensions.is_empty() {
+                                        let exts: ::std::vec::Vec<::std::string::String> =
+                                            decl.replacement_scan_extensions
+                                                .iter()
+                                                .map(|s| (*s).into())
+                                                .collect();
+                                        let scan = _files_alias::ReplacementScan {
+                                            extensions: exts,
+                                            table_function: _reg_id,
+                                            mode: _files_alias::DetectionMode::ExtensionOnly,
+                                        };
+                                        // A failed replacement-scan hook is not
+                                        // fatal to the load — surface as
+                                        // Duckerror::Internal to match style.
+                                        _files_alias::register_replacement_scan(&scan)
+                                            .map_err(|e| types::Duckerror::Internal(
+                                                ::std::format!(
+                                                    "{}: register_replacement_scan failed: {}",
+                                                    <Core as $crate::ExtCore>::NAME,
+                                                    e
+                                                )
+                                            ))?;
+                                    }
+                                }
+                            )?
+                        }
+                        $crate::CapabilityKind::Aggregate => {
+                            // Aggregates require `duckdb_agg_shim!`; this
+                            // shim silently skips them so a mixed core that
+                            // accidentally uses the wrong shim still loads
+                            // its scalars/tables (aggregates just won't be
+                            // callable — a runtime discovery failure).
+                        }
                     }
-                    let opts = runtime::Funcopts {
-                        description: Some(
-                            ::std::format!("{} scalar", <Core as $crate::ExtCore>::NAME),
-                        ),
-                        tags: ::std::vec![<Core as $crate::ExtCore>::NAME.into()],
-                        attributes,
-                    };
-                    registry.register(
-                        decl.name,
-                        &args,
-                        &ntype_to_logical(&decl.ret),
-                        callback,
-                        Some(&opts),
-                    )?;
                 }
                 Ok(())
             }

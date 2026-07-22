@@ -116,6 +116,13 @@ macro_rules! sqlite_shim {
                     for (idx, decl) in
                         <Core as $crate::ExtCore>::DECLS.iter().enumerate()
                     {
+                        // T5: sqlite tables ride the vtab shape (a different
+                        // port); skip Table decls here so mixed cores still
+                        // compile. Aggregates use `sqlite_agg_shim!`, so we
+                        // also skip them defensively.
+                        if !matches!(decl.kind, $crate::CapabilityKind::Scalar) {
+                            continue;
+                        }
                         let mut func_flags = FunctionFlags::empty();
                         if decl.deterministic {
                             func_flags |= FunctionFlags::DETERMINISTIC;

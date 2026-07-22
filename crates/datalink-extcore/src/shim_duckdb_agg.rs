@@ -405,6 +405,7 @@ macro_rules! duckdb_agg_shim {
                                 match decl.kind {
                                     $crate::CapabilityKind::Aggregate => "aggregate",
                                     $crate::CapabilityKind::Scalar => "scalar",
+                                    $crate::CapabilityKind::Table => "table",
                                 }),
                         ),
                         tags: ::std::vec![<Core as $crate::ExtCore>::NAME.into()],
@@ -477,6 +478,11 @@ macro_rules! duckdb_agg_shim {
                                 Some(&opts),
                             )?;
                         }
+                        // Table decls are handled by `duckdb_shim!` (T4).
+                        // A mixed scalar+aggregate+table core should use
+                        // that shim; this one silently no-ops on Table so
+                        // an accidental combination compiles.
+                        $crate::CapabilityKind::Table => {}
                     }
                 }
                 Ok(())
