@@ -68,16 +68,70 @@ datalink_extcore::declare! {
         sequence: text,
     ) [deterministic, replacement_scan = ["gb", "gbk"]] = |args| {
         use datalink_extcore::ArgExt as _;
-        let path = args.arg_text(0, "genbank_read_path")?;
-        let bytes = std::fs::read(&path).map_err(|e| {
+        let arg = args.arg_text(0, "genbank_read_path")?;
+        read_path_or_glob(&arg)
+    };
+}
+
+/// Detect whether `s` contains a glob metacharacter that the `glob` crate
+/// would expand. Cheap check — we don't want to pay the directory-walk
+/// cost for the common case of a literal filesystem path.
+fn is_glob(s: &str) -> bool {
+    s.chars().any(|c| matches!(c, '*' | '?' | '['))
+}
+
+/// Read one or many GenBank files. A path without glob metacharacters is
+/// a single `std::fs::read`; a path WITH them is expanded via the `glob`
+/// crate, each match is parsed, and the results are unioned into one row
+/// stream. Matches DuckDB's own `read_csv('dir/*.csv')` / `read_parquet`
+/// ergonomics so `SELECT * FROM 'phages/*.gb'` (via the replacement scan)
+/// works the way users already expect from file-shaped table functions.
+///
+/// Sort order is `glob`'s lexicographic default so multi-file scans are
+/// deterministic across runs. An empty match set is an error — matches
+/// `read_csv`'s behaviour on an unmatched glob and avoids silently
+/// returning zero rows when the user probably fat-fingered a path.
+fn read_path_or_glob(arg: &str) -> Result<Vec<Vec<NeutralValue>>, String> {
+    if !is_glob(arg) {
+        let bytes = std::fs::read(arg).map_err(|e| {
             format!(
-                "genbank_read_path: cannot read '{path}': {e}. If this DuckLink build \
+                "genbank_read_path: cannot read '{arg}': {e}. If this DuckLink build \
                  does not grant filesystem access to extensions, read the file with \
                  DuckDB's read_text and call genbank_scan(<contents>) instead."
             )
         })?;
-        emit_from_bytes(&bytes)
-    };
+        return emit_from_bytes(&bytes);
+    }
+
+    let entries: Vec<std::path::PathBuf> = glob::glob(arg)
+        .map_err(|e| format!("genbank_read_path: bad glob '{arg}': {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if entries.is_empty() {
+        return Err(format!(
+            "genbank_read_path: glob '{arg}' matched no files"
+        ));
+    }
+
+    // Parse + emit per file, unioning rows. The parser already tolerates
+    // multi-record files, so a caller can also concatenate on the SQL
+    // side if they prefer — the glob path is the ergonomic default.
+    let mut rows: Vec<Vec<NeutralValue>> = Vec::new();
+    for path in entries {
+        let path_str = path.display().to_string();
+        let bytes = std::fs::read(&path).map_err(|e| {
+            format!("genbank_read_path: cannot read '{path_str}' (matched by '{arg}'): {e}")
+        })?;
+        let parsed = parser::parse_genbank(&bytes).map_err(|e| {
+            let reason = match e {
+                ParseError::Malformed(m) => m,
+                ParseError::UnsupportedVersion(m) => format!("unsupported version: {m}"),
+            };
+            format!("genome-format: cannot parse '{path_str}': {reason}")
+        })?;
+        emit_rows(&parsed, &mut rows);
+    }
+    Ok(rows)
 }
 
 // ---- parse + wide-row emission ----------------------------------------
