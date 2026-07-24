@@ -2,13 +2,14 @@
 name = "datalink-contract"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.94"
 description = "Shared runtime WIT contract-version load guard for the sqlink + ducklink wasm-component hosts. Introspects a loaded component's imported package @MAJOR and rejects a component whose contract major differs from the host's, with a friendly, actionable message."
 license = "MIT"
 repository = "https://github.com/tegmentum/datalink"
 
 [dependencies]
 # The component-model engine. Pinned to the version both hosts run (sqlink +
-# ducklink are on wasmtime 46.0.1) so the introspected component types are
+# ducklink are on wasmtime 47.0.2) so the introspected component types are
 # ABI-identical across the consumers.
-wasmtime = { version = "46.0.1", features = ["component-model"] }
+wasmtime = { version = "47.0.2", features = ["component-model"] }
 anyhow = "1.0"

@@ -1826,7 +1826,8 @@ mod tests {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
         // Network providers use the async WASI linker (awaited socket futures).
-        config.async_support(true);
+        // Note: `Config::async_support` was deprecated in wasmtime 47 (no-op);
+        // the async wiring is now inferred from the linker/host functions.
         let engine = Engine::new(&config).expect("engine");
 
         let registry = AsyncProviderRegistry::new(engine);

@@ -2,6 +2,7 @@
 name = "redis-endpoint-harness"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.94"
 publish = false
 
 [workspace]
@@ -11,7 +12,7 @@ name = "harness"
 path = "src/main.rs"
 
 [dependencies]
-wasmtime = { version = "46.0.1", features = ["component-model"] }
-wasmtime-wasi = "46.0.1"
+wasmtime = { version = "47.0.2", features = ["component-model"] }
+wasmtime-wasi = "47.0.2"
 anyhow = "1"
 ciborium = "0.2"
