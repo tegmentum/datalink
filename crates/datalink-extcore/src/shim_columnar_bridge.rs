@@ -332,6 +332,46 @@ macro_rules! __columnar_bridge_conv {
                         });
                     }
                 }
+                // major-5: HUGEINT / UHUGEINT 128-bit integer columns.
+                $col::Column::Hugeint(v) => {
+                    for i in 0..n {
+                        out.push(if valid(i) {
+                            V::Hugeint($types::Hugeintvalue {
+                                lower: v[i].lower,
+                                upper: v[i].upper,
+                            })
+                        } else {
+                            V::Null
+                        });
+                    }
+                }
+                $col::Column::Uhugeint(v) => {
+                    for i in 0..n {
+                        out.push(if valid(i) {
+                            V::Uhugeint($types::Uhugeintvalue {
+                                lower: v[i].lower,
+                                upper: v[i].upper,
+                            })
+                        } else {
+                            V::Null
+                        });
+                    }
+                }
+                // major-5 S1 nested-column arms carry opaque byte payloads
+                // that this row-per-cell bridge cannot faithfully round-trip
+                // through per-row `duckvalue`. Components on this bridge do
+                // not currently register LIST/STRUCT/MAP/ARRAY scalars, so we
+                // surface each row as NULL (matching the all-null fallback
+                // path); the columnar override (`scalar_batch_col`) is where a
+                // nested-aware component would opt out of the bridge.
+                $col::Column::ListCol(_)
+                | $col::Column::StructCol(_)
+                | $col::Column::MapCol(_)
+                | $col::Column::ArrayCol(_) => {
+                    for _ in 0..n {
+                        out.push(V::Null);
+                    }
+                }
             }
             out
         }
@@ -464,6 +504,29 @@ macro_rules! __columnar_bridge_conv {
                                 type_expr: ::std::string::String::new().into(),
                                 json: ::std::string::String::new().into(),
                             },
+                        })
+                        .collect(),
+                ),
+                // major-5: HUGEINT / UHUGEINT 128-bit integer columns.
+                Some(V::Hugeint(_)) => $col::Column::Hugeint(
+                    vals.iter()
+                        .map(|v| match v {
+                            V::Hugeint(x) => $col::DuckInt128 {
+                                lower: x.lower,
+                                upper: x.upper,
+                            },
+                            _ => $col::DuckInt128 { lower: 0, upper: 0 },
+                        })
+                        .collect(),
+                ),
+                Some(V::Uhugeint(_)) => $col::Column::Uhugeint(
+                    vals.iter()
+                        .map(|v| match v {
+                            V::Uhugeint(x) => $col::DuckUint128 {
+                                lower: x.lower,
+                                upper: x.upper,
+                            },
+                            _ => $col::DuckUint128 { lower: 0, upper: 0 },
                         })
                         .collect(),
                 ),

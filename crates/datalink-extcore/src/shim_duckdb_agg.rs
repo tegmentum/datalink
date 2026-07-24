@@ -189,6 +189,38 @@ macro_rules! duckdb_agg_shim {
                         type_expr: "UUID".into(),
                         json: v.iter().map(|d| ::std::format!("{:?}", d)).collect(),
                     },
+                    // major-5: HUGEINT / UHUGEINT rendered as JSON so the
+                    // neutral aggregate core (which speaks int64/float64/text)
+                    // sees them as Complex, matching the fallback used by
+                    // decimal / interval / uuid.
+                    col::Column::Hugeint(v) => $crate::NeutralColumn::Complex {
+                        type_expr: "HUGEINT".into(),
+                        json: v.iter().map(|d| ::std::format!("{:?}", d)).collect(),
+                    },
+                    col::Column::Uhugeint(v) => $crate::NeutralColumn::Complex {
+                        type_expr: "UHUGEINT".into(),
+                        json: v.iter().map(|d| ::std::format!("{:?}", d)).collect(),
+                    },
+                    // major-5 S1 nested arms: opaque encoded bytes; surface as
+                    // Complex placeholders so the neutral aggregate sees a
+                    // well-typed column (no aggregate registered on this shim
+                    // consumes LIST/STRUCT/MAP/ARRAY today).
+                    col::Column::ListCol(v) => $crate::NeutralColumn::Complex {
+                        type_expr: "LIST".into(),
+                        json: (0..c.rows).map(|_| ::std::format!("<encoded:{}b>", v.encoded.len())).collect(),
+                    },
+                    col::Column::StructCol(v) => $crate::NeutralColumn::Complex {
+                        type_expr: "STRUCT".into(),
+                        json: (0..c.rows).map(|_| ::std::format!("<encoded:{}b>", v.encoded.len())).collect(),
+                    },
+                    col::Column::MapCol(v) => $crate::NeutralColumn::Complex {
+                        type_expr: "MAP".into(),
+                        json: (0..c.rows).map(|_| ::std::format!("<keys:{}b vals:{}b>", v.keys_encoded.len(), v.vals_encoded.len())).collect(),
+                    },
+                    col::Column::ArrayCol(v) => $crate::NeutralColumn::Complex {
+                        type_expr: "ARRAY".into(),
+                        json: (0..c.rows).map(|_| ::std::format!("<size:{} encoded:{}b>", v.size, v.encoded.len())).collect(),
+                    },
                 };
                 $crate::NeutralColVec {
                     data,
