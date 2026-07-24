@@ -217,6 +217,15 @@ macro_rules! duckdb_shim {
                         type_expr: "UUID".into(),
                         json: v.iter().map(|d| ::std::format!("{:?}", d)).collect(),
                     },
+                    // duckdb:extension @5.0.0 additive arms (hugeint,
+                    // uhugeint, list-col, struct-col, map-col, array-col) —
+                    // biology cores don't emit these; ride the Complex
+                    // escape hatch so the match stays exhaustive without a
+                    // per-arm lift. Additive-tolerant catch-all.
+                    _ => $crate::NeutralColumn::Complex {
+                        type_expr: "UNSUPPORTED".into(),
+                        json: ::std::vec::Vec::new(),
+                    },
                 };
                 $crate::NeutralColVec {
                     data,
