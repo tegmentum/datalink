@@ -349,12 +349,10 @@ fn do_record_run(
 // ---------------------------------------------------------------------------
 // Capability declaration.
 //
-// NOTE ON WIDTHS: the native extension declares Integer (i32) for
-// `fieldbook_add_entry` (return) and `fieldbook_record_run` (`ordinal`).
-// The neutral type set has only `int64` — DuckDB's built-in cast handles
-// the INTEGER->BIGINT widening at the SQL boundary, so callers see BIGINT
-// on the wasm side. This is the only signature drift from native and is
-// unavoidable without extending `NeutralType`.
+// Widths: `fieldbook_add_entry` returns BIGINT and `fieldbook_record_run`
+// takes BIGINT for `ordinal`. The native `duckdb-fieldbook` extension uses
+// the same widths -- both engines present an identical SQL surface, and
+// this file is the surface-of-record along with `duckdb-fieldbook/src/lib.rs`.
 // ---------------------------------------------------------------------------
 
 datalink_extcore::declare! {
@@ -378,9 +376,8 @@ datalink_extcore::declare! {
         do_drop(&name)
     };
 
-    // Native declares (text, integer, bigint, bigint, text, text, bigint).
-    // Wasm neutral: (text, int64, int64, int64, text, text, int64). See the
-    // "NOTE ON WIDTHS" comment above.
+    // Signature: (text, bigint, bigint, bigint, text, text, bigint) -> boolean.
+    // Native `duckdb-fieldbook` declares the same shape.
     scalar fieldbook_record_run(text, int64, int64, int64, text, text, int64) -> boolean
         [propagate, nondeterministic] = |args| {
         let name = args.arg_text(0, "fieldbook_record_run")?;
