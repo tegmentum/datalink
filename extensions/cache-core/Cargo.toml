@@ -1,0 +1,17 @@
+[package]
+name = "cache-core"
+version = "0.1.0"
+edition = "2021"
+description = "Neutral, DB-agnostic core for the `cache` DuckDB scalar extension — the wasm-side counterpart to the native `duckdb-cache`. Declares `cache(uri)` and `cache(config_json, uri)` as the sole scalar surface, parses the JSON config, and drives the resolver-policy loop; the actual metadata store (sqlite `sqlite:extension/spi`), filesystem writes, and HTTP fetches live in the DB shim (ducklink `cache-component`) via installed function pointers, keeping this crate no_std + free of host dependencies."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "cache_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
