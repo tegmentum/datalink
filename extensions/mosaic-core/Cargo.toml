@@ -1,0 +1,27 @@
+[package]
+name = "mosaic-core"
+version = "0.1.0"
+edition = "2021"
+description = """
+Neutral core for the ducklink mosaic wasm extension. Owns the SQL
+surface (mosaic_create + mosaic_drop + mosaic_url + mosaic_spec +
+mosaic_plot scalars, plus the mosaic_list read macro) as a `declare!`
+capability table, the __mosaic_apps schema DDL, the SQL that the shared
+POST /ducklink/mosaic/api/query route runs, the vgplot-spec template for
+mosaic_plot, and the fn-pointer bridges the per-DB shim installs at
+load() to hand back the JS bundle bytes and to generate per-app auth
+tokens. Everything else — the routes-table writes, the embedded browser
+bundle, and the token generator — lives in the ducklink
+mosaic-component (this crate is DB-agnostic, no_std + alloc + std for
+serde_json only).
+"""
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[lib]
+name = "mosaic_core"
+path = "src/lib.rs"
+
+[dependencies]
+datalink-extcore = { path = "../../crates/datalink-extcore" }
+serde_json = { version = "1", default-features = false, features = ["std", "preserve_order"] }
