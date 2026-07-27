@@ -596,69 +596,6 @@ fn app_exists(name: &str) -> Result<bool, String> {
     Ok(n > 0)
 }
 
-/// PHASE 1 workaround (nested-exec re-entry currently traps on the
-/// standalone ducklink CLI; see extensions/mosaic-component/README.md):
-/// build the SQL string a caller can `POST /sql` to install the app
-/// entirely from the httpd's connection context. `mosaic_create`
-/// internally does exactly the same work through nested-exec — this
-/// scalar just externalises it so operators can drive the install
-/// without needing nested-exec to work first.
-///
-/// Returns a semicolon-terminated batch of INSERT statements (idempotent
-/// via `ON CONFLICT DO NOTHING` on the shared query route; the caller
-/// is responsible for making sure the app name is fresh — collisions
-/// on __mosaic_apps.name PK are the caller's error).
-pub fn build_install_sql(
-    name: &str,
-    spec_json: &str,
-    opts_json: &str,
-) -> Result<(String /* url */, String /* sql */), String> {
-    if !valid_name(name) {
-        return Err(String::from(
-            "mosaic_install_sql: name must be URL-safe (letters, digits, _-), 1-64 chars",
-        ));
-    }
-    let _: serde_json::Value = serde_json::from_str(spec_json)
-        .map_err(|e| format!("mosaic_install_sql: spec not valid JSON: {e}"))?;
-    let opts = parse_opts(opts_json)?;
-
-    let bundle = bundle_js()?;
-    let bundle_str = core::str::from_utf8(bundle)
-        .map_err(|_| String::from("mosaic: bundle.js is not valid UTF-8"))?;
-    let idx = index_html()?;
-    let index_html_body = idx
-        .replace("__NAME__", name)
-        .replace("__TOKEN__", &opts.token);
-
-    let mut sql = String::new();
-    sql.push_str(&bootstrap_sql());
-    // Insert into __mosaic_apps.
-    let token_sql = if opts.token.is_empty() {
-        String::from("NULL")
-    } else {
-        quote(&opts.token)
-    };
-    let desc_sql = match &opts.description {
-        Some(d) => quote(d),
-        None => String::from("NULL"),
-    };
-    sql.push_str(&format!(
-        "INSERT INTO __mosaic_apps (name, spec, token, description) VALUES ({n}, {s}, {t}, {d});\n",
-        n = quote(name),
-        s = quote(spec_json),
-        t = token_sql,
-        d = desc_sql,
-    ));
-    sql.push_str(&insert_app_routes_sql(name, &opts.token, &index_html_body, bundle_str));
-
-    Ok((app_url_with_token(name, Some(&opts.token)), sql))
-}
-
-fn do_install_sql(name: &str, spec_json: &str, opts_json: &str) -> Result<NeutralValue, String> {
-    let (_url, sql) = build_install_sql(name, spec_json, opts_json)?;
-    Ok(NeutralValue::Text(sql))
-}
-
 fn do_create(name: &str, spec_json: &str, opts_json: &str) -> Result<NeutralValue, String> {
     if !valid_name(name) {
         return Err(String::from(
@@ -851,18 +788,6 @@ datalink_extcore::declare! {
         let kind = args.arg_text(1, "mosaic_plot_spec")?;
         let opts = args.arg_text(2, "mosaic_plot_spec")?;
         build_plot_spec(&sql, &kind, &opts).map(NeutralValue::Text)
-    };
-
-    // Phase-1 workaround alongside the canonical `mosaic_create`. Returns
-    // the semicolon-batched SQL an operator can POST /sql back into a
-    // running `ducklink serve` to install an app without needing
-    // nested-exec re-entry to work on their host. See the E2E script
-    // (scripts/mosaic-phase1-e2e.sh) for the intended usage.
-    scalar mosaic_install_sql(text, text, text) -> text [propagate, nondeterministic] = |args| {
-        let name = args.arg_text(0, "mosaic_install_sql")?;
-        let spec = args.arg_text(1, "mosaic_install_sql")?;
-        let opts = args.arg_text(2, "mosaic_install_sql")?;
-        do_install_sql(&name, &spec, &opts)
     };
 }
 
