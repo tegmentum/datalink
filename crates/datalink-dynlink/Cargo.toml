@@ -11,8 +11,8 @@ repository = "https://github.com/tegmentum/datalink"
 # The component-model engine. Pinned to the version both hosts run (sqlink +
 # ducklink are on wasmtime 47.0.2) so the generated component bindings are
 # ABI-identical across the consumers (matches datalink-contract).
-wasmtime = { version = "47.0.2", features = ["component-model", "async"] }
-wasmtime-wasi = "47.0.2"
+wasmtime = { version = "48.0.0", features = ["component-model", "async"] }
+wasmtime-wasi = "48.0.0"
 # Async flavor: boxed-Send futures for the async provider-backend trait and
 # the async host methods. sqlink's host is fully async (`bindgen` `default:
 # async` -> `async fn` Host methods over a tokio/hickory/reqwest stack), so the

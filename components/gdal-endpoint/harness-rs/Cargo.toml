@@ -12,8 +12,8 @@ name = "harness"
 path = "src/main.rs"
 
 [dependencies]
-wasmtime = { version = "47.0.2", features = ["component-model"] }
-wasmtime-wasi = "47.0.2"
+wasmtime = { version = "48.0.0", features = ["component-model"] }
+wasmtime-wasi = "48.0.0"
 anyhow = "1"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }

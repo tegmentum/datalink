@@ -38,8 +38,7 @@ use std::sync::{Arc, Mutex};
 use wasmtime::component::{Component, Linker, Resource, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::{
-    DirPerms, FilePerms, ResourceTable as WasiResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView,
-    WasiView,
+    FsPerms, ResourceTable as WasiResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
 
 /// Async, deep-reentrant + streaming `compose:dynlink` host (ports #221 deep
@@ -960,7 +959,7 @@ fn materialize_resident(registry: &ProviderRegistry, id: &str) -> Result<(), Err
         builder.inherit_stdio();
         for po in &entry.preopens {
             builder
-                .preopened_dir(&po.host, &po.guest, DirPerms::all(), FilePerms::all())
+                .preopened_dir(&po.host, &po.guest, FsPerms::ReadWrite)
                 .map_err(|e| {
                     err(
                         ErrorCode::InvalidInput,
@@ -1387,7 +1386,7 @@ async fn materialize_resident_async(slot: &mut AsyncSlot, id: &str) -> Result<()
     }
     for po in &slot.preopens {
         builder
-            .preopened_dir(&po.host, &po.guest, DirPerms::all(), FilePerms::all())
+            .preopened_dir(&po.host, &po.guest, FsPerms::ReadWrite)
             .map_err(|e| {
                 async_err(
                     AsyncErrorCode::InvalidInput,

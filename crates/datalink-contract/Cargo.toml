@@ -11,5 +11,5 @@ repository = "https://github.com/tegmentum/datalink"
 # The component-model engine. Pinned to the version both hosts run (sqlink +
 # ducklink are on wasmtime 47.0.2) so the introspected component types are
 # ABI-identical across the consumers.
-wasmtime = { version = "47.0.2", features = ["component-model"] }
+wasmtime = { version = "48.0.0", features = ["component-model"] }
 anyhow = "1.0"
