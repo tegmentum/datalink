@@ -154,7 +154,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "wasmos-runtime-api"
 version = "0.1.0"
-source = "git+https://github.com/tegmentum/wasmos.git?rev=cf60e2563496ac6a66e843d6afa61050e070aebe#cf60e2563496ac6a66e843d6afa61050e070aebe"
+source = "git+https://github.com/tegmentum/wasmos.git?rev=571220d64e765d90cb1b7036c04c7fd6cd6b2911#571220d64e765d90cb1b7036c04c7fd6cd6b2911"
 dependencies = [
  "async-trait",
  "bytes",
