@@ -1,0 +1,63 @@
+[package]
+name = "datalink-dynlink-wasmos"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "compose:dynlink/linker host machinery written against wasmos-runtime-api. The wasmos-abstraction counterpart of datalink-dynlink — same WIT world, same resident-backend + provider-registry semantics, but no direct wasmtime dependency (consumes SelectedRuntime + HostImports + Value primitives from the wasmos runtime abstraction). Coexists with datalink-dynlink v0.1.x on datalink main; consumers migrate piecewise (ducklink + sqlink on their own schedules per ADR-0029 Phase 6.2.d/e)."
+license = "MIT"
+repository = "https://github.com/tegmentum/datalink"
+
+[dependencies]
+# ADR-0029 Phase 6.2.c — the wasmos runtime abstraction. Provides
+# every primitive this crate previously reached for through raw
+# wasmtime:
+#   * SelectedRuntime — compile + instantiate (Phase 2)
+#   * Instance::call_export — dispatch to provider endpoint (Phase 4-preflight)
+#   * HostImports + HostCall — install linker imports (Phase 4-unblocker)
+#   * HostCallContext::new_host_resource — mint fresh Value::Resource
+#     for resolve-by-id/-by-digest returns (Phase 6.2.b.2)
+#   * Value::Resource — opaque host-owned handles (Phase 5.2)
+#   * Value::Bytes — zero-copy payload path (Phase 6.2.b)
+#   * WasiEnvironment — provider WASI configuration (Phase 2b)
+#   * imported_instance_names — contract introspection (Phase 6.1a)
+#
+# Auto-registration of resource types on HostImports-covered interfaces
+# (Phase 6.2.b) means this crate does NOT need to explicitly declare
+# the `resource instance` type at the linker level — the adapter walks
+# the guest's imports and registers it automatically. Same for the
+# resource destructor (no-op today; Phase 6+ workload if drop-hooks are
+# needed).
+#
+# Git-pinned to wasmos main tip at the time of this crate's rewrite;
+# bump when growing to consume new abstraction surface. Once
+# wasmos-runtime-api is published to crates.io, switch to a version
+# constraint.
+wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", rev = "0eb1ad19753e31fc7f4df9757594ae000ca34daf" }
+# NOTE: no wasmos-runtime-select dep! This crate stays runtime-agnostic
+# by taking `Arc<dyn Runtime>` — the consumer picks their runtime
+# (wasmos-runtime-wasmtime-v48, edge, future WAMR/browser adapters).
+# That's the whole point of the abstraction: `cargo tree -p
+# datalink-dynlink | grep -c wasmtime` returns 0 in this crate's own
+# resolved dep graph.
+
+# HostCall's fn is `async fn`, and the ProviderBackend trait in this
+# crate mirrors that pattern for user impls. `async-trait` boxes the
+# returned futures as `Send` for wasmtime's async host-call requirement
+# (the wasmos adapter propagates that requirement through).
+async-trait = "0.1"
+
+# `Arc<Mutex<..>>` for the ResidentBackend's per-provider slot held
+# across await points (instantiate + call_export). The tokio sync
+# feature is enough — no runtime/net.
+tokio = { version = "1", features = ["sync"] }
+
+# `Bytes` for zero-copy payload handoff into Value::Bytes. Matches
+# ComponentSource::Bytes convention on the wasmos side.
+bytes = "1"
+
+# `anyhow` for construction ergonomics inside error-mapping helpers.
+# Not exposed in public sigs.
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
