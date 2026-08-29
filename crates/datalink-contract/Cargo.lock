@@ -24,6 +24,9 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "datalink-contract"
@@ -121,6 +124,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "wasmos-runtime-api"
 version = "0.1.0"
+source = "git+https://github.com/tegmentum/wasmos.git?rev=2406cc7075dcf1d9c98f054c408f062ebed3c0b0#2406cc7075dcf1d9c98f054c408f062ebed3c0b0"
 dependencies = [
  "async-trait",
  "bytes",

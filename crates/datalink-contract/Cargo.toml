@@ -20,9 +20,16 @@ repository = "https://github.com/tegmentum/datalink"
 # in the wasmos repo for the design; the api surface added at wasmos
 # commit 8579294.
 #
-# Path dep to the peer wasmos repo — matches the pattern datalink
-# uses for its other cross-repo peer deps (secure-log, mosaic-core,
-# etc.). Once wasmos-runtime-api is published to crates.io, switch to
-# `wasmos-runtime-api = "0.1"` here.
-wasmos-runtime-api = { path = "../../../wasmos/runtime/api" }
+# Git dep to the peer wasmos repo. A path dep would work in the
+# local dev environment where wasmos + datalink are sibling checkouts
+# but breaks external consumers that fetch datalink-contract via a
+# git rev (the path `../../../wasmos/...` resolves inside the cargo
+# git cache, not to a sibling checkout of the wasmos repo). Once
+# wasmos-runtime-api is published to crates.io, switch this to
+# `wasmos-runtime-api = "0.1"`.
+#
+# Rev pinning: bump when wasmos-runtime-api changes; consumers of
+# datalink-contract (this dep is transitive to them) inherit the pin
+# implicitly and rebuild against the pinned wasmos snapshot.
+wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", rev = "2406cc7075dcf1d9c98f054c408f062ebed3c0b0" }
 anyhow = "1.0"
