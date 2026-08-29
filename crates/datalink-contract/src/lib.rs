@@ -27,8 +27,7 @@
 //! catalog-verify time in each repo.
 
 use anyhow::Result;
-use wasmtime::component::Component;
-use wasmtime::Engine;
+use wasmos_runtime_api::CompiledComponent;
 
 /// The WIT contract MAJOR a component targets, read from its imported package
 /// ids, for the given `package` (e.g. `"duckdb:extension"` or `"sqlink:wasm"`).
@@ -39,18 +38,17 @@ use wasmtime::Engine;
 ///     or imports nothing from `<package>` at all (in practice every loadable
 ///     extension imports at least one interface from its contract package).
 ///
-/// The introspection uses `component.component_type().imports(engine)`, whose
-/// instance names look like `duckdb:extension/runtime@2.0.0` or, for a legacy
-/// component, `duckdb:extension/runtime` (no version).
-pub fn component_contract_major(
-    engine: &Engine,
-    component: &Component,
-    package: &str,
-) -> Option<u64> {
-    for (name, _) in component.component_type().imports(engine) {
+/// The introspection uses [`CompiledComponent::imported_instance_names`], whose
+/// entries look like `duckdb:extension/runtime@2.0.0` or, for a legacy
+/// component, `duckdb:extension/runtime` (no version). ADR-0029 Phase 6.1b —
+/// migrated from a direct `wasmtime::Engine` + `wasmtime::component::Component`
+/// pair to the runtime abstraction so this crate stays on the wasmos runtime
+/// contract rather than a specific wasmtime major.
+pub fn component_contract_major(component: &CompiledComponent, package: &str) -> Option<u64> {
+    for name in component.imported_instance_names() {
         // `name` is an instance import like `<package>/<iface>@MAJOR.minor.patch`
         // or, for a legacy/unversioned component, `<package>/<iface>`.
-        let pkg = name.split('/').next().unwrap_or(name);
+        let pkg = name.split('/').next().unwrap_or(&name);
         if pkg.starts_with(package) {
             return match name.rsplit_once('@') {
                 Some((_, ver)) => ver.split('.').next().and_then(|m| m.parse::<u64>().ok()),
@@ -76,16 +74,16 @@ pub fn component_contract_major(
 /// are ADDITIVE, so a host at `MAJOR.minor` can load any component built at
 /// `MAJOR.k` for `k <= minor`, but NOT one built at a higher minor (it imports
 /// interfaces the host does not provide). The introspection mirrors
-/// [`component_contract_major`]: scan `component_type().imports`, whose instance
-/// names look like `duckdb:extension/runtime@2.1.0`.
+/// [`component_contract_major`]: scan
+/// [`CompiledComponent::imported_instance_names`], whose entries look like
+/// `duckdb:extension/runtime@2.1.0`.
 pub fn component_contract_version(
-    engine: &Engine,
-    component: &Component,
+    component: &CompiledComponent,
     package: &str,
 ) -> Option<(u64, u64)> {
     let mut found: Option<(u64, u64)> = None;
-    for (name, _) in component.component_type().imports(engine) {
-        let pkg = name.split('/').next().unwrap_or(name);
+    for name in component.imported_instance_names() {
+        let pkg = name.split('/').next().unwrap_or(&name);
         if !pkg.starts_with(package) {
             continue;
         }
