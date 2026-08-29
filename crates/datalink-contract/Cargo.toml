@@ -8,8 +8,21 @@ license = "MIT"
 repository = "https://github.com/tegmentum/datalink"
 
 [dependencies]
-# The component-model engine. Pinned to the version both hosts run (sqlink +
-# ducklink are on wasmtime 47.0.2) so the introspected component types are
-# ABI-identical across the consumers.
-wasmtime = { version = "48.0.0", features = ["component-model"] }
+# ADR-0029 (wasmos-side) Phase 6.1b migration — datalink-contract now
+# consumes the wasmos runtime abstraction rather than a direct wasmtime
+# dep. The two leaky pub fns (component_contract_major /
+# component_contract_version) previously took (&Engine, &Component)
+# and called `component.component_type().imports(engine)`; they now
+# take &CompiledComponent and call the abstraction's
+# `imported_instance_names()`. The full wasmtime dep drops entirely.
+#
+# See docs/design/runtime-abstraction/phase-6-1-component-metadata-introspection.md
+# in the wasmos repo for the design; the api surface added at wasmos
+# commit 8579294.
+#
+# Path dep to the peer wasmos repo — matches the pattern datalink
+# uses for its other cross-repo peer deps (secure-log, mosaic-core,
+# etc.). Once wasmos-runtime-api is published to crates.io, switch to
+# `wasmos-runtime-api = "0.1"` here.
+wasmos-runtime-api = { path = "../../../wasmos/runtime/api" }
 anyhow = "1.0"
