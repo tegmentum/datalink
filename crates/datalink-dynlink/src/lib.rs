@@ -242,17 +242,11 @@ pub trait ProviderBackend: Send + Sync + 'static {
 /// backend-owned `Handle` values. The rep becomes the wasmtime
 /// resource's internal representation via
 /// [`HostCallContext::new_host_resource`]; the guest observes it as
-/// an opaque `Resource<Instance>` handle.
-///
-/// TODO(phase-6.2.b.3): the `invoke` dispatch needs a way to
-/// recover the rep from a `Value::Resource` received as an arg from
-/// the guest. Currently uses `handle_id as u32` as a proxy, which
-/// works ONLY when the abstraction's assigned handle_id happens to
-/// match the rep we requested. Integration testing will surface
-/// the divergence; the fix is either a new
-/// `HostCallContext::resolve_host_resource(&Value)` method or a
-/// `rep: Option<u32>` field on Value::Resource for host-owned
-/// handles.
+/// an opaque `Resource<Instance>` handle. On invoke, the guest's
+/// `Value::Resource` passes through
+/// [`HostCallContext::resource_rep`] (Phase 6.2.b.3) to recover the
+/// original rep, which is then used to look up the backend handle
+/// in the table.
 pub struct DynLinkBridge<B: ProviderBackend> {
     backend: Arc<B>,
     handles: AsyncMutex<HandleTable<B::Handle>>,
@@ -303,7 +297,7 @@ impl<B: ProviderBackend> HostCall for DynLinkBridge<B> {
         match method {
             "resolve-by-id" => self.dispatch_resolve_by_id(ctx, args).await,
             "resolve-by-digest" => self.dispatch_resolve_by_digest(ctx, args).await,
-            m if m == INVOKE_METHOD => self.dispatch_invoke(args).await,
+            m if m == INVOKE_METHOD => self.dispatch_invoke(ctx, args).await,
             // Drop is handled by the adapter's no-op destructor
             // (Phase 6.2.b registered resource types with a no-op
             // dtor). If a future adapter routes drop through here,
@@ -369,16 +363,14 @@ impl<B: ProviderBackend> DynLinkBridge<B> {
         }
     }
 
-    async fn dispatch_invoke(&self, args: Vec<Value>) -> RuntimeResult<Vec<Value>> {
-        // TODO(phase-6.2.b.3): recover the wasmtime rep from
-        // Value::Resource received as an arg. Currently uses
-        // handle_id-as-rep, which is a placeholder — will need a
-        // proper HostCallContext helper (or Value::Resource
-        // extension) once end-to-end guest calls exercise this
-        // path.
-        let (rep_as_handle_id, method, payload) = match args.as_slice() {
-            [Value::Resource { handle_id, .. }, Value::String(m), Value::Bytes(p)] => {
-                (*handle_id as u32, m.clone(), p.clone())
+    async fn dispatch_invoke(
+        &self,
+        ctx: &mut HostCallContext<'_>,
+        args: Vec<Value>,
+    ) -> RuntimeResult<Vec<Value>> {
+        let (handle_value, method, payload) = match args.as_slice() {
+            [Value::Resource { .. }, Value::String(m), Value::Bytes(p)] => {
+                (args[0].clone(), m.clone(), p.clone())
             }
             other => {
                 return Err(RuntimeError::msg(format!(
@@ -386,17 +378,17 @@ impl<B: ProviderBackend> DynLinkBridge<B> {
                 )));
             }
         };
+        // Phase 6.2.b.3 — recover the rep the host supplied when
+        // it minted this handle via ctx.new_host_resource.
+        let rep = ctx.resource_rep(&handle_value)?;
         let handle = {
             let table = self.handles.lock().await;
-            table
-                .get(rep_as_handle_id)
-                .cloned()
-                .ok_or_else(|| {
-                    RuntimeError::msg(format!(
-                        "invoke: unknown handle rep {rep_as_handle_id} (see \
-                         phase-6.2.b.3 TODO in datalink-dynlink lib.rs)"
-                    ))
-                })?
+            table.get(rep).cloned().ok_or_else(|| {
+                RuntimeError::msg(format!(
+                    "invoke: no backend handle for rep={rep} — the guest may have passed a \
+                     handle from a stale registry, or the backend forgot to store it"
+                ))
+            })?
         };
         let result = match self.backend.invoke(&handle, &method, payload).await {
             Ok(bytes) => Value::Result(Ok(Some(Box::new(Value::Bytes(bytes))))),
