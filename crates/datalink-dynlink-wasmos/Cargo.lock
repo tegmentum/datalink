@@ -154,7 +154,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "wasmos-runtime-api"
 version = "0.1.0"
-source = "git+https://github.com/tegmentum/wasmos.git?rev=e2b2422cb6f2335d3672f8dfa95e6e6bdcf797d3#e2b2422cb6f2335d3672f8dfa95e6e6bdcf797d3"
+source = "git+https://github.com/tegmentum/wasmos.git?rev=5010d1d538606d0721f8d45d9320ce1f76689c0d#5010d1d538606d0721f8d45d9320ce1f76689c0d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -166,7 +166,7 @@ dependencies = [
 [[package]]
 name = "wasmos-runtime-api-macros"
 version = "0.1.0"
-source = "git+https://github.com/tegmentum/wasmos.git?rev=e2b2422cb6f2335d3672f8dfa95e6e6bdcf797d3#e2b2422cb6f2335d3672f8dfa95e6e6bdcf797d3"
+source = "git+https://github.com/tegmentum/wasmos.git?rev=5010d1d538606d0721f8d45d9320ce1f76689c0d#5010d1d538606d0721f8d45d9320ce1f76689c0d"
 dependencies = [
  "proc-macro2",
  "quote",

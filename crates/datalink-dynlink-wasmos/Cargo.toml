@@ -32,7 +32,7 @@ repository = "https://github.com/tegmentum/datalink"
 # bump when growing to consume new abstraction surface. Once
 # wasmos-runtime-api is published to crates.io, switch to a version
 # constraint.
-wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", rev = "e2b2422cb6f2335d3672f8dfa95e6e6bdcf797d3" }
+wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", rev = "5010d1d538606d0721f8d45d9320ce1f76689c0d" }
 # NOTE: no wasmos-runtime-select dep! This crate stays runtime-agnostic
 # by taking `Arc<dyn Runtime>` — the consumer picks their runtime
 # (wasmos-runtime-wasmtime-v48, edge, future WAMR/browser adapters).
