@@ -31,5 +31,5 @@ repository = "https://github.com/tegmentum/datalink"
 # Rev pinning: bump when wasmos-runtime-api changes; consumers of
 # datalink-contract (this dep is transitive to them) inherit the pin
 # implicitly and rebuild against the pinned wasmos snapshot.
-wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", rev = "8937810ced6580fc0f9b19b708097368c15a1474" }
+wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", rev = "06147e0479d25d87c67416c78ec315b1bc9a1d23" }
 anyhow = "1.0"
