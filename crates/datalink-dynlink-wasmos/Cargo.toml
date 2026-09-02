@@ -28,11 +28,10 @@ repository = "https://github.com/tegmentum/datalink"
 # resource destructor (no-op today; Phase 6+ workload if drop-hooks are
 # needed).
 #
-# Git-pinned to wasmos main tip at the time of this crate's rewrite;
-# bump when growing to consume new abstraction surface. Once
-# wasmos-runtime-api is published to crates.io, switch to a version
-# constraint.
-wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", rev = "5010d1d538606d0721f8d45d9320ce1f76689c0d" }
+# Pinned to a wasmos release tag; bump when growing to consume new
+# abstraction surface. Once wasmos-runtime-api is published to
+# crates.io, switch to a version constraint.
+wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", tag = "v0.1.0" }
 # NOTE: no wasmos-runtime-select dep! This crate stays runtime-agnostic
 # by taking `Arc<dyn Runtime>` — the consumer picks their runtime
 # (wasmos-runtime-wasmtime-v48, edge, future WAMR/browser adapters).

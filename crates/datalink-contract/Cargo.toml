@@ -28,8 +28,8 @@ repository = "https://github.com/tegmentum/datalink"
 # wasmos-runtime-api is published to crates.io, switch this to
 # `wasmos-runtime-api = "0.1"`.
 #
-# Rev pinning: bump when wasmos-runtime-api changes; consumers of
+# Tag pinning: bump when a new wasmos release is cut; consumers of
 # datalink-contract (this dep is transitive to them) inherit the pin
-# implicitly and rebuild against the pinned wasmos snapshot.
-wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", rev = "5010d1d538606d0721f8d45d9320ce1f76689c0d" }
+# implicitly and rebuild against the pinned wasmos release.
+wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", tag = "v0.1.0" }
 anyhow = "1.0"
