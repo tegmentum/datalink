@@ -31,5 +31,5 @@ repository = "https://github.com/tegmentum/datalink"
 # Tag pinning: bump when a new wasmos release is cut; consumers of
 # datalink-contract (this dep is transitive to them) inherit the pin
 # implicitly and rebuild against the pinned wasmos release.
-wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", tag = "v0.1.0" }
+wasmos-runtime-api = { git = "https://github.com/tegmentum/wasmos.git", tag = "v0.3.2" }
 anyhow = "1.0"

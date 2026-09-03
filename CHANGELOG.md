@@ -8,6 +8,37 @@ this project uses [SemVer](https://semver.org/) and is pre-1.0, so
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-03
+
+Bumps the internal wasmos pin from v0.1.0 to v0.3.2. Breaking for
+downstream consumers of `datalink-contract` / `datalink-dynlink-wasmos`
+— their host code must be on wasmos v0.3.2 too, or the shared
+wasmos-runtime-api type in the datalink-contract boundary won't
+match. Pin as:
+
+```toml
+datalink-contract        = { git = "https://github.com/tegmentum/datalink.git", tag = "v0.2.0" }
+datalink-dynlink         = { git = "https://github.com/tegmentum/datalink.git", tag = "v0.2.0" }
+datalink-dynlink-wasmos  = { git = "https://github.com/tegmentum/datalink.git", tag = "v0.2.0" }
+```
+
+### Changed
+
+- `datalink-contract` — internal `wasmos-runtime-api` pin bumped
+  v0.1.0 → v0.3.2. Its `verify_component`/`verify_bytes` surfaces
+  still take a `&(impl WasmComponent + WasmModule)` — the trait is
+  the same one, just resolved from a newer wasmos revision.
+- `datalink-dynlink-wasmos` — same wasmos pin bump; no API change.
+
+### Breaking
+
+- `datalink-contract` and `datalink-dynlink-wasmos` are now
+  built against wasmos v0.3.2 types. Downstream repos that use
+  `datalink-contract::verify_*` or the `-dynlink-wasmos` bridge
+  must migrate to wasmos v0.3.2 simultaneously — the shared
+  `wasmos-runtime-api` type at the boundary makes this a
+  lockstep bump.
+
 ## [0.1.0] — 2026-09-02
 
 First tagged release. Establishes a stable pin for downstream repos
@@ -60,5 +91,6 @@ datalink-dynlink-wasmos  = { git = "https://github.com/tegmentum/datalink.git", 
   runtime-abstraction/`); the datalink release note at the wasmos
   side lists which rev each consumer used to hold.
 
-[Unreleased]: https://github.com/tegmentum/datalink/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/tegmentum/datalink/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/tegmentum/datalink/releases/tag/v0.2.0
 [0.1.0]: https://github.com/tegmentum/datalink/releases/tag/v0.1.0
