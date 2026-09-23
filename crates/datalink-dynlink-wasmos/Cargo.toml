@@ -50,6 +50,15 @@ async-trait = "0.1"
 # feature is enough — no runtime/net.
 tokio = { version = "1", features = ["sync"] }
 
+# `futures::executor::block_on` drives the async `ProviderBackend`
+# methods from inside the `SyncHostCall`-shaped `DynLinkBridge`. The
+# bridge registers under `HostImports::register_sync` so wasmos'
+# sync_dispatch (Ready-on-first-poll under `now_or_never`) sees an
+# already-Ready future; the `block_on` inside the sync body sits on
+# a separate LocalPool from wasmos itself (wasmos doesn't run one),
+# so no executor nesting.
+futures = { version = "0.3", default-features = false, features = ["executor", "std"] }
+
 # `Bytes` for zero-copy payload handoff into Value::Bytes. Matches
 # ComponentSource::Bytes convention on the wasmos side.
 bytes = "1"

@@ -60,11 +60,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex as AsyncMutex;
 
 use wasmos_runtime_api::{
-    ComponentSource, ExecutionContext, HostCall, HostCallContext, HostImports, Instance, Runtime,
-    RuntimeError, RuntimeResult, Value, WasiEnvironment,
+    ComponentSource, ExecutionContext, HostCallContext, HostImports, Instance, Runtime,
+    RuntimeError, RuntimeResult, SyncHostCall, Value, WasiEnvironment,
 };
 use wasmos_runtime_api::wasi::Preopen;
 
@@ -235,7 +236,7 @@ pub trait ProviderBackend: Send + Sync + 'static {
 
 // ─── DynLinkBridge ──────────────────────────────────────────────────
 
-/// The [`HostCall`] implementation that routes
+/// The [`SyncHostCall`] implementation that routes
 /// `compose:dynlink/linker` method calls to a [`ProviderBackend`].
 ///
 /// Handle table: maps freshly-minted `u32` rep values to
@@ -247,9 +248,25 @@ pub trait ProviderBackend: Send + Sync + 'static {
 /// [`HostCallContext::resource_rep`] (Phase 6.2.b.3) to recover the
 /// original rep, which is then used to look up the backend handle
 /// in the table.
+///
+/// ## `sync_dispatch` alignment
+///
+/// Registered on [`HostImports`] via [`HostImports::register_sync`]
+/// (see [`install_host_imports`]). Under
+/// `RuntimeConfig::sync_dispatch(true)` wasmos polls host handlers
+/// via `now_or_never` — no executor entered — so a handler MUST be
+/// Ready on first poll. The [`SyncHostCallAdapter`] wrapping
+/// `SyncHostCall` guarantees that. The sync body drives the async
+/// [`ProviderBackend`] methods via [`futures::executor::block_on`],
+/// which is safe here (no LocalPool nesting — wasmos itself is not
+/// running an executor around this call). A [`ProviderBackend`] impl
+/// whose body needs a tokio runtime (`spawn_blocking`, tokio I/O,
+/// timers) will panic when driven this way; pre-registering
+/// providers at [`ProviderRegistry::register_provider`] time keeps
+/// the on-invoke path purely-cached and avoids that.
 pub struct DynLinkBridge<B: ProviderBackend> {
     backend: Arc<B>,
-    handles: AsyncMutex<HandleTable<B::Handle>>,
+    handles: StdMutex<HandleTable<B::Handle>>,
 }
 
 struct HandleTable<H> {
@@ -281,23 +298,22 @@ impl<H> HandleTable<H> {
 
 impl<B: ProviderBackend> DynLinkBridge<B> {
     /// Construct a fresh bridge over the given backend.
-    pub fn new(backend: Arc<B>) -> Arc<Self> {
-        Arc::new(Self { backend, handles: AsyncMutex::new(HandleTable::new()) })
+    pub fn new(backend: Arc<B>) -> Self {
+        Self { backend, handles: StdMutex::new(HandleTable::new()) }
     }
 }
 
-#[async_trait]
-impl<B: ProviderBackend> HostCall for DynLinkBridge<B> {
-    async fn call(
+impl<B: ProviderBackend> SyncHostCall for DynLinkBridge<B> {
+    fn call(
         &self,
         ctx: &mut HostCallContext<'_>,
         method: &str,
         args: Vec<Value>,
     ) -> RuntimeResult<Vec<Value>> {
         match method {
-            "resolve-by-id" => self.dispatch_resolve_by_id(ctx, args).await,
-            "resolve-by-digest" => self.dispatch_resolve_by_digest(ctx, args).await,
-            m if m == INVOKE_METHOD => self.dispatch_invoke(ctx, args).await,
+            "resolve-by-id" => self.dispatch_resolve_by_id(ctx, args),
+            "resolve-by-digest" => self.dispatch_resolve_by_digest(ctx, args),
+            m if m == INVOKE_METHOD => self.dispatch_invoke(ctx, args),
             // Drop is handled by the adapter's no-op destructor
             // (Phase 6.2.b registered resource types with a no-op
             // dtor). If a future adapter routes drop through here,
@@ -311,7 +327,7 @@ impl<B: ProviderBackend> HostCall for DynLinkBridge<B> {
 }
 
 impl<B: ProviderBackend> DynLinkBridge<B> {
-    async fn dispatch_resolve_by_id(
+    fn dispatch_resolve_by_id(
         &self,
         ctx: &mut HostCallContext<'_>,
         args: Vec<Value>,
@@ -324,10 +340,15 @@ impl<B: ProviderBackend> DynLinkBridge<B> {
                 )));
             }
         };
-        match self.backend.resolve_by_id(&id).await {
+        // `block_on` drives the async `ProviderBackend` method under
+        // wasmos's sync_dispatch — safe because wasmos polls this
+        // handler via `now_or_never` (no outer executor to nest
+        // under). See the `DynLinkBridge` docstring for the
+        // implicit pre-warm invariant.
+        match futures::executor::block_on(self.backend.resolve_by_id(&id)) {
             Ok(handle) => {
                 let rep = {
-                    let mut table = self.handles.lock().await;
+                    let mut table = self.handles.lock().expect("handle table poisoned");
                     table.insert(handle)
                 };
                 let resource = ctx.new_host_resource(LINKER_INTERFACE, INSTANCE_RESOURCE, rep)?;
@@ -337,7 +358,7 @@ impl<B: ProviderBackend> DynLinkBridge<B> {
         }
     }
 
-    async fn dispatch_resolve_by_digest(
+    fn dispatch_resolve_by_digest(
         &self,
         ctx: &mut HostCallContext<'_>,
         args: Vec<Value>,
@@ -350,10 +371,10 @@ impl<B: ProviderBackend> DynLinkBridge<B> {
                 )));
             }
         };
-        match self.backend.resolve_by_digest(&digest).await {
+        match futures::executor::block_on(self.backend.resolve_by_digest(&digest)) {
             Ok(handle) => {
                 let rep = {
-                    let mut table = self.handles.lock().await;
+                    let mut table = self.handles.lock().expect("handle table poisoned");
                     table.insert(handle)
                 };
                 let resource = ctx.new_host_resource(LINKER_INTERFACE, INSTANCE_RESOURCE, rep)?;
@@ -363,7 +384,7 @@ impl<B: ProviderBackend> DynLinkBridge<B> {
         }
     }
 
-    async fn dispatch_invoke(
+    fn dispatch_invoke(
         &self,
         ctx: &mut HostCallContext<'_>,
         args: Vec<Value>,
@@ -382,7 +403,7 @@ impl<B: ProviderBackend> DynLinkBridge<B> {
         // it minted this handle via ctx.new_host_resource.
         let rep = ctx.resource_rep(&handle_value)?;
         let handle = {
-            let table = self.handles.lock().await;
+            let table = self.handles.lock().expect("handle table poisoned");
             table.get(rep).cloned().ok_or_else(|| {
                 RuntimeError::msg(format!(
                     "invoke: no backend handle for rep={rep} — the guest may have passed a \
@@ -390,7 +411,9 @@ impl<B: ProviderBackend> DynLinkBridge<B> {
                 ))
             })?
         };
-        let result = match self.backend.invoke(&handle, &method, payload).await {
+        let result = match futures::executor::block_on(
+            self.backend.invoke(&handle, &method, payload),
+        ) {
             Ok(bytes) => Value::Result(Ok(Some(Box::new(Value::Bytes(bytes))))),
             Err(e) => Value::Result(Err(Some(Box::new(e.to_value())))),
         };
@@ -400,12 +423,24 @@ impl<B: ProviderBackend> DynLinkBridge<B> {
 
 /// Install the `compose:dynlink/linker` handler on the given
 /// [`HostImports`], returning the updated builder.
+///
+/// Safe under `RuntimeConfig::sync_dispatch(true)` when all providers
+/// are pre-registered (compile fires at
+/// [`ProviderRegistry::register_provider`] time, not first-invoke).
+/// The handler is registered via [`HostImports::register_sync`], so
+/// wasmos wraps it in `SyncHostCallAdapter` and guarantees
+/// Ready-on-first-poll under sync_dispatch's `now_or_never` polling
+/// discipline. The sync body drives the async [`ProviderBackend`]
+/// methods with [`futures::executor::block_on`]; a `ProviderBackend`
+/// impl whose body needs a tokio runtime (`spawn_blocking`, tokio
+/// I/O, timers) fired from a callback will panic, which is why
+/// pre-warming matters — the on-invoke path stays purely-cached.
 pub fn install_host_imports<B: ProviderBackend>(
     host_imports: HostImports,
     backend: Arc<B>,
 ) -> HostImports {
     let bridge = DynLinkBridge::new(backend);
-    host_imports.register(LINKER_INTERFACE, bridge)
+    host_imports.register_sync(LINKER_INTERFACE, bridge)
 }
 
 // ─── ProviderPreopen ────────────────────────────────────────────────
