@@ -2,3 +2,7 @@
 # tokens. Per-crate .gitignore files handle each crate's /target; this
 # file only handles repo-root secrets that don't fit that pattern.
 /r2.env
+
+# Compose build cache — populated by `cargo compose` and friends;
+# per-artifact temp dir, safe to ignore repo-wide.
+/.compose/
