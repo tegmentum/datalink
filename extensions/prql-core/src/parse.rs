@@ -126,7 +126,10 @@ mod tests {
 
     #[test]
     fn transparent_pipeline_compiles() {
-        let sql = rw("from invoices | filter total > 100 | select {id, total}", DUCKDB);
+        let sql = rw(
+            "from invoices | filter total > 100 | select {id, total}",
+            DUCKDB,
+        );
         let up = sql.to_uppercase();
         assert!(up.contains("SELECT"), "{sql}");
         assert!(up.contains("FROM"), "{sql}");

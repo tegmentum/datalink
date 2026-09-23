@@ -47,13 +47,20 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
     use std::vec;
 
     #[test]
     fn suffixes() {
-        for (n, want) in [(1, "1st"), (2, "2nd"), (3, "3rd"), (11, "11th"), (21, "21st"), (113, "113th")] {
+        for (n, want) in [
+            (1, "1st"),
+            (2, "2nd"),
+            (3, "3rd"),
+            (11, "11th"),
+            (21, "21st"),
+            (113, "113th"),
+        ] {
             assert_eq!(
                 Core::dispatch(0, &[NeutralValue::Int64(n)]).unwrap(),
                 NeutralValue::Text(String::from(want))

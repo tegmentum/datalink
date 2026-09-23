@@ -67,7 +67,9 @@ pub mod logic {
 
     /// Collect base-10 digits, ignoring any other character.
     pub fn digits(s: &str) -> Vec<u8> {
-        s.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect()
+        s.chars()
+            .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+            .collect()
     }
 
     /// Verhoeff running check. `for_append` shifts the permutation row so the

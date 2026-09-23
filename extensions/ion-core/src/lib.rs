@@ -36,7 +36,9 @@ pub mod logic {
                 .map(Json::Number)
                 .unwrap_or(Json::Null),
             Value::Decimal(_) => match e.as_float() {
-                Some(f) => serde_json::Number::from_f64(f).map(Json::Number).unwrap_or_else(|| Json::String(e.to_string())),
+                Some(f) => serde_json::Number::from_f64(f)
+                    .map(Json::Number)
+                    .unwrap_or_else(|| Json::String(e.to_string())),
                 None => Json::String(e.to_string()),
             },
             Value::String(s) => Json::String(s.text().to_string()),
@@ -130,14 +132,30 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("ion_to_json"), &[t("{a:1, b:\"hi\"}")]).unwrap(), t("{\"a\":1,\"b\":\"hi\"}"));
-        assert_eq!(Core::dispatch(idx("ion_get"), &[t("{a:1, b:2}"), t("b")]).unwrap(), t("2"));
-        assert_eq!(Core::dispatch(idx("ion_to_json"), &[t("{not valid")]).unwrap(), NeutralValue::Null);
-        assert_eq!(Core::dispatch(idx("ion_from_json"), &[t("{not json")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("ion_to_json"), &[t("{a:1, b:\"hi\"}")]).unwrap(),
+            t("{\"a\":1,\"b\":\"hi\"}")
+        );
+        assert_eq!(
+            Core::dispatch(idx("ion_get"), &[t("{a:1, b:2}"), t("b")]).unwrap(),
+            t("2")
+        );
+        assert_eq!(
+            Core::dispatch(idx("ion_to_json"), &[t("{not valid")]).unwrap(),
+            NeutralValue::Null
+        );
+        assert_eq!(
+            Core::dispatch(idx("ion_from_json"), &[t("{not json")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

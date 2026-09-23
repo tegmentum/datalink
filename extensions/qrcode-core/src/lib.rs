@@ -43,8 +43,12 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {

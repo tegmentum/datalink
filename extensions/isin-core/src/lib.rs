@@ -77,7 +77,9 @@ pub mod logic {
         if normalized.len() != 12 {
             return None;
         }
-        expand(&normalized[..11]).as_deref().and_then(luhn_check_digit)
+        expand(&normalized[..11])
+            .as_deref()
+            .and_then(luhn_check_digit)
     }
 
     /// True if the normalized ISIN's trailing check digit is correct.
@@ -131,8 +133,8 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
     fn t(s: &str) -> NeutralValue {
         NeutralValue::Text(String::from(s))
@@ -143,11 +145,29 @@ mod tests {
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("isin_validate"), &[t("US0378331005")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("isin_validate"), &[t("US0378331006")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("isin_check_digit"), &[t("US0378331005")]).unwrap(), NeutralValue::Int64(5));
-        assert_eq!(Core::dispatch(idx("isin_country"), &[t("US0378331005")]).unwrap(), t("US"));
-        assert_eq!(Core::dispatch(idx("isin_nsin"), &[t("US0378331005")]).unwrap(), t("037833100"));
-        assert_eq!(Core::dispatch(idx("isin_check_digit"), &[t("junk")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("isin_validate"), &[t("US0378331005")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("isin_validate"), &[t("US0378331006")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("isin_check_digit"), &[t("US0378331005")]).unwrap(),
+            NeutralValue::Int64(5)
+        );
+        assert_eq!(
+            Core::dispatch(idx("isin_country"), &[t("US0378331005")]).unwrap(),
+            t("US")
+        );
+        assert_eq!(
+            Core::dispatch(idx("isin_nsin"), &[t("US0378331005")]).unwrap(),
+            t("037833100")
+        );
+        assert_eq!(
+            Core::dispatch(idx("isin_check_digit"), &[t("junk")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

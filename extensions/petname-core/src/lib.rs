@@ -42,7 +42,15 @@ mod tests {
 
     #[test]
     fn generates_with_sep() {
-        match Core::dispatch(0, &[NeutralValue::Int64(2), NeutralValue::Text(String::from("."))]).unwrap() {
+        match Core::dispatch(
+            0,
+            &[
+                NeutralValue::Int64(2),
+                NeutralValue::Text(String::from(".")),
+            ],
+        )
+        .unwrap()
+        {
             NeutralValue::Text(s) => assert!(s.contains('.')),
             _ => panic!("expected text"),
         }

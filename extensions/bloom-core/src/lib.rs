@@ -125,10 +125,16 @@ mod tests {
         NeutralValue::Text(alloc::string::String::from(s))
     }
     fn aidx() -> usize {
-        Core::DECLS.iter().position(|d| d.name == "bloom_filter").unwrap()
+        Core::DECLS
+            .iter()
+            .position(|d| d.name == "bloom_filter")
+            .unwrap()
     }
     fn sidx() -> usize {
-        Core::DECLS.iter().position(|d| d.name == "bloom_contains").unwrap()
+        Core::DECLS
+            .iter()
+            .position(|d| d.name == "bloom_contains")
+            .unwrap()
     }
 
     #[test]

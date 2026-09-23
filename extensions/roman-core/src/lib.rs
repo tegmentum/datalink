@@ -25,15 +25,31 @@ pub mod logic {
     use alloc::string::String;
 
     const PAIRS: &[(i64, &str)] = &[
-        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"),
-        (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"),
-        (5, "V"), (4, "IV"), (1, "I"),
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
     ];
 
     fn char_to_val(c: char) -> Option<i64> {
         match c {
-            'I' => Some(1), 'V' => Some(5), 'X' => Some(10), 'L' => Some(50),
-            'C' => Some(100), 'D' => Some(500), 'M' => Some(1000), _ => None,
+            'I' => Some(1),
+            'V' => Some(5),
+            'X' => Some(10),
+            'L' => Some(50),
+            'C' => Some(100),
+            'D' => Some(500),
+            'M' => Some(1000),
+            _ => None,
         }
     }
 
@@ -125,30 +141,72 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn i(n: i64) -> NeutralValue { NeutralValue::Int64(n) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn i(n: i64) -> NeutralValue {
+        NeutralValue::Int64(n)
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn ducklink_family() {
-        assert_eq!(Core::dispatch(idx("to_roman"), &[i(2024)]).unwrap(), t("MMXXIV"));
-        assert_eq!(Core::dispatch(idx("to_roman"), &[i(49)]).unwrap(), t("XLIX"));
-        assert_eq!(Core::dispatch(idx("to_roman"), &[i(0)]).unwrap(), NeutralValue::Null);
-        assert_eq!(Core::dispatch(idx("from_roman"), &[t("MCMLXXXIV")]).unwrap(), i(1984));
-        assert_eq!(Core::dispatch(idx("from_roman"), &[t("NOPE")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("to_roman"), &[i(2024)]).unwrap(),
+            t("MMXXIV")
+        );
+        assert_eq!(
+            Core::dispatch(idx("to_roman"), &[i(49)]).unwrap(),
+            t("XLIX")
+        );
+        assert_eq!(
+            Core::dispatch(idx("to_roman"), &[i(0)]).unwrap(),
+            NeutralValue::Null
+        );
+        assert_eq!(
+            Core::dispatch(idx("from_roman"), &[t("MCMLXXXIV")]).unwrap(),
+            i(1984)
+        );
+        assert_eq!(
+            Core::dispatch(idx("from_roman"), &[t("NOPE")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 
     #[test]
     fn sqlink_family() {
-        assert_eq!(Core::dispatch(idx("roman_encode"), &[i(1)]).unwrap(), t("I"));
-        assert_eq!(Core::dispatch(idx("roman_encode"), &[i(3999)]).unwrap(), t("MMMCMXCIX"));
-        assert_eq!(Core::dispatch(idx("roman_encode"), &[i(4000)]).unwrap(), NeutralValue::Null);
-        assert_eq!(Core::dispatch(idx("roman_decode"), &[t("MCMXCIV")]).unwrap(), i(1994));
-        assert_eq!(Core::dispatch(idx("roman_decode"), &[t("iv")]).unwrap(), i(4));
-        assert_eq!(Core::dispatch(idx("roman_validate"), &[t("MCMXCIV")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("roman_validate"), &[t("IIII")]).unwrap(), NeutralValue::Boolean(false));
+        assert_eq!(
+            Core::dispatch(idx("roman_encode"), &[i(1)]).unwrap(),
+            t("I")
+        );
+        assert_eq!(
+            Core::dispatch(idx("roman_encode"), &[i(3999)]).unwrap(),
+            t("MMMCMXCIX")
+        );
+        assert_eq!(
+            Core::dispatch(idx("roman_encode"), &[i(4000)]).unwrap(),
+            NeutralValue::Null
+        );
+        assert_eq!(
+            Core::dispatch(idx("roman_decode"), &[t("MCMXCIV")]).unwrap(),
+            i(1994)
+        );
+        assert_eq!(
+            Core::dispatch(idx("roman_decode"), &[t("iv")]).unwrap(),
+            i(4)
+        );
+        assert_eq!(
+            Core::dispatch(idx("roman_validate"), &[t("MCMXCIV")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("roman_validate"), &[t("IIII")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
     }
 }

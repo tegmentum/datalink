@@ -76,7 +76,11 @@ mod tests {
     #[test]
     fn roundtrip() {
         // 8 hex bytes (multiple of 4) -> z85 -> back to the same hex.
-        let enc = Core::dispatch(idx("z85_encode"), &[t("86 4f d2 6f b5 59 f7 5b".replace(' ', "").as_str())]).unwrap();
+        let enc = Core::dispatch(
+            idx("z85_encode"),
+            &[t("86 4f d2 6f b5 59 f7 5b".replace(' ', "").as_str())],
+        )
+        .unwrap();
         let ct = match &enc {
             NeutralValue::Text(s) => s.clone(),
             o => panic!("{o:?}"),

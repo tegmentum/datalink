@@ -31,8 +31,10 @@ pub mod logic {
         if n.len() < 15 || n.len() > 34 {
             return false;
         }
-        if !b[0].is_ascii_alphabetic() || !b[1].is_ascii_alphabetic()
-            || !b[2].is_ascii_digit() || !b[3].is_ascii_digit()
+        if !b[0].is_ascii_alphabetic()
+            || !b[1].is_ascii_alphabetic()
+            || !b[2].is_ascii_digit()
+            || !b[3].is_ascii_digit()
         {
             return false;
         }
@@ -109,16 +111,38 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("iban_validate"), &[t("GB82 WEST 1234 5698 7654 32")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("iban_validate"), &[t("DE89370400440532013000")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("iban_validate"), &[t("GB82 WEST 1234 5698 7654 33")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("iban_validate"), &[t("not an iban")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("iban_country"), &[t("GB82WEST12345698765432")]).unwrap(), t("GB"));
-        assert_eq!(Core::dispatch(idx("iban_bban"), &[t("GB82WEST12345698765432")]).unwrap(), t("WEST12345698765432"));
+        assert_eq!(
+            Core::dispatch(idx("iban_validate"), &[t("GB82 WEST 1234 5698 7654 32")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("iban_validate"), &[t("DE89370400440532013000")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("iban_validate"), &[t("GB82 WEST 1234 5698 7654 33")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("iban_validate"), &[t("not an iban")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("iban_country"), &[t("GB82WEST12345698765432")]).unwrap(),
+            t("GB")
+        );
+        assert_eq!(
+            Core::dispatch(idx("iban_bban"), &[t("GB82WEST12345698765432")]).unwrap(),
+            t("WEST12345698765432")
+        );
     }
 }

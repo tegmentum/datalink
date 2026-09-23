@@ -34,13 +34,26 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("idna_to_ascii"), &[t("münchen.de")]).unwrap(), t("xn--mnchen-3ya.de"));
-        assert_eq!(Core::dispatch(idx("idna_to_unicode"), &[t("xn--mnchen-3ya.de")]).unwrap(), t("münchen.de"));
-        assert_eq!(Core::dispatch(idx("idna_to_ascii"), &[t("пример.рф")]).unwrap(), t("xn--e1afmkfd.xn--p1ai"));
+        assert_eq!(
+            Core::dispatch(idx("idna_to_ascii"), &[t("münchen.de")]).unwrap(),
+            t("xn--mnchen-3ya.de")
+        );
+        assert_eq!(
+            Core::dispatch(idx("idna_to_unicode"), &[t("xn--mnchen-3ya.de")]).unwrap(),
+            t("münchen.de")
+        );
+        assert_eq!(
+            Core::dispatch(idx("idna_to_ascii"), &[t("пример.рф")]).unwrap(),
+            t("xn--e1afmkfd.xn--p1ai")
+        );
     }
 }

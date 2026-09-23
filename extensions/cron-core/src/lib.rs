@@ -17,9 +17,9 @@
 extern crate alloc;
 
 use chrono::{DateTime, TimeZone, Utc};
+use core::str::FromStr;
 use croner::Cron;
 use datalink_extcore::NeutralValue;
-use core::str::FromStr;
 
 /// Parse a cron expression (DB-agnostic).
 pub fn parse_cron(expr: &str) -> Option<Cron> {
@@ -87,11 +87,19 @@ mod tests {
     fn parity_with_baseline_smoke() {
         // Reference ms = 1700000000000 (2023-11-14T22:13:20Z); daily midnight.
         assert_eq!(
-            Core::dispatch(idx("cron_next"), &[t("0 0 * * *"), NeutralValue::Int64(1700000000000)]).unwrap(),
+            Core::dispatch(
+                idx("cron_next"),
+                &[t("0 0 * * *"), NeutralValue::Int64(1700000000000)]
+            )
+            .unwrap(),
             NeutralValue::Int64(1700006400000)
         );
         assert_eq!(
-            Core::dispatch(idx("cron_prev"), &[t("0 0 * * *"), NeutralValue::Int64(1700000000000)]).unwrap(),
+            Core::dispatch(
+                idx("cron_prev"),
+                &[t("0 0 * * *"), NeutralValue::Int64(1700000000000)]
+            )
+            .unwrap(),
             NeutralValue::Int64(1699920000000)
         );
         assert_eq!(

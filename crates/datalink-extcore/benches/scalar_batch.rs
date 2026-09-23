@@ -68,7 +68,17 @@ fn old_per_row(table: &Mutex<HashMap<u32, usize>>, handle: u32, rows: Vec<Vec<Va
 
 fn new_batched(table: &Mutex<HashMap<u32, usize>>, handle: u32, rows: Vec<Vec<Val>>) -> Vec<Val> {
     let idx = *table.lock().unwrap().get(&handle).unwrap(); // resolve ONCE
-    scalar_batch(idx, false, rows, to_neutral, from_neutral, || Val::Null, dispatch, |e| e).unwrap()
+    scalar_batch(
+        idx,
+        false,
+        rows,
+        to_neutral,
+        from_neutral,
+        || Val::Null,
+        dispatch,
+        |e| e,
+    )
+    .unwrap()
 }
 
 fn bench(name: &str, iters: u64, mut f: impl FnMut()) {

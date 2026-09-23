@@ -82,8 +82,8 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
     fn t(s: &str) -> NeutralValue {
         NeutralValue::Text(String::from(s))
@@ -99,7 +99,8 @@ mod tests {
             NeutralValue::Text(s) => s.clone(),
             o => panic!("{o:?}"),
         };
-        let dec = Core::dispatch(idx("vigenere_decrypt"), &[NeutralValue::Text(ct), t("key")]).unwrap();
+        let dec =
+            Core::dispatch(idx("vigenere_decrypt"), &[NeutralValue::Text(ct), t("key")]).unwrap();
         assert_eq!(dec, t("Hello, World!"));
     }
 

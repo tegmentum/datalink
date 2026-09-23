@@ -104,7 +104,10 @@ mod tests {
         NeutralValue::Float64(x)
     }
     fn aidx() -> usize {
-        Core::DECLS.iter().position(|d| d.name == "tdigest").unwrap()
+        Core::DECLS
+            .iter()
+            .position(|d| d.name == "tdigest")
+            .unwrap()
     }
     fn qidx() -> usize {
         Core::DECLS
@@ -113,13 +116,15 @@ mod tests {
             .unwrap()
     }
     fn cidx() -> usize {
-        Core::DECLS.iter().position(|d| d.name == "tdigest_count").unwrap()
+        Core::DECLS
+            .iter()
+            .position(|d| d.name == "tdigest_count")
+            .unwrap()
     }
 
     #[test]
     fn build_then_query() {
-        let rows: alloc::vec::Vec<[NeutralValue; 1]> =
-            (1..=100).map(|n| [f(n as f64)]).collect();
+        let rows: alloc::vec::Vec<[NeutralValue; 1]> = (1..=100).map(|n| [f(n as f64)]).collect();
         let refs: alloc::vec::Vec<&[NeutralValue]> = rows.iter().map(|r| &r[..]).collect();
         let blob = match Core::dispatch_aggregate(aidx(), &refs).unwrap() {
             NeutralValue::Blob(b) => b,

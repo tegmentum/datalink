@@ -77,11 +77,25 @@ mod tests {
     #[test]
     fn bigrams_and_too_long() {
         assert_eq!(
-            Core::dispatch(0, &[NeutralValue::Text(String::from("hello")), NeutralValue::Int64(2)]).unwrap(),
+            Core::dispatch(
+                0,
+                &[
+                    NeutralValue::Text(String::from("hello")),
+                    NeutralValue::Int64(2)
+                ]
+            )
+            .unwrap(),
             NeutralValue::Text(String::from(r#"["he","el","ll","lo"]"#))
         );
         assert_eq!(
-            Core::dispatch(0, &[NeutralValue::Text(String::from("hi")), NeutralValue::Int64(5)]).unwrap(),
+            Core::dispatch(
+                0,
+                &[
+                    NeutralValue::Text(String::from("hi")),
+                    NeutralValue::Int64(5)
+                ]
+            )
+            .unwrap(),
             NeutralValue::Text(String::from("[]"))
         );
     }

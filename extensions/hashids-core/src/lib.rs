@@ -81,12 +81,27 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let enc = match Core::dispatch(idx("hashids_encode"), &[NeutralValue::Int64(42), NeutralValue::Text(String::from("salt"))]).unwrap() {
+        let enc = match Core::dispatch(
+            idx("hashids_encode"),
+            &[
+                NeutralValue::Int64(42),
+                NeutralValue::Text(String::from("salt")),
+            ],
+        )
+        .unwrap()
+        {
             NeutralValue::Text(s) => s,
             other => panic!("expected text, got {other:?}"),
         };
         assert_eq!(
-            Core::dispatch(idx("hashids_decode"), &[NeutralValue::Text(enc), NeutralValue::Text(String::from("salt"))]).unwrap(),
+            Core::dispatch(
+                idx("hashids_decode"),
+                &[
+                    NeutralValue::Text(enc),
+                    NeutralValue::Text(String::from("salt"))
+                ]
+            )
+            .unwrap(),
             NeutralValue::Int64(42)
         );
     }
@@ -94,7 +109,14 @@ mod tests {
     #[test]
     fn negative_is_null() {
         assert_eq!(
-            Core::dispatch(idx("hashids_encode"), &[NeutralValue::Int64(-1), NeutralValue::Text(String::from("s"))]).unwrap(),
+            Core::dispatch(
+                idx("hashids_encode"),
+                &[
+                    NeutralValue::Int64(-1),
+                    NeutralValue::Text(String::from("s"))
+                ]
+            )
+            .unwrap(),
             NeutralValue::Null
         );
     }

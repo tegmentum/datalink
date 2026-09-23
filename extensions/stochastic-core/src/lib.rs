@@ -11,7 +11,9 @@ extern crate alloc;
 use datalink_extcore::NeutralValue;
 
 pub mod logic {
-    use statrs::distribution::{Beta, Binomial, Continuous, ContinuousCDF, Discrete, Exp, Normal, Poisson};
+    use statrs::distribution::{
+        Beta, Binomial, Continuous, ContinuousCDF, Discrete, Exp, Normal, Poisson,
+    };
 
     pub fn normal_cdf(x: f64, mean: f64, sd: f64) -> Option<f64> {
         Normal::new(mean, sd).ok().map(|d| d.cdf(x))
@@ -135,16 +137,40 @@ mod tests {
     #[test]
     fn distributions() {
         approx(
-            Core::dispatch(idx("normal_cdf"), &[NeutralValue::Float64(0.0), NeutralValue::Float64(0.0), NeutralValue::Float64(1.0)]).unwrap(),
+            Core::dispatch(
+                idx("normal_cdf"),
+                &[
+                    NeutralValue::Float64(0.0),
+                    NeutralValue::Float64(0.0),
+                    NeutralValue::Float64(1.0),
+                ],
+            )
+            .unwrap(),
             0.5,
         );
         approx(
-            Core::dispatch(idx("binomial_pmf"), &[NeutralValue::Int64(2), NeutralValue::Int64(5), NeutralValue::Float64(0.5)]).unwrap(),
+            Core::dispatch(
+                idx("binomial_pmf"),
+                &[
+                    NeutralValue::Int64(2),
+                    NeutralValue::Int64(5),
+                    NeutralValue::Float64(0.5),
+                ],
+            )
+            .unwrap(),
             0.3125,
         );
         // invalid sd -> NULL
         assert_eq!(
-            Core::dispatch(idx("normal_cdf"), &[NeutralValue::Float64(0.0), NeutralValue::Float64(0.0), NeutralValue::Float64(0.0)]).unwrap(),
+            Core::dispatch(
+                idx("normal_cdf"),
+                &[
+                    NeutralValue::Float64(0.0),
+                    NeutralValue::Float64(0.0),
+                    NeutralValue::Float64(0.0)
+                ]
+            )
+            .unwrap(),
             NeutralValue::Null
         );
     }

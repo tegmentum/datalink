@@ -80,10 +80,25 @@ mod tests {
 
     #[test]
     fn parity_with_baseline_smoke() {
-        assert!((as_f64(Core::dispatch(idx("color_luminance"), &[t("white")]).unwrap()) - 1.0).abs() < 1e-4);
-        assert!(as_f64(Core::dispatch(idx("color_luminance"), &[t("black")]).unwrap()).abs() < 1e-4);
-        assert!((as_f64(Core::dispatch(idx("color_contrast"), &[t("white"), t("black")]).unwrap()) - 21.0).abs() < 0.1);
-        assert!((as_f64(Core::dispatch(idx("color_contrast"), &[t("#777"), t("#fff")]).unwrap()) - 4.48).abs() < 0.01);
+        assert!(
+            (as_f64(Core::dispatch(idx("color_luminance"), &[t("white")]).unwrap()) - 1.0).abs()
+                < 1e-4
+        );
+        assert!(
+            as_f64(Core::dispatch(idx("color_luminance"), &[t("black")]).unwrap()).abs() < 1e-4
+        );
+        assert!(
+            (as_f64(Core::dispatch(idx("color_contrast"), &[t("white"), t("black")]).unwrap())
+                - 21.0)
+                .abs()
+                < 0.1
+        );
+        assert!(
+            (as_f64(Core::dispatch(idx("color_contrast"), &[t("#777"), t("#fff")]).unwrap())
+                - 4.48)
+                .abs()
+                < 0.01
+        );
         assert_eq!(
             Core::dispatch(idx("color_luminance"), &[t("not-a-color")]).unwrap(),
             NeutralValue::Null

@@ -54,12 +54,16 @@ pub mod logic {
 
     /// The human-readable part of a bech32 string; `None` if it does not decode.
     pub fn hrp(s: &str) -> Option<String> {
-        bech32::decode(s.trim()).ok().map(|(hrp, _)| hrp.to_string())
+        bech32::decode(s.trim())
+            .ok()
+            .map(|(hrp, _)| hrp.to_string())
     }
 
     /// The data bytes of a bech32 string as hex; `None` if it does not decode.
     pub fn decode_hex(s: &str) -> Option<String> {
-        bech32::decode(s.trim()).ok().map(|(_, data)| hex_encode(&data))
+        bech32::decode(s.trim())
+            .ok()
+            .map(|(_, data)| hex_encode(&data))
     }
 }
 

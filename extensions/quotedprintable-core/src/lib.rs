@@ -60,6 +60,9 @@ mod tests {
             NeutralValue::Text(s) => s.clone(),
             _ => panic!(),
         };
-        assert_eq!(Core::dispatch(idx("qp_decode"), &[NeutralValue::Text(s)]).unwrap(), t("héllo"));
+        assert_eq!(
+            Core::dispatch(idx("qp_decode"), &[NeutralValue::Text(s)]).unwrap(),
+            t("héllo")
+        );
     }
 }

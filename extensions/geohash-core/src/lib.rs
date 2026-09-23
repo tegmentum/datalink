@@ -53,19 +53,34 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(alloc::string::String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(alloc::string::String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
         assert_eq!(
-            Core::dispatch(idx("geohash_encode"), &[NeutralValue::Float64(40.7484), NeutralValue::Float64(-73.9857), NeutralValue::Int64(5)]).unwrap(),
+            Core::dispatch(
+                idx("geohash_encode"),
+                &[
+                    NeutralValue::Float64(40.7484),
+                    NeutralValue::Float64(-73.9857),
+                    NeutralValue::Int64(5)
+                ]
+            )
+            .unwrap(),
             t("dr5ru")
         );
         match Core::dispatch(idx("geohash_decode_lat"), &[t("dr5ru")]).unwrap() {
             NeutralValue::Float64(v) => assert!((v - 40.76).abs() < 0.1),
             other => panic!("expected float, got {other:?}"),
         }
-        assert_eq!(Core::dispatch(idx("geohash_decode_lat"), &[t("not!valid")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("geohash_decode_lat"), &[t("not!valid")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

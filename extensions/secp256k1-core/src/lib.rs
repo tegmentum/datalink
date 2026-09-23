@@ -91,8 +91,12 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn b(v: Vec<u8>) -> NeutralValue { NeutralValue::Blob(v) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn b(v: Vec<u8>) -> NeutralValue {
+        NeutralValue::Blob(v)
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
@@ -103,12 +107,20 @@ mod tests {
             other => panic!("expected blob, got {other:?}"),
         };
         assert_eq!(pub_v.len(), 33);
-        let sig_v = match Core::dispatch(idx("secp256k1_sign"), &[b(hash.clone()), b(pk.clone())]).unwrap() {
+        let sig_v = match Core::dispatch(idx("secp256k1_sign"), &[b(hash.clone()), b(pk.clone())])
+            .unwrap()
+        {
             NeutralValue::Blob(v) => v,
             other => panic!("expected blob, got {other:?}"),
         };
         assert_eq!(sig_v.len(), 64);
-        assert_eq!(Core::dispatch(idx("secp256k1_verify"), &[b(hash), b(sig_v), b(pub_v)]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("secp256k1_pubkey"), &[b(vec![1u8, 2u8])]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("secp256k1_verify"), &[b(hash), b(sig_v), b(pub_v)]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("secp256k1_pubkey"), &[b(vec![1u8, 2u8])]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

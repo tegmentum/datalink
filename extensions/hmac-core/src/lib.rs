@@ -15,13 +15,15 @@ use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha512};
 
 pub fn hmac256(key: &str, msg: &str) -> String {
-    let mut mac = <Hmac<Sha256>>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
     mac.update(msg.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
 
 pub fn hmac512(key: &str, msg: &str) -> String {
-    let mut mac = <Hmac<Sha512>>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac =
+        <Hmac<Sha512>>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
     mac.update(msg.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
@@ -62,7 +64,11 @@ mod tests {
     fn known_vector() {
         // RFC-4231 test case 1.
         assert_eq!(
-            Core::dispatch(idx("hmac_sha256"), &[t("key"), t("The quick brown fox jumps over the lazy dog")]).unwrap(),
+            Core::dispatch(
+                idx("hmac_sha256"),
+                &[t("key"), t("The quick brown fox jumps over the lazy dog")]
+            )
+            .unwrap(),
             t("f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
         );
     }

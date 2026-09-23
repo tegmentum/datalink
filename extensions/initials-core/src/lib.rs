@@ -20,7 +20,11 @@ pub mod logic {
     /// First alphanumeric char of each whitespace-separated word, uppercased.
     pub fn first_letters(s: &str) -> Vec<char> {
         s.split_whitespace()
-            .filter_map(|w| w.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_ascii_uppercase()))
+            .filter_map(|w| {
+                w.chars()
+                    .find(|c| c.is_alphanumeric())
+                    .map(|c| c.to_ascii_uppercase())
+            })
             .collect()
     }
 }
@@ -47,13 +51,23 @@ mod tests {
     extern crate std;
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("initials"), &[t("Portable Document Format")]).unwrap(), t("PDF"));
-        assert_eq!(Core::dispatch(idx("initials_dotted"), &[t("Thomas Stearns Eliot")]).unwrap(), t("T.S.E."));
+        assert_eq!(
+            Core::dispatch(idx("initials"), &[t("Portable Document Format")]).unwrap(),
+            t("PDF")
+        );
+        assert_eq!(
+            Core::dispatch(idx("initials_dotted"), &[t("Thomas Stearns Eliot")]).unwrap(),
+            t("T.S.E.")
+        );
         assert_eq!(Core::dispatch(idx("initials"), &[t("   ")]).unwrap(), t(""));
     }
 }

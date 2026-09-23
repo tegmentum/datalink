@@ -35,7 +35,10 @@ pub mod logic {
     }
 
     pub fn slot_hash(base: u64, i: usize) -> u32 {
-        let a = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1) | 1;
+        let a = (i as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(1)
+            | 1;
         let b = (i as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
         (base.wrapping_mul(a).wrapping_add(b) >> 32) as u32
     }
@@ -143,7 +146,10 @@ mod tests {
         NeutralValue::Text(alloc::string::String::from(s))
     }
     fn aidx() -> usize {
-        Core::DECLS.iter().position(|d| d.name == "minhash").unwrap()
+        Core::DECLS
+            .iter()
+            .position(|d| d.name == "minhash")
+            .unwrap()
     }
     fn sidx() -> usize {
         Core::DECLS
@@ -152,8 +158,7 @@ mod tests {
             .unwrap()
     }
     fn sig(items: &[&str]) -> alloc::string::String {
-        let rows: alloc::vec::Vec<[NeutralValue; 1]> =
-            items.iter().map(|s| [t(s)]).collect();
+        let rows: alloc::vec::Vec<[NeutralValue; 1]> = items.iter().map(|s| [t(s)]).collect();
         let refs: alloc::vec::Vec<&[NeutralValue]> = rows.iter().map(|r| &r[..]).collect();
         match Core::dispatch_aggregate(aidx(), &refs).unwrap() {
             NeutralValue::Text(s) => s,

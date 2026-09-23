@@ -43,8 +43,8 @@ datalink_extcore::declare! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
     fn idx(name: &str) -> usize {
         Core::DECLS.iter().position(|d| d.name == name).unwrap()
@@ -54,17 +54,26 @@ mod tests {
     fn wraps_to_width() {
         let out = Core::dispatch(
             idx("word_wrap"),
-            &[NeutralValue::Text(String::from("the quick brown fox")), NeutralValue::Int64(9)],
+            &[
+                NeutralValue::Text(String::from("the quick brown fox")),
+                NeutralValue::Int64(9),
+            ],
         )
         .unwrap();
-        assert_eq!(out, NeutralValue::Text(String::from("the quick\nbrown fox")));
+        assert_eq!(
+            out,
+            NeutralValue::Text(String::from("the quick\nbrown fox"))
+        );
     }
 
     #[test]
     fn non_positive_width_is_null() {
         let out = Core::dispatch(
             idx("word_wrap"),
-            &[NeutralValue::Text(String::from("hello")), NeutralValue::Int64(0)],
+            &[
+                NeutralValue::Text(String::from("hello")),
+                NeutralValue::Int64(0),
+            ],
         )
         .unwrap();
         assert_eq!(out, NeutralValue::Null);

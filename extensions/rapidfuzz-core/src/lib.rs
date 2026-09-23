@@ -71,7 +71,13 @@ mod tests {
 
     #[test]
     fn distances() {
-        assert_eq!(Core::dispatch(idx("osa"), &[t("abc"), t("abc")]).unwrap(), NeutralValue::Int64(0));
-        assert_eq!(Core::dispatch(idx("indel"), &[t("abc"), t("abd")]).unwrap(), NeutralValue::Int64(2));
+        assert_eq!(
+            Core::dispatch(idx("osa"), &[t("abc"), t("abc")]).unwrap(),
+            NeutralValue::Int64(0)
+        );
+        assert_eq!(
+            Core::dispatch(idx("indel"), &[t("abc"), t("abd")]).unwrap(),
+            NeutralValue::Int64(2)
+        );
     }
 }

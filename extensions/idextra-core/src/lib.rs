@@ -32,7 +32,9 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn shape() {

@@ -70,18 +70,18 @@ macro_rules! sqlite_agg_shim {
         prefix_expansion = $prefix_exp:expr ;
     ) => {
         const _: () = {
-            use $crate::ExtCore as _;
-            use $bindings as __bindings;
-            use $types as __types;
-            use $meta as __meta;
-            use $sf as __sf;
-            use $af as __af;
-            use __types::{FunctionFlags, SqlValue};
+            use __af::Guest as AggregateFunctionGuest;
             use __meta::{
                 AggregateFunctionSpec, Guest as MetadataGuest, Manifest, ScalarFunctionSpec,
             };
             use __sf::Guest as ScalarFunctionGuest;
-            use __af::Guest as AggregateFunctionGuest;
+            use __types::{FunctionFlags, SqlValue};
+            use $af as __af;
+            use $bindings as __bindings;
+            use $crate::ExtCore as _;
+            use $meta as __meta;
+            use $sf as __sf;
+            use $types as __types;
 
             type Core = $core;
 
@@ -277,10 +277,7 @@ macro_rules! sqlite_agg_shim {
                     fold_frame(func_id, &buffer)
                 }
 
-                fn value(
-                    func_id: u64,
-                    context_id: u64,
-                ) -> Result<SqlValue, ::std::string::String> {
+                fn value(func_id: u64, context_id: u64) -> Result<SqlValue, ::std::string::String> {
                     FRAMES.with(|f| {
                         let map = f.borrow();
                         let empty = ::std::vec::Vec::new();
@@ -306,7 +303,7 @@ macro_rules! sqlite_agg_shim {
                 }
             }
 
-            __bindings::export!(Ext with_types_in __bindings);
+    __bindings::export!(Ext with_types_in __bindings);
         };
     };
 }

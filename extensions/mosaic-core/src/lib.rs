@@ -164,7 +164,8 @@ pub const TOKEN_PLACEHOLDER: &str = "__DUCKLINK_TOKEN__";
 /// permissive `LIKE '%'` — always true.
 pub fn build_app_query_route_sql(token: &str) -> String {
     let literal = quote(token);
-    format!("\
+    format!(
+        "\
 SELECT * FROM query(
     CASE
         WHEN COALESCE($query, '') LIKE '%token=' || {literal} || '%'
@@ -174,7 +175,8 @@ SELECT * FROM query(
         ELSE 'SELECT ''unauthorized'' AS error, ''UNAUTHORIZED'' AS code'
     END
 )\
-")
+"
+    )
 }
 
 /// LEGACY / kept for reference: the SQL for the once-shared query route.
@@ -364,9 +366,7 @@ pub fn valid_name(name: &str) -> bool {
 /// Validate a token. Empty or 8-64 hex characters.
 pub fn valid_token(tok: &str) -> bool {
     tok.is_empty()
-        || (tok.len() >= 8
-            && tok.len() <= 64
-            && tok.chars().all(|c| c.is_ascii_hexdigit()))
+        || (tok.len() >= 8 && tok.len() <= 64 && tok.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +451,11 @@ pub fn build_plot_spec(sql: &str, kind: &str, opts_json: &str) -> Result<String,
 
     let mark_kind = match kind {
         "line" | "bar" | "dot" | "area" => kind,
-        other => return Err(format!("mosaic_plot: unsupported kind {other:?} (line|bar|dot|area)")),
+        other => {
+            return Err(format!(
+                "mosaic_plot: unsupported kind {other:?} (line|bar|dot|area)"
+            ))
+        }
     };
 
     // Build the mark object.
@@ -464,10 +468,7 @@ pub fn build_plot_spec(sql: &str, kind: &str, opts_json: &str) -> Result<String,
     }
 
     let mut mark = serde_json::Map::new();
-    mark.insert(
-        format!("mark"),
-        serde_json::Value::String(mark_kind.into()),
-    );
+    mark.insert(format!("mark"), serde_json::Value::String(mark_kind.into()));
     for (k, v) in mark_from {
         mark.insert(k, v);
     }
@@ -603,8 +604,8 @@ fn do_create(name: &str, spec_json: &str, opts_json: &str) -> Result<NeutralValu
         ));
     }
     // Sanity-check the spec is valid JSON.
-    let _: serde_json::Value =
-        serde_json::from_str(spec_json).map_err(|e| format!("mosaic_create: spec not valid JSON: {e}"))?;
+    let _: serde_json::Value = serde_json::from_str(spec_json)
+        .map_err(|e| format!("mosaic_create: spec not valid JSON: {e}"))?;
 
     let opts = parse_opts(opts_json)?;
 
@@ -644,9 +645,17 @@ fn do_create(name: &str, spec_json: &str, opts_json: &str) -> Result<NeutralValu
     let index_html_body = idx
         .replace("__NAME__", name)
         .replace("__TOKEN__", &opts.token);
-    nested_exec(&insert_app_routes_sql(name, &opts.token, &index_html_body, bundle_str))?;
+    nested_exec(&insert_app_routes_sql(
+        name,
+        &opts.token,
+        &index_html_body,
+        bundle_str,
+    ))?;
 
-    Ok(NeutralValue::Text(app_url_with_token(name, Some(&opts.token))))
+    Ok(NeutralValue::Text(app_url_with_token(
+        name,
+        Some(&opts.token),
+    )))
 }
 
 fn do_drop(name: &str) -> Result<NeutralValue, String> {
@@ -699,9 +708,7 @@ fn do_spec(name: &str) -> Result<NeutralValue, String> {
     let r = nested_exec(&sql)?;
     match r.rows.as_ref().and_then(|rs| rs.first()) {
         None => Ok(NeutralValue::Null),
-        Some(row) => Ok(NeutralValue::Text(
-            row.first().cloned().unwrap_or_default(),
-        )),
+        Some(row) => Ok(NeutralValue::Text(row.first().cloned().unwrap_or_default())),
     }
 }
 

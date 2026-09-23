@@ -84,9 +84,11 @@ mod tests {
 
     #[test]
     fn parity_with_baseline_smoke() {
-        let dec = as_f64(Core::dispatch(idx("dms_to_decimal"), &[f(40.0), f(26.0), f(46.0)]).unwrap());
+        let dec =
+            as_f64(Core::dispatch(idx("dms_to_decimal"), &[f(40.0), f(26.0), f(46.0)]).unwrap());
         assert!((dec - 40.446111).abs() < 1e-6, "got {dec}");
-        let neg = as_f64(Core::dispatch(idx("dms_to_decimal"), &[f(-73.0), f(58.0), f(23.0)]).unwrap());
+        let neg =
+            as_f64(Core::dispatch(idx("dms_to_decimal"), &[f(-73.0), f(58.0), f(23.0)]).unwrap());
         assert!((neg - (-73.973056)).abs() < 1e-6, "got {neg}");
         assert_eq!(
             Core::dispatch(idx("decimal_to_dms"), &[f(40.446111)]).unwrap(),
@@ -101,7 +103,17 @@ mod tests {
     #[test]
     fn integer_args_widen() {
         // dms_to_decimal accepts INT64 args (widened), matching the baseline.
-        let dec = as_f64(Core::dispatch(idx("dms_to_decimal"), &[NeutralValue::Int64(40), NeutralValue::Int64(26), NeutralValue::Int64(46)]).unwrap());
+        let dec = as_f64(
+            Core::dispatch(
+                idx("dms_to_decimal"),
+                &[
+                    NeutralValue::Int64(40),
+                    NeutralValue::Int64(26),
+                    NeutralValue::Int64(46),
+                ],
+            )
+            .unwrap(),
+        );
         assert!((dec - 40.446111).abs() < 1e-6, "got {dec}");
     }
 }

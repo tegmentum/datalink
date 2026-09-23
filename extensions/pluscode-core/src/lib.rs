@@ -62,7 +62,11 @@ mod tests {
     fn encode_valid_decode() {
         let code = Core::dispatch(
             idx("pluscode_encode"),
-            &[NeutralValue::Float64(47.0), NeutralValue::Float64(8.0), NeutralValue::Int64(10)],
+            &[
+                NeutralValue::Float64(47.0),
+                NeutralValue::Float64(8.0),
+                NeutralValue::Int64(10),
+            ],
         )
         .unwrap();
         let s = match code {

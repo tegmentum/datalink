@@ -47,13 +47,26 @@ mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
     const TOK: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("jwt_header"), &[t(TOK)]).unwrap(), t(r#"{"alg":"HS256","typ":"JWT"}"#));
-        assert_eq!(Core::dispatch(idx("jwt_payload"), &[t(TOK)]).unwrap(), t(r#"{"sub":"1234567890","name":"John Doe","iat":1516239022}"#));
-        assert_eq!(Core::dispatch(idx("jwt_payload"), &[t("not-a-jwt")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("jwt_header"), &[t(TOK)]).unwrap(),
+            t(r#"{"alg":"HS256","typ":"JWT"}"#)
+        );
+        assert_eq!(
+            Core::dispatch(idx("jwt_payload"), &[t(TOK)]).unwrap(),
+            t(r#"{"sub":"1234567890","name":"John Doe","iat":1516239022}"#)
+        );
+        assert_eq!(
+            Core::dispatch(idx("jwt_payload"), &[t("not-a-jwt")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

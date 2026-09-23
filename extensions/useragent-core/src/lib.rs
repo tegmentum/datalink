@@ -54,16 +54,38 @@ mod tests {
     use datalink_extcore::ExtCore;
     const CHROME: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
     const BOT: &str = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("ua_browser"), &[t(CHROME)]).unwrap(), t("Chrome"));
-        assert_eq!(Core::dispatch(idx("ua_os"), &[t(CHROME)]).unwrap(), t("Windows 10"));
-        assert_eq!(Core::dispatch(idx("ua_category"), &[t(CHROME)]).unwrap(), t("pc"));
-        assert_eq!(Core::dispatch(idx("ua_is_bot"), &[t(CHROME)]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("ua_category"), &[t(BOT)]).unwrap(), t("crawler"));
-        assert_eq!(Core::dispatch(idx("ua_is_bot"), &[t(BOT)]).unwrap(), NeutralValue::Boolean(true));
+        assert_eq!(
+            Core::dispatch(idx("ua_browser"), &[t(CHROME)]).unwrap(),
+            t("Chrome")
+        );
+        assert_eq!(
+            Core::dispatch(idx("ua_os"), &[t(CHROME)]).unwrap(),
+            t("Windows 10")
+        );
+        assert_eq!(
+            Core::dispatch(idx("ua_category"), &[t(CHROME)]).unwrap(),
+            t("pc")
+        );
+        assert_eq!(
+            Core::dispatch(idx("ua_is_bot"), &[t(CHROME)]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ua_category"), &[t(BOT)]).unwrap(),
+            t("crawler")
+        );
+        assert_eq!(
+            Core::dispatch(idx("ua_is_bot"), &[t(BOT)]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
     }
 }

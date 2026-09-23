@@ -84,13 +84,15 @@ macro_rules! embed_shim {
                 ));
             }
             let idx = (func_id - 1) as usize;
-            let decl = <EmbedCore as $crate::ExtCore>::DECLS.get(idx).ok_or_else(|| {
-                ::alloc::format!(
-                    "{}: unknown func id {}",
-                    <EmbedCore as $crate::ExtCore>::NAME,
-                    func_id
-                )
-            })?;
+            let decl = <EmbedCore as $crate::ExtCore>::DECLS
+                .get(idx)
+                .ok_or_else(|| {
+                    ::alloc::format!(
+                        "{}: unknown func id {}",
+                        <EmbedCore as $crate::ExtCore>::NAME,
+                        func_id
+                    )
+                })?;
             let neutral: ::alloc::vec::Vec<$crate::NeutralValue> =
                 args.iter().map(__dl_to_neutral).collect();
             if matches!(decl.null_handling, $crate::NullHandling::Propagate)
@@ -105,27 +107,22 @@ macro_rules! embed_shim {
         /// Register every declared scalar into `db`. Builds the
         /// `ScalarSpec` table from `DECLS` + the compile-time
         /// NUL-terminated names.
-        pub unsafe fn register_into(
-            db: *mut ::libsqlite3_sys::sqlite3,
-        ) -> ::core::ffi::c_int {
+        pub unsafe fn register_into(db: *mut ::libsqlite3_sys::sqlite3) -> ::core::ffi::c_int {
             // T5: only Scalar decls belong on the embed path (aggregates
             // stay on the WIT stateful shim; tables ride the sqlite vtab
             // shape, unwritten here). Filter defensively so a mixed core
             // still links its scalars.
-            let specs: ::alloc::vec::Vec<ScalarSpec> =
-                <EmbedCore as $crate::ExtCore>::DECLS
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, decl)| {
-                        matches!(decl.kind, $crate::CapabilityKind::Scalar)
-                    })
-                    .map(|(idx, decl)| ScalarSpec {
-                        func_id: (idx as u64) + 1,
-                        name: <EmbedCore>::SCALAR_NAMES_NUL[idx],
-                        num_args: decl.args.len() as i32,
-                        deterministic: decl.deterministic,
-                    })
-                    .collect();
+            let specs: ::alloc::vec::Vec<ScalarSpec> = <EmbedCore as $crate::ExtCore>::DECLS
+                .iter()
+                .enumerate()
+                .filter(|(_, decl)| matches!(decl.kind, $crate::CapabilityKind::Scalar))
+                .map(|(idx, decl)| ScalarSpec {
+                    func_id: (idx as u64) + 1,
+                    name: <EmbedCore>::SCALAR_NAMES_NUL[idx],
+                    num_args: decl.args.len() as i32,
+                    deterministic: decl.deterministic,
+                })
+                .collect();
             __dl_register_scalars(db, &specs, call_scalar)
         }
     };

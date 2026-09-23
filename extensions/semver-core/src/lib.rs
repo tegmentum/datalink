@@ -72,21 +72,49 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("semver_valid"), &[t("1.2.3")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("semver_valid"), &[t("not.a.version")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("semver_major"), &[t("2.5.9")]).unwrap(), NeutralValue::Int64(2));
-        assert_eq!(Core::dispatch(idx("semver_minor"), &[t("2.5.9")]).unwrap(), NeutralValue::Int64(5));
-        assert_eq!(Core::dispatch(idx("semver_patch"), &[t("2.5.9")]).unwrap(), NeutralValue::Int64(9));
-        assert_eq!(Core::dispatch(idx("semver_compare"), &[t("1.0.0"), t("1.0.1")]).unwrap(), NeutralValue::Int64(-1));
-        assert_eq!(Core::dispatch(idx("semver_compare"), &[t("2.0.0"), t("2.0.0")]).unwrap(), NeutralValue::Int64(0));
-        assert_eq!(Core::dispatch(idx("semver_compare"), &[t("3.1.0"), t("3.0.9")]).unwrap(), NeutralValue::Int64(1));
+        assert_eq!(
+            Core::dispatch(idx("semver_valid"), &[t("1.2.3")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("semver_valid"), &[t("not.a.version")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("semver_major"), &[t("2.5.9")]).unwrap(),
+            NeutralValue::Int64(2)
+        );
+        assert_eq!(
+            Core::dispatch(idx("semver_minor"), &[t("2.5.9")]).unwrap(),
+            NeutralValue::Int64(5)
+        );
+        assert_eq!(
+            Core::dispatch(idx("semver_patch"), &[t("2.5.9")]).unwrap(),
+            NeutralValue::Int64(9)
+        );
+        assert_eq!(
+            Core::dispatch(idx("semver_compare"), &[t("1.0.0"), t("1.0.1")]).unwrap(),
+            NeutralValue::Int64(-1)
+        );
+        assert_eq!(
+            Core::dispatch(idx("semver_compare"), &[t("2.0.0"), t("2.0.0")]).unwrap(),
+            NeutralValue::Int64(0)
+        );
+        assert_eq!(
+            Core::dispatch(idx("semver_compare"), &[t("3.1.0"), t("3.0.9")]).unwrap(),
+            NeutralValue::Int64(1)
+        );
     }
 }

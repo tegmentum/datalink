@@ -104,7 +104,9 @@ pub mod logic {
         let dt = parse_to_utc(s, None)?;
         let unit_lc = unit.to_ascii_lowercase();
         let out = match unit_lc.as_str() {
-            "year" | "years" => add_months(dt, amount.checked_mul(12).ok_or("date_add: overflow")?)?,
+            "year" | "years" => {
+                add_months(dt, amount.checked_mul(12).ok_or("date_add: overflow")?)?
+            }
             "month" | "months" => add_months(dt, amount)?,
             "week" | "weeks" => dt
                 .checked_add_signed(Duration::weeks(amount))
@@ -271,7 +273,10 @@ pub mod logic {
             None => (rest, ""),
         };
         let mut secs: i64 = 0;
-        secs += parse_iso_segment(date_part, &[('Y', 365 * 86400), ('M', 30 * 86400), ('D', 86400)])?;
+        secs += parse_iso_segment(
+            date_part,
+            &[('Y', 365 * 86400), ('M', 30 * 86400), ('D', 86400)],
+        )?;
         secs += parse_iso_segment(time_part, &[('H', 3600), ('M', 60), ('S', 1)])?;
         Ok(secs)
     }
@@ -799,7 +804,11 @@ mod tests {
     #[test]
     fn parse_and_format() {
         assert_eq!(
-            call("date_parse", 1, &[NeutralValue::Text("2025-06-20T15:30:00Z".into())]),
+            call(
+                "date_parse",
+                1,
+                &[NeutralValue::Text("2025-06-20T15:30:00Z".into())]
+            ),
             NeutralValue::Text("2025-06-20T15:30:00Z".into())
         );
         assert_eq!(
@@ -837,7 +846,11 @@ mod tests {
             call(
                 "makedate",
                 3,
-                &[NeutralValue::Int64(2024), NeutralValue::Int64(2), NeutralValue::Int64(29)]
+                &[
+                    NeutralValue::Int64(2024),
+                    NeutralValue::Int64(2),
+                    NeutralValue::Int64(29)
+                ]
             ),
             NeutralValue::Text("2024-02-29T00:00:00Z".into())
         );
@@ -874,7 +887,11 @@ mod tests {
             NeutralValue::Int64(97200)
         );
         assert_eq!(
-            call("duration_format", 2, &[NeutralValue::Int64(90061), NeutralValue::Int64(2)]),
+            call(
+                "duration_format",
+                2,
+                &[NeutralValue::Int64(90061), NeutralValue::Int64(2)]
+            ),
             NeutralValue::Text("1d 1h".into())
         );
     }

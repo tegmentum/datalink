@@ -21,9 +21,13 @@ pub mod logic {
     fn replace_url(mut s: String) -> String {
         loop {
             let Some(start) = s.find("[url=") else { break };
-            let Some(rb_rel) = s[start..].find(']') else { break };
+            let Some(rb_rel) = s[start..].find(']') else {
+                break;
+            };
             let href_end = start + rb_rel;
-            let Some(close_rel) = s[href_end..].find("[/url]") else { break };
+            let Some(close_rel) = s[href_end..].find("[/url]") else {
+                break;
+            };
             let text_start = href_end + 1;
             let text_end = href_end + close_rel;
             let href = s[start + 5..href_end].to_string();

@@ -52,13 +52,13 @@ macro_rules! sqlite_shim {
             // followed by `::{...}` in a `use`, so import members off the
             // alias instead). This keeps the macro parameterized by the
             // consuming repo's WIT paths with no `::{}` after a fragment.
-            use $bindings as __bindings;
-            use $types as __types;
-            use $meta as __meta;
-            use $sf as __sf;
-            use __types::{FunctionFlags, SqlValue};
             use __meta::{Guest as MetadataGuest, Manifest, ScalarFunctionSpec};
             use __sf::Guest as ScalarFunctionGuest;
+            use __types::{FunctionFlags, SqlValue};
+            use $bindings as __bindings;
+            use $meta as __meta;
+            use $sf as __sf;
+            use $types as __types;
 
             type Core = $core;
 
@@ -113,9 +113,7 @@ macro_rules! sqlite_shim {
             impl MetadataGuest for Ext {
                 fn describe() -> Manifest {
                     let mut scalar_functions = ::alloc::vec::Vec::new();
-                    for (idx, decl) in
-                        <Core as $crate::ExtCore>::DECLS.iter().enumerate()
-                    {
+                    for (idx, decl) in <Core as $crate::ExtCore>::DECLS.iter().enumerate() {
                         // T5: sqlite tables ride the vtab shape (a different
                         // port); skip Table decls here so mixed cores still
                         // compile. Aggregates use `sqlite_agg_shim!`, so we
@@ -150,9 +148,7 @@ macro_rules! sqlite_shim {
                         dot_commands: ::alloc::vec::Vec::new(),
                         declared_capabilities: ::alloc::vec::Vec::new(),
                         optional_capabilities: ::alloc::vec::Vec::new(),
-                        preferred_prefix: Some(
-                            <Core as $crate::ExtCore>::NAME.into(),
-                        ),
+                        preferred_prefix: Some(<Core as $crate::ExtCore>::NAME.into()),
                         prefix_expansion: Some($prefix_exp.into()),
                         typed_values: ::alloc::vec::Vec::new(),
                     }
@@ -173,15 +169,13 @@ macro_rules! sqlite_shim {
                         ));
                     }
                     let idx = (func_id - 1) as usize;
-                    let decl = <Core as $crate::ExtCore>::DECLS.get(idx).ok_or_else(
-                        || {
-                            ::alloc::format!(
-                                "{}: unknown func id {}",
-                                <Core as $crate::ExtCore>::NAME,
-                                func_id
-                            )
-                        },
-                    )?;
+                    let decl = <Core as $crate::ExtCore>::DECLS.get(idx).ok_or_else(|| {
+                        ::alloc::format!(
+                            "{}: unknown func id {}",
+                            <Core as $crate::ExtCore>::NAME,
+                            func_id
+                        )
+                    })?;
                     let neutral: ::alloc::vec::Vec<$crate::NeutralValue> =
                         args.iter().map(to_neutral).collect();
                     if matches!(decl.null_handling, $crate::NullHandling::Propagate)
@@ -194,7 +188,7 @@ macro_rules! sqlite_shim {
                 }
             }
 
-            __bindings::export!(Ext with_types_in __bindings);
+    __bindings::export!(Ext with_types_in __bindings);
         };
     };
 }

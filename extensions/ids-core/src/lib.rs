@@ -42,22 +42,37 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn shape_and_determinism() {
         // ulid is 26 chars, nanoid is 21 chars.
         match Core::dispatch(idx("ulid"), &[]).unwrap() {
-            NeutralValue::Text(s) => assert_eq!(s.len(), 26), o => panic!("{o:?}"),
+            NeutralValue::Text(s) => assert_eq!(s.len(), 26),
+            o => panic!("{o:?}"),
         }
         match Core::dispatch(idx("nanoid"), &[]).unwrap() {
-            NeutralValue::Text(s) => assert_eq!(s.len(), 21), o => panic!("{o:?}"),
+            NeutralValue::Text(s) => assert_eq!(s.len(), 21),
+            o => panic!("{o:?}"),
         }
         assert_eq!(
-            Core::dispatch(idx("ulid_timestamp"), &[NeutralValue::Text("01ARZ3NDEKTSV4RRFFQ69G5FAV".into())]).unwrap(),
+            Core::dispatch(
+                idx("ulid_timestamp"),
+                &[NeutralValue::Text("01ARZ3NDEKTSV4RRFFQ69G5FAV".into())]
+            )
+            .unwrap(),
             NeutralValue::Int64(1469922850259)
         );
-        assert_eq!(Core::dispatch(idx("ulid_timestamp"), &[NeutralValue::Text("not-a-ulid".into())]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(
+                idx("ulid_timestamp"),
+                &[NeutralValue::Text("not-a-ulid".into())]
+            )
+            .unwrap(),
+            NeutralValue::Null
+        );
         // The generators are declared nondeterministic.
         assert!(!Core::DECLS[idx("ulid")].deterministic);
         assert!(!Core::DECLS[idx("nanoid")].deterministic);

@@ -36,7 +36,11 @@ pub mod logic {
             "amex"
         } else if (51..=55).contains(&p2) || (2221..=2720).contains(&p4) {
             "mastercard"
-        } else if p4 == 6011 || p2 == 65 || (644..=649).contains(&p3) || (622126..=622925).contains(&p6) {
+        } else if p4 == 6011
+            || p2 == 65
+            || (644..=649).contains(&p3)
+            || (622126..=622925).contains(&p6)
+        {
             "discover"
         } else if (3528..=3589).contains(&p4) {
             "jcb"

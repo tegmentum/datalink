@@ -54,16 +54,38 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(alloc::string::String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(alloc::string::String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("ip_valid"), &[t("192.168.1.1")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("ip_valid"), &[t("2001:db8::1")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("ip_valid"), &[t("999.1.1.1")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("ip_version"), &[t("::1")]).unwrap(), NeutralValue::Int64(6));
-        assert_eq!(Core::dispatch(idx("ip_is_private"), &[t("10.0.0.5")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("ip_is_private"), &[t("8.8.8.8")]).unwrap(), NeutralValue::Boolean(false));
+        assert_eq!(
+            Core::dispatch(idx("ip_valid"), &[t("192.168.1.1")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ip_valid"), &[t("2001:db8::1")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ip_valid"), &[t("999.1.1.1")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ip_version"), &[t("::1")]).unwrap(),
+            NeutralValue::Int64(6)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ip_is_private"), &[t("10.0.0.5")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ip_is_private"), &[t("8.8.8.8")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
     }
 }

@@ -52,7 +52,11 @@ pub mod logic {
         for &d in num.iter().rev() {
             let v = if alt {
                 let x = d * 2;
-                if x > 9 { x - 9 } else { x }
+                if x > 9 {
+                    x - 9
+                } else {
+                    x
+                }
             } else {
                 d
             };
@@ -87,7 +91,11 @@ pub mod logic {
             Some("Mastercard")
         } else if p2 == 34 || p2 == 37 {
             Some("American Express")
-        } else if p4 == 6011 || p2 == 65 || (644..=649).contains(&p3) || (622126..=622925).contains(&p6) {
+        } else if p4 == 6011
+            || p2 == 65
+            || (644..=649).contains(&p3)
+            || (622126..=622925).contains(&p6)
+        {
             Some("Discover")
         } else if (3528..=3589).contains(&p4) {
             Some("JCB")
@@ -156,8 +164,11 @@ pub mod logic {
             return Some("unionpay");
         }
         if matches!(d.len(), 12..=19)
-            && (d.starts_with("50") || d.starts_with("56") || d.starts_with("57")
-                || d.starts_with("58") || d.starts_with("67"))
+            && (d.starts_with("50")
+                || d.starts_with("56")
+                || d.starts_with("57")
+                || d.starts_with("58")
+                || d.starts_with("67"))
         {
             return Some("maestro");
         }
@@ -235,34 +246,86 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn ducklink_family() {
-        assert_eq!(Core::dispatch(idx("cc_validate"), &[t("4111 1111 1111 1111")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("cc_validate"), &[t("4111 1111 1111 1112")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("cc_network"), &[t("4111111111111111")]).unwrap(), t("Visa"));
-        assert_eq!(Core::dispatch(idx("cc_network"), &[t("5105105105105100")]).unwrap(), t("Mastercard"));
-        assert_eq!(Core::dispatch(idx("cc_network"), &[t("340000000000009")]).unwrap(), t("American Express"));
-        assert_eq!(Core::dispatch(idx("cc_network"), &[t("6011000990139424")]).unwrap(), t("Discover"));
+        assert_eq!(
+            Core::dispatch(idx("cc_validate"), &[t("4111 1111 1111 1111")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_validate"), &[t("4111 1111 1111 1112")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_network"), &[t("4111111111111111")]).unwrap(),
+            t("Visa")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_network"), &[t("5105105105105100")]).unwrap(),
+            t("Mastercard")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_network"), &[t("340000000000009")]).unwrap(),
+            t("American Express")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_network"), &[t("6011000990139424")]).unwrap(),
+            t("Discover")
+        );
     }
 
     #[test]
     fn sqlink_family() {
         // ground-truthed from sqlink smoke.expected
-        assert_eq!(Core::dispatch(idx("cc_type"), &[t("4111111111111111")]).unwrap(), t("visa"));
-        assert_eq!(Core::dispatch(idx("cc_type"), &[t("5555 5555 5555 4444")]).unwrap(), t("mastercard"));
-        assert_eq!(Core::dispatch(idx("cc_type"), &[t("378282246310005")]).unwrap(), t("amex"));
-        assert_eq!(Core::dispatch(idx("cc_type"), &[t("6011111111111117")]).unwrap(), t("discover"));
-        assert_eq!(Core::dispatch(idx("cc_type"), &[t("3530111333300000")]).unwrap(), t("jcb"));
-        assert_eq!(Core::dispatch(idx("cc_type"), &[t("not a card")]).unwrap(), NeutralValue::Null);
-        assert_eq!(Core::dispatch(idx("cc_mask"), &[t("4111-1111-1111-1111")]).unwrap(), t("XXXXXXXXXXXX1111"));
-        assert_eq!(Core::dispatch(idx("cc_last4"), &[t("4111-1111-1111-1111")]).unwrap(), t("1111"));
-        assert_eq!(Core::dispatch(idx("cc_bin"), &[t("4111-1111-1111-1111")]).unwrap(), t("411111"));
-        assert_eq!(Core::dispatch(idx("cc_normalize"), &[t("4111 1111 1111 1111")]).unwrap(), t("4111111111111111"));
+        assert_eq!(
+            Core::dispatch(idx("cc_type"), &[t("4111111111111111")]).unwrap(),
+            t("visa")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_type"), &[t("5555 5555 5555 4444")]).unwrap(),
+            t("mastercard")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_type"), &[t("378282246310005")]).unwrap(),
+            t("amex")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_type"), &[t("6011111111111117")]).unwrap(),
+            t("discover")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_type"), &[t("3530111333300000")]).unwrap(),
+            t("jcb")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_type"), &[t("not a card")]).unwrap(),
+            NeutralValue::Null
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_mask"), &[t("4111-1111-1111-1111")]).unwrap(),
+            t("XXXXXXXXXXXX1111")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_last4"), &[t("4111-1111-1111-1111")]).unwrap(),
+            t("1111")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_bin"), &[t("4111-1111-1111-1111")]).unwrap(),
+            t("411111")
+        );
+        assert_eq!(
+            Core::dispatch(idx("cc_normalize"), &[t("4111 1111 1111 1111")]).unwrap(),
+            t("4111111111111111")
+        );
     }
 }

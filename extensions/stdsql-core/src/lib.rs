@@ -231,7 +231,10 @@ mod tests {
         assert_eq!(call("toString", 1, &[t("42")]), t("42"));
         assert_eq!(call("lowerUTF8", 1, &[t("ABC")]), t("abc"));
         assert_eq!(call("upperUTF8", 1, &[t("abc")]), t("ABC"));
-        assert_eq!(call("replaceAll", 3, &[t("a.b.c"), t("."), t("-")]), t("a-b-c"));
+        assert_eq!(
+            call("replaceAll", 3, &[t("a.b.c"), t("."), t("-")]),
+            t("a-b-c")
+        );
     }
 
     #[test]
@@ -261,6 +264,9 @@ mod tests {
         assert_eq!(call("get_byte", 2, &[i(0x01020304), i(0)]), i(4));
         assert_eq!(call("get_byte", 2, &[i(0x01020304), i(1)]), i(3));
         // set byte 0 to 0xff -> 0x010203ff.
-        assert_eq!(call("set_byte", 3, &[i(0x01020304), i(0), i(0xff)]), i(0x010203ff));
+        assert_eq!(
+            call("set_byte", 3, &[i(0x01020304), i(0), i(0xff)]),
+            i(0x010203ff)
+        );
     }
 }

@@ -75,8 +75,12 @@ mod tests {
         assert_eq!(
             Core::dispatch(
                 idx("jsonata"),
-                &[t("$sum(items.price)"), t("{\"items\":[{\"price\":10},{\"price\":20}]}")]
-            ).unwrap(),
+                &[
+                    t("$sum(items.price)"),
+                    t("{\"items\":[{\"price\":10},{\"price\":20}]}")
+                ]
+            )
+            .unwrap(),
             t("30")
         );
         assert_eq!(

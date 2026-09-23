@@ -18,7 +18,9 @@ pub mod logic {
     use alloc::vec::Vec;
 
     pub fn digits(s: &str) -> Vec<u8> {
-        s.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect()
+        s.chars()
+            .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+            .collect()
     }
 
     /// Check digit so partial+digit passes Luhn (the appended digit sits at

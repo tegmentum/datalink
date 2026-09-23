@@ -102,7 +102,13 @@ mod tests {
 
     #[test]
     fn romanizes() {
-        assert_eq!(Core::dispatch(idx("to_pinyin_plain"), &[t("中国")]).unwrap(), t("zhong guo"));
-        assert_eq!(Core::dispatch(idx("to_pinyin_initials"), &[t("中国")]).unwrap(), t("z g"));
+        assert_eq!(
+            Core::dispatch(idx("to_pinyin_plain"), &[t("中国")]).unwrap(),
+            t("zhong guo")
+        );
+        assert_eq!(
+            Core::dispatch(idx("to_pinyin_initials"), &[t("中国")]).unwrap(),
+            t("z g")
+        );
     }
 }

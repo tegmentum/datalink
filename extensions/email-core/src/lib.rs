@@ -45,15 +45,34 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(alloc::string::String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(alloc::string::String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("email_validate"), &[t("a.b@example.com")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("email_validate"), &[t("not-an-email")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("email_domain"), &[t("user@sub.example.org")]).unwrap(), t("sub.example.org"));
-        assert_eq!(Core::dispatch(idx("email_local"), &[t("user.name@example.com")]).unwrap(), t("user.name"));
-        assert_eq!(Core::dispatch(idx("email_domain"), &[t("garbage")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("email_validate"), &[t("a.b@example.com")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("email_validate"), &[t("not-an-email")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("email_domain"), &[t("user@sub.example.org")]).unwrap(),
+            t("sub.example.org")
+        );
+        assert_eq!(
+            Core::dispatch(idx("email_local"), &[t("user.name@example.com")]).unwrap(),
+            t("user.name")
+        );
+        assert_eq!(
+            Core::dispatch(idx("email_domain"), &[t("garbage")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

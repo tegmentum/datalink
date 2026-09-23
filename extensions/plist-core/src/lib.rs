@@ -58,12 +58,24 @@ pub mod logic {
         const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
         for chunk in input.chunks(3) {
-            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
             let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
             out.push(T[((n >> 18) & 63) as usize] as char);
             out.push(T[((n >> 12) & 63) as usize] as char);
-            out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-            out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+            out.push(if chunk.len() > 1 {
+                T[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                T[(n & 63) as usize] as char
+            } else {
+                '='
+            });
         }
         out
     }
@@ -73,7 +85,13 @@ pub mod logic {
     pub fn value_to_text(v: &plist::Value) -> String {
         match v {
             plist::Value::String(s) => s.clone(),
-            plist::Value::Boolean(b) => if *b { "true".into() } else { "false".into() },
+            plist::Value::Boolean(b) => {
+                if *b {
+                    "true".into()
+                } else {
+                    "false".into()
+                }
+            }
             plist::Value::Integer(i) => {
                 if let Some(n) = i.as_signed() {
                     n.to_string()
@@ -155,11 +173,17 @@ mod tests {
 
     #[test]
     fn parses_and_gets() {
-        assert_eq!(Core::dispatch(idx("plist_get"), &[t(XML), t("name")]).unwrap(), t("Ada"));
+        assert_eq!(
+            Core::dispatch(idx("plist_get"), &[t(XML), t("name")]).unwrap(),
+            t("Ada")
+        );
         assert!(matches!(
             Core::dispatch(idx("plist_to_json"), &[t(XML)]).unwrap(),
             NeutralValue::Text(_)
         ));
-        assert_eq!(Core::dispatch(idx("plist_get"), &[t(XML), t("absent")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("plist_get"), &[t(XML), t("absent")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

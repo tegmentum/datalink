@@ -25,9 +25,13 @@ pub mod logic {
         let conf = ini::Ini::load_from_str(src).ok()?;
         let mut root = Map::new();
         for (sec, props) in conf.iter() {
-            if sec.is_none() && props.is_empty() { continue; }
+            if sec.is_none() && props.is_empty() {
+                continue;
+            }
             let name = sec.unwrap_or("").to_string();
-            let entry = root.entry(name).or_insert_with(|| Value::Object(Map::new()));
+            let entry = root
+                .entry(name)
+                .or_insert_with(|| Value::Object(Map::new()));
             if let Value::Object(m) = entry {
                 for (k, v) in props.iter() {
                     m.insert(k.to_string(), Value::String(v.to_string()));
@@ -43,7 +47,11 @@ pub mod logic {
 
     pub fn ini_get(src: &str, section: &str, key: &str) -> Option<String> {
         let conf = ini::Ini::load_from_str(src).ok()?;
-        let sec = if section.is_empty() { None } else { Some(section) };
+        let sec = if section.is_empty() {
+            None
+        } else {
+            Some(section)
+        };
         conf.get_from(sec, key).map(|s| s.to_string())
     }
 
@@ -52,7 +60,9 @@ pub mod logic {
         let mut seen: Vec<String> = Vec::new();
         let mut names: Vec<Value> = Vec::new();
         for (sec, props) in conf.iter() {
-            if sec.is_none() && props.is_empty() { continue; }
+            if sec.is_none() && props.is_empty() {
+                continue;
+            }
             let name = sec.unwrap_or("").to_string();
             if !seen.contains(&name) {
                 seen.push(name.clone());
@@ -64,7 +74,10 @@ pub mod logic {
 }
 
 fn opt(v: Option<String>) -> NeutralValue {
-    match v { Some(t) => NeutralValue::Text(t), None => NeutralValue::Null }
+    match v {
+        Some(t) => NeutralValue::Text(t),
+        None => NeutralValue::Null,
+    }
 }
 
 datalink_extcore::declare! {
@@ -92,15 +105,35 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
 
     #[test]
     fn matches_baseline() {
         let ini = "[db]\nhost=localhost\nport=5432";
-        assert_eq!(Core::dispatch(idx("ini_get"), &[t(ini), t("db"), t("host")]).unwrap(), t("localhost"));
-        assert_eq!(Core::dispatch(idx("ini_sections"), &[t(ini)]).unwrap(), t("[\"db\"]"));
-        assert_eq!(Core::dispatch(idx("ini_to_json"), &[t(ini)]).unwrap(), t("{\"db\":{\"host\":\"localhost\",\"port\":\"5432\"}}"));
-        assert_eq!(Core::dispatch(idx("ini_get"), &[t("[db]\nhost=localhost"), t("db"), t("missing")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("ini_get"), &[t(ini), t("db"), t("host")]).unwrap(),
+            t("localhost")
+        );
+        assert_eq!(
+            Core::dispatch(idx("ini_sections"), &[t(ini)]).unwrap(),
+            t("[\"db\"]")
+        );
+        assert_eq!(
+            Core::dispatch(idx("ini_to_json"), &[t(ini)]).unwrap(),
+            t("{\"db\":{\"host\":\"localhost\",\"port\":\"5432\"}}")
+        );
+        assert_eq!(
+            Core::dispatch(
+                idx("ini_get"),
+                &[t("[db]\nhost=localhost"), t("db"), t("missing")]
+            )
+            .unwrap(),
+            NeutralValue::Null
+        );
     }
 }

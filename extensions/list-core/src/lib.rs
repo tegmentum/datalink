@@ -121,7 +121,9 @@ fn as_json_value(v: &NeutralValue) -> serde_json::Value {
             .map(Value::Number)
             .unwrap_or(Value::Null),
         NeutralValue::Text(s) => algo::parse_value(s),
-        NeutralValue::Blob(b) => Value::String(alloc::string::String::from_utf8_lossy(b).into_owned()),
+        NeutralValue::Blob(b) => {
+            Value::String(alloc::string::String::from_utf8_lossy(b).into_owned())
+        }
         NeutralValue::Complex { json, .. } => algo::parse_value(json),
     }
 }
@@ -251,12 +253,19 @@ mod tests {
             call(
                 "array_remove",
                 2,
-                &[NeutralValue::Text("[1,2,3,2,4,2]".into()), NeutralValue::Int64(2)]
+                &[
+                    NeutralValue::Text("[1,2,3,2,4,2]".into()),
+                    NeutralValue::Int64(2)
+                ]
             ),
             NeutralValue::Text("[1,3,4]".into())
         );
         assert_eq!(
-            call("list_length", 1, &[NeutralValue::Text("[1,2,3,4,5]".into())]),
+            call(
+                "list_length",
+                1,
+                &[NeutralValue::Text("[1,2,3,4,5]".into())]
+            ),
             NeutralValue::Int64(5)
         );
     }
@@ -295,7 +304,10 @@ mod tests {
             call(
                 "arrays_overlap",
                 2,
-                &[NeutralValue::Text("[1,2,3]".into()), NeutralValue::Text("[3,4,5]".into())]
+                &[
+                    NeutralValue::Text("[1,2,3]".into()),
+                    NeutralValue::Text("[3,4,5]".into())
+                ]
             ),
             NeutralValue::Int64(1)
         );
@@ -303,7 +315,10 @@ mod tests {
             call(
                 "array_positions",
                 2,
-                &[NeutralValue::Text("[5,6,5,7,5]".into()), NeutralValue::Int64(5)]
+                &[
+                    NeutralValue::Text("[5,6,5,7,5]".into()),
+                    NeutralValue::Int64(5)
+                ]
             ),
             NeutralValue::Text("[1,3,5]".into())
         );

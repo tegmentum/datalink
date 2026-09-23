@@ -34,7 +34,11 @@ pub fn canonical_dump(data: &[u8]) -> String {
         }
         out.push('|');
         for &b in chunk {
-            out.push(if (0x20..=0x7e).contains(&b) { b as char } else { '.' });
+            out.push(if (0x20..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '.'
+            });
         }
         out.push('|');
         out.push('\n');

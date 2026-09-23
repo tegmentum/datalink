@@ -24,7 +24,10 @@ pub mod logic {
     /// Percent-decode a component. Per RFC 6068, '+' is a literal plus,
     /// NOT a space, so we decode only %XX.
     pub fn pct_decode(s: &str) -> Option<String> {
-        percent_decode_str(s).decode_utf8().ok().map(|c| c.into_owned())
+        percent_decode_str(s)
+            .decode_utf8()
+            .ok()
+            .map(|c| c.into_owned())
     }
 
     /// A parsed mailto: URI. Addresses + header values are decoded.
@@ -189,20 +192,39 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
     const U: &str = "mailto:alice@example.com?subject=Hello%20World&cc=bob@example.com";
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("mailto_to"), &[t(U)]).unwrap(), t(r#"["alice@example.com"]"#));
-        assert_eq!(Core::dispatch(idx("mailto_field"), &[t(U), t("subject")]).unwrap(), t("Hello World"));
-        assert_eq!(Core::dispatch(idx("mailto_field"), &[t(U), t("cc")]).unwrap(), t("bob@example.com"));
-        assert_eq!(Core::dispatch(idx("mailto_field"), &[t(U), t("bcc")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("mailto_to"), &[t(U)]).unwrap(),
+            t(r#"["alice@example.com"]"#)
+        );
+        assert_eq!(
+            Core::dispatch(idx("mailto_field"), &[t(U), t("subject")]).unwrap(),
+            t("Hello World")
+        );
+        assert_eq!(
+            Core::dispatch(idx("mailto_field"), &[t(U), t("cc")]).unwrap(),
+            t("bob@example.com")
+        );
+        assert_eq!(
+            Core::dispatch(idx("mailto_field"), &[t(U), t("bcc")]).unwrap(),
+            NeutralValue::Null
+        );
         assert_eq!(
             Core::dispatch(idx("mailto_to_json"), &[t("mailto:alice@example.com,carol@example.com?subject=Hi&body=Yo&cc=bob@example.com")]).unwrap(),
             t(r#"{"to":["alice@example.com","carol@example.com"],"subject":"Hi","body":"Yo","cc":"bob@example.com"}"#)
         );
-        assert_eq!(Core::dispatch(idx("mailto_to"), &[t("https://example.com/not-a-mailto")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("mailto_to"), &[t("https://example.com/not-a-mailto")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

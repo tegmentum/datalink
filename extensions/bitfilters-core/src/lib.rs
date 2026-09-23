@@ -82,7 +82,10 @@ mod tests {
         NeutralValue::Int64(n)
     }
     fn aidx() -> usize {
-        Core::DECLS.iter().position(|d| d.name == "xor_filter").unwrap()
+        Core::DECLS
+            .iter()
+            .position(|d| d.name == "xor_filter")
+            .unwrap()
     }
     fn sidx() -> usize {
         Core::DECLS
@@ -93,7 +96,13 @@ mod tests {
 
     #[test]
     fn build_then_contains() {
-        let rows = [&[i(10)][..], &[i(20)][..], &[i(30)][..], &[i(40)][..], &[i(50)][..]];
+        let rows = [
+            &[i(10)][..],
+            &[i(20)][..],
+            &[i(30)][..],
+            &[i(40)][..],
+            &[i(50)][..],
+        ];
         let blob = match Core::dispatch_aggregate(aidx(), &rows).unwrap() {
             NeutralValue::Blob(b) => b,
             other => panic!("expected blob, got {other:?}"),

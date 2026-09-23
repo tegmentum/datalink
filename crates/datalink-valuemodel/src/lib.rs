@@ -178,9 +178,7 @@ impl NeutralColumn {
             NeutralColumn::Float64(_) => NeutralType::Float64,
             NeutralColumn::Text(_) => NeutralType::Text,
             NeutralColumn::Blob(_) => NeutralType::Blob,
-            NeutralColumn::Complex { type_expr, .. } => {
-                NeutralType::Complex(type_expr.clone())
-            }
+            NeutralColumn::Complex { type_expr, .. } => NeutralType::Complex(type_expr.clone()),
         }
     }
 

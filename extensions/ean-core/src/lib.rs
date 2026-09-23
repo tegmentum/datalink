@@ -115,23 +115,51 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn baseline_and_superset() {
         // ducklink baseline
-        assert_eq!(Core::dispatch(idx("ean_validate"), &[t("4006381333931")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("ean_validate"), &[t("96385074")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("ean_validate"), &[t("4006381333930")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("ean_check_digit"), &[t("400638133393")]).unwrap(), NeutralValue::Int64(1));
-        assert_eq!(Core::dispatch(idx("ean_check_digit"), &[t("9638507")]).unwrap(), NeutralValue::Int64(4));
+        assert_eq!(
+            Core::dispatch(idx("ean_validate"), &[t("4006381333931")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ean_validate"), &[t("96385074")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ean_validate"), &[t("4006381333930")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ean_check_digit"), &[t("400638133393")]).unwrap(),
+            NeutralValue::Int64(1)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ean_check_digit"), &[t("9638507")]).unwrap(),
+            NeutralValue::Int64(4)
+        );
         // superset (ground-truthed from sqlink smoke.expected)
-        assert_eq!(Core::dispatch(idx("ean_gs1_prefix"), &[t("4006381333931")]).unwrap(), NeutralValue::Int64(400));
-        assert_eq!(Core::dispatch(idx("ean_gs1_prefix"), &[t("5901234123457")]).unwrap(), NeutralValue::Int64(590));
-        assert_eq!(Core::dispatch(idx("upca_to_ean13"), &[t("036000291452")]).unwrap(), t("0036000291452"));
+        assert_eq!(
+            Core::dispatch(idx("ean_gs1_prefix"), &[t("4006381333931")]).unwrap(),
+            NeutralValue::Int64(400)
+        );
+        assert_eq!(
+            Core::dispatch(idx("ean_gs1_prefix"), &[t("5901234123457")]).unwrap(),
+            NeutralValue::Int64(590)
+        );
+        assert_eq!(
+            Core::dispatch(idx("upca_to_ean13"), &[t("036000291452")]).unwrap(),
+            t("0036000291452")
+        );
     }
 }

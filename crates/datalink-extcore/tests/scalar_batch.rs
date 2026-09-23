@@ -51,10 +51,7 @@ fn dispatch(_idx: usize, args: &[NeutralValue]) -> Result<NeutralValue, String> 
 
 /// The OLD shape: re-marshal each row into a fresh Vec, no shared scratch.
 /// Semantically what `call_scalar` per row did. Used as the oracle.
-fn naive_per_row(
-    propagate: bool,
-    rows: Vec<Vec<Val>>,
-) -> Result<Vec<Val>, String> {
+fn naive_per_row(propagate: bool, rows: Vec<Vec<Val>>) -> Result<Vec<Val>, String> {
     let mut out = Vec::with_capacity(rows.len());
     for args in rows.into_iter() {
         let neutral: Vec<NeutralValue> = args.iter().map(to_neutral).collect();
@@ -130,7 +127,11 @@ fn batched_matches_naive_called() {
 
 #[test]
 fn error_short_circuits_like_per_row() {
-    let rows = vec![vec![Val::Int64(1)], vec![Val::Int64(-5)], vec![Val::Int64(9)]];
+    let rows = vec![
+        vec![Val::Int64(1)],
+        vec![Val::Int64(-5)],
+        vec![Val::Int64(9)],
+    ];
     assert_eq!(
         batched(false, rows.clone()).unwrap_err(),
         naive_per_row(false, rows).unwrap_err()

@@ -45,14 +45,30 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("iso_country_name"), &[t("US")]).unwrap(), t("United States of America"));
-        assert_eq!(Core::dispatch(idx("iso_country_alpha3"), &[t("de")]).unwrap(), t("DEU"));
-        assert_eq!(Core::dispatch(idx("iso_country_numeric"), &[t("JP")]).unwrap(), NeutralValue::Int64(392));
-        assert_eq!(Core::dispatch(idx("iso_country_name"), &[t("ZZ")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("iso_country_name"), &[t("US")]).unwrap(),
+            t("United States of America")
+        );
+        assert_eq!(
+            Core::dispatch(idx("iso_country_alpha3"), &[t("de")]).unwrap(),
+            t("DEU")
+        );
+        assert_eq!(
+            Core::dispatch(idx("iso_country_numeric"), &[t("JP")]).unwrap(),
+            NeutralValue::Int64(392)
+        );
+        assert_eq!(
+            Core::dispatch(idx("iso_country_name"), &[t("ZZ")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

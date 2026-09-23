@@ -27,7 +27,10 @@ pub mod logic {
         } else if let Some(pos) = s.find(':') {
             let scheme = &s[..pos];
             if !scheme.is_empty()
-                && scheme.chars().next().map_or(false, |c| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_alphabetic())
                 && scheme
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
@@ -40,7 +43,10 @@ pub mod logic {
             }
         }
         s = s.trim_start_matches('/');
-        let authority = s.split(|c| c == '/' || c == '?' || c == '#').next().unwrap_or("");
+        let authority = s
+            .split(|c| c == '/' || c == '?' || c == '#')
+            .next()
+            .unwrap_or("");
         let hostport = authority.rsplit('@').next().unwrap_or(authority);
         let host = if let Some(stripped) = hostport.strip_prefix('[') {
             stripped.split(']').next().unwrap_or("")
@@ -59,7 +65,9 @@ pub mod logic {
     pub fn parse(input: &str) -> Option<(String, String, String)> {
         let host = extract_host(input)?;
         let domain = psl::domain(host.as_bytes())?;
-        let suffix = core::str::from_utf8(domain.suffix().as_bytes()).ok()?.to_string();
+        let suffix = core::str::from_utf8(domain.suffix().as_bytes())
+            .ok()?
+            .to_string();
         let registrable = core::str::from_utf8(domain.as_bytes()).ok()?.to_string();
         Some((registrable, suffix, host))
     }
@@ -113,8 +121,8 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
     use std::vec;
 
     fn t(s: &str) -> NeutralValue {
@@ -127,10 +135,22 @@ mod tests {
             Core::dispatch(0, &[t("https://a.b.example.co.uk/x")]).unwrap(),
             t("example.co.uk")
         );
-        assert_eq!(Core::dispatch(1, &[t("https://a.b.example.co.uk/x")]).unwrap(), t("co.uk"));
-        assert_eq!(Core::dispatch(2, &[t("https://a.b.example.co.uk/x")]).unwrap(), t("a.b"));
-        assert_eq!(Core::dispatch(3, &[t("https://a.b.example.co.uk/x")]).unwrap(), t("example"));
+        assert_eq!(
+            Core::dispatch(1, &[t("https://a.b.example.co.uk/x")]).unwrap(),
+            t("co.uk")
+        );
+        assert_eq!(
+            Core::dispatch(2, &[t("https://a.b.example.co.uk/x")]).unwrap(),
+            t("a.b")
+        );
+        assert_eq!(
+            Core::dispatch(3, &[t("https://a.b.example.co.uk/x")]).unwrap(),
+            t("example")
+        );
         assert_eq!(Core::dispatch(2, &[t("example.com")]).unwrap(), t(""));
-        assert_eq!(Core::dispatch(0, &[t("co.uk")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(0, &[t("co.uk")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

@@ -17,7 +17,10 @@ use datalink_extcore::NeutralValue;
 
 /// md5 hex of the normalized (trimmed + ASCII-lowercased) email.
 pub fn hash(email: &str) -> String {
-    format!("{:x}", md5::compute(email.trim().to_ascii_lowercase().as_bytes()))
+    format!(
+        "{:x}",
+        md5::compute(email.trim().to_ascii_lowercase().as_bytes())
+    )
 }
 
 /// The Gravatar avatar URL for an email.
@@ -55,17 +58,28 @@ mod tests {
     #[test]
     fn hash_normalizes() {
         // Gravatar's canonical example.
-        assert_eq!(hash(" MyEmailAddress@example.com "), "0bc83cb571cd1c50ba6f3e8a78ef1346");
+        assert_eq!(
+            hash(" MyEmailAddress@example.com "),
+            "0bc83cb571cd1c50ba6f3e8a78ef1346"
+        );
     }
 
     #[test]
     fn dispatch_matches() {
         assert_eq!(
-            Core::dispatch(idx("gravatar_hash"), &[NeutralValue::Text(String::from("a@b.com"))]).unwrap(),
+            Core::dispatch(
+                idx("gravatar_hash"),
+                &[NeutralValue::Text(String::from("a@b.com"))]
+            )
+            .unwrap(),
             NeutralValue::Text(hash("a@b.com"))
         );
         assert_eq!(
-            Core::dispatch(idx("gravatar_url"), &[NeutralValue::Text(String::from("a@b.com"))]).unwrap(),
+            Core::dispatch(
+                idx("gravatar_url"),
+                &[NeutralValue::Text(String::from("a@b.com"))]
+            )
+            .unwrap(),
             NeutralValue::Text(url("a@b.com"))
         );
     }

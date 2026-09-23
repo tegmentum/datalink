@@ -54,16 +54,27 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn shape_and_determinism() {
-        for n in ["fake_name", "fake_email", "fake_username", "fake_city", "fake_company"] {
+        for n in [
+            "fake_name",
+            "fake_email",
+            "fake_username",
+            "fake_city",
+            "fake_company",
+        ] {
             match Core::dispatch(idx(n), &[]).unwrap() {
                 NeutralValue::Text(s) => assert!(!s.is_empty()),
                 o => panic!("{n}: {o:?}"),
             }
-            assert!(!Core::DECLS[idx(n)].deterministic, "{n} must be nondeterministic");
+            assert!(
+                !Core::DECLS[idx(n)].deterministic,
+                "{n} must be nondeterministic"
+            );
         }
     }
 }

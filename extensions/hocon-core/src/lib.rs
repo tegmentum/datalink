@@ -27,7 +27,9 @@ fn parse(text: &str) -> Option<Hocon> {
 fn hocon_to_value(h: &Hocon) -> serde_json::Value {
     use serde_json::Value;
     match h {
-        Hocon::Real(r) => serde_json::Number::from_f64(*r).map(Value::Number).unwrap_or(Value::Null),
+        Hocon::Real(r) => serde_json::Number::from_f64(*r)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         Hocon::Integer(i) => Value::Number((*i).into()),
         Hocon::String(s) => Value::String(s.clone()),
         Hocon::Boolean(b) => Value::Bool(*b),

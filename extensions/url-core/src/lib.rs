@@ -54,16 +54,42 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(alloc::string::String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(alloc::string::String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("url_scheme"), &[t("https://user@ex.com:8443/p/q?a=1#f")]).unwrap(), t("https"));
-        assert_eq!(Core::dispatch(idx("url_host"), &[t("https://ex.com:8443/p?a=1")]).unwrap(), t("ex.com"));
-        assert_eq!(Core::dispatch(idx("url_port"), &[t("https://ex.com/p")]).unwrap(), NeutralValue::Int64(443));
-        assert_eq!(Core::dispatch(idx("url_path"), &[t("https://ex.com/a/b/c")]).unwrap(), t("/a/b/c"));
-        assert_eq!(Core::dispatch(idx("url_query"), &[t("https://ex.com/p?a=1&b=2")]).unwrap(), t("a=1&b=2"));
-        assert_eq!(Core::dispatch(idx("url_host"), &[t("not a url")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(
+                idx("url_scheme"),
+                &[t("https://user@ex.com:8443/p/q?a=1#f")]
+            )
+            .unwrap(),
+            t("https")
+        );
+        assert_eq!(
+            Core::dispatch(idx("url_host"), &[t("https://ex.com:8443/p?a=1")]).unwrap(),
+            t("ex.com")
+        );
+        assert_eq!(
+            Core::dispatch(idx("url_port"), &[t("https://ex.com/p")]).unwrap(),
+            NeutralValue::Int64(443)
+        );
+        assert_eq!(
+            Core::dispatch(idx("url_path"), &[t("https://ex.com/a/b/c")]).unwrap(),
+            t("/a/b/c")
+        );
+        assert_eq!(
+            Core::dispatch(idx("url_query"), &[t("https://ex.com/p?a=1&b=2")]).unwrap(),
+            t("a=1&b=2")
+        );
+        assert_eq!(
+            Core::dispatch(idx("url_host"), &[t("not a url")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

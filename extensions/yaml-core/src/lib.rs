@@ -49,13 +49,26 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("yaml_to_json"), &[t("name: Alice\nage: 30")]).unwrap(), t(r#"{"age":30,"name":"Alice"}"#));
-        assert_eq!(Core::dispatch(idx("yaml_to_json"), &[t("[1, 2, 3]")]).unwrap(), t("[1,2,3]"));
-        assert_eq!(Core::dispatch(idx("yaml_to_json"), &[t(": : invalid : :")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("yaml_to_json"), &[t("name: Alice\nage: 30")]).unwrap(),
+            t(r#"{"age":30,"name":"Alice"}"#)
+        );
+        assert_eq!(
+            Core::dispatch(idx("yaml_to_json"), &[t("[1, 2, 3]")]).unwrap(),
+            t("[1,2,3]")
+        );
+        assert_eq!(
+            Core::dispatch(idx("yaml_to_json"), &[t(": : invalid : :")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

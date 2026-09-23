@@ -128,8 +128,8 @@ datalink_extcore::declare! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
     fn t(s: &str) -> NeutralValue {
         NeutralValue::Text(String::from(s))

@@ -72,7 +72,11 @@ mod tests {
     #[test]
     fn renders_with_context() {
         assert_eq!(
-            Core::dispatch(idx("tera_render"), &[t("Hello {{ name }}!"), t("{\"name\": \"World\"}")]).unwrap(),
+            Core::dispatch(
+                idx("tera_render"),
+                &[t("Hello {{ name }}!"), t("{\"name\": \"World\"}")]
+            )
+            .unwrap(),
             t("Hello World!")
         );
     }
@@ -82,12 +86,20 @@ mod tests {
         assert_eq!(
             Core::dispatch(
                 idx("tera_render"),
-                &[t("{% for n in nums %}{{ n }}{% endfor %}"), t("{\"nums\": [1, 2, 3]}")]
-            ).unwrap(),
+                &[
+                    t("{% for n in nums %}{{ n }}{% endfor %}"),
+                    t("{\"nums\": [1, 2, 3]}")
+                ]
+            )
+            .unwrap(),
             t("123")
         );
         assert_eq!(
-            Core::dispatch(idx("tera_render"), &[t("{{ word | upper }}"), t("{\"word\": \"hi\"}")]).unwrap(),
+            Core::dispatch(
+                idx("tera_render"),
+                &[t("{{ word | upper }}"), t("{\"word\": \"hi\"}")]
+            )
+            .unwrap(),
             t("HI")
         );
     }

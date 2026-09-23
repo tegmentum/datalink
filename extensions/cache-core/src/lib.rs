@@ -174,8 +174,7 @@ impl Config {
     /// Parse the JSON blob a caller passed. An empty / missing config
     /// maps to `Config::default()`.
     pub fn from_json(s: &str) -> Result<Self, String> {
-        let raw: RawConfig =
-            serde_json::from_str(s).map_err(|e| format!("cache config: {e}"))?;
+        let raw: RawConfig = serde_json::from_str(s).map_err(|e| format!("cache config: {e}"))?;
         let mut cfg = Config::default();
         if let Some(v) = raw.scope {
             cfg.scope = match v.as_str() {

@@ -84,11 +84,7 @@ mod tests {
 
     #[test]
     fn scalar_rewrite_carries_sql() {
-        let r = Core::dispatch(
-            idx(PARSE_FN),
-            &[t("from t | filter x > 1 | select {x}")],
-        )
-        .unwrap();
+        let r = Core::dispatch(idx(PARSE_FN), &[t("from t | filter x > 1 | select {x}")]).unwrap();
         match r {
             NeutralValue::Text(sql) => assert!(sql.to_uppercase().contains("SELECT")),
             other => panic!("expected rewrite text, got {other:?}"),

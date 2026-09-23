@@ -34,14 +34,22 @@ fn prop<'a>(c: &'a ical::parser::vcard::component::VcardContact, name: &str) -> 
 
 fn contacts_to_json(contacts: &[ical::parser::vcard::component::VcardContact]) -> Option<String> {
     // Output key -> vCard property name.
-    let fields = [("fn", "FN"), ("email", "EMAIL"), ("tel", "TEL"), ("org", "ORG")];
+    let fields = [
+        ("fn", "FN"),
+        ("email", "EMAIL"),
+        ("tel", "TEL"),
+        ("org", "ORG"),
+    ];
     let arr: Vec<serde_json::Value> = contacts
         .iter()
         .map(|c| {
             let mut obj = serde_json::Map::new();
             for (out_key, vcard_name) in fields {
                 if let Some(v) = prop(c, vcard_name) {
-                    obj.insert(out_key.to_string(), serde_json::Value::String(v.to_string()));
+                    obj.insert(
+                        out_key.to_string(),
+                        serde_json::Value::String(v.to_string()),
+                    );
                 }
             }
             serde_json::Value::Object(obj)

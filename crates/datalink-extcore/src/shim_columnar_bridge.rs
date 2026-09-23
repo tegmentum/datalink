@@ -549,4 +549,3 @@ macro_rules! __columnar_bridge_conv {
         }
     };
 }
-

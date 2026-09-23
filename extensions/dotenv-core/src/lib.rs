@@ -86,7 +86,11 @@ pub mod logic {
     }
 
     pub fn get(src: &str, key: &str) -> Option<String> {
-        entries(src).into_iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+        entries(src)
+            .into_iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
     }
 
     pub fn keys(src: &str) -> Option<String> {

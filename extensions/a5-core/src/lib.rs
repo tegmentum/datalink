@@ -41,7 +41,9 @@ pub mod logic {
             return None;
         }
         let res = i32::try_from(resolution).ok()?;
-        a5::lonlat_to_cell(LonLat::new(lon, lat), res).ok().map(to_i64)
+        a5::lonlat_to_cell(LonLat::new(lon, lat), res)
+            .ok()
+            .map(to_i64)
     }
 
     /// Latitude of a cell's center. `None` on an invalid cell.
@@ -184,7 +186,11 @@ mod tests {
         // recovered point must be near the input (cells are small at res 10).
         let cell = match Core::dispatch(
             idx("a5_lonlat_to_cell"),
-            &[NeutralValue::Float64(40.7484), NeutralValue::Float64(-73.9857), NeutralValue::Int64(10)],
+            &[
+                NeutralValue::Float64(40.7484),
+                NeutralValue::Float64(-73.9857),
+                NeutralValue::Int64(10),
+            ],
         )
         .unwrap()
         {
@@ -214,7 +220,11 @@ mod tests {
     fn hex_roundtrips() {
         let cell = match Core::dispatch(
             idx("a5_lonlat_to_cell"),
-            &[NeutralValue::Float64(0.0), NeutralValue::Float64(0.0), NeutralValue::Int64(5)],
+            &[
+                NeutralValue::Float64(0.0),
+                NeutralValue::Float64(0.0),
+                NeutralValue::Int64(5),
+            ],
         )
         .unwrap()
         {
@@ -238,17 +248,27 @@ mod tests {
     fn parent_has_lower_resolution() {
         let cell = match Core::dispatch(
             idx("a5_lonlat_to_cell"),
-            &[NeutralValue::Float64(51.5074), NeutralValue::Float64(-0.1278), NeutralValue::Int64(8)],
+            &[
+                NeutralValue::Float64(51.5074),
+                NeutralValue::Float64(-0.1278),
+                NeutralValue::Int64(8),
+            ],
         )
         .unwrap()
         {
             NeutralValue::Int64(c) => c,
             other => panic!("expected cell, got {other:?}"),
         };
-        match Core::dispatch(idx("a5_cell_to_parent"), &[NeutralValue::Int64(cell), NeutralValue::Int64(5)]).unwrap() {
+        match Core::dispatch(
+            idx("a5_cell_to_parent"),
+            &[NeutralValue::Int64(cell), NeutralValue::Int64(5)],
+        )
+        .unwrap()
+        {
             NeutralValue::Int64(parent) => {
                 assert_eq!(
-                    Core::dispatch(idx("a5_cell_to_resolution"), &[NeutralValue::Int64(parent)]).unwrap(),
+                    Core::dispatch(idx("a5_cell_to_resolution"), &[NeutralValue::Int64(parent)])
+                        .unwrap(),
                     NeutralValue::Int64(5)
                 );
             }

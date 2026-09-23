@@ -57,9 +57,17 @@ mod tests {
 
     #[test]
     fn scores_and_labels() {
-        let s = Core::dispatch(idx("password_score"), &[NeutralValue::Text(String::from("a"))]).unwrap();
+        let s = Core::dispatch(
+            idx("password_score"),
+            &[NeutralValue::Text(String::from("a"))],
+        )
+        .unwrap();
         assert!(matches!(s, NeutralValue::Float64(_)));
-        let l = Core::dispatch(idx("password_strength"), &[NeutralValue::Text(String::from("a"))]).unwrap();
+        let l = Core::dispatch(
+            idx("password_strength"),
+            &[NeutralValue::Text(String::from("a"))],
+        )
+        .unwrap();
         assert!(matches!(l, NeutralValue::Text(_)));
     }
 }

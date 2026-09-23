@@ -26,7 +26,9 @@ pub mod logic {
     }
 
     pub fn isbn13_check(body12: &str) -> Option<char> {
-        if body12.len() != 12 { return None; }
+        if body12.len() != 12 {
+            return None;
+        }
         let mut sum = 0i32;
         for (i, c) in body12.chars().enumerate() {
             let d = c.to_digit(10)? as i32;
@@ -36,13 +38,19 @@ pub mod logic {
     }
 
     pub fn isbn10_check(body9: &str) -> Option<char> {
-        if body9.len() != 9 { return None; }
+        if body9.len() != 9 {
+            return None;
+        }
         let mut sum = 0i32;
         for (i, c) in body9.chars().enumerate() {
             sum += (10 - i as i32) * c.to_digit(10)? as i32;
         }
         let cd = (11 - sum % 11) % 11;
-        Some(if cd == 10 { 'X' } else { (b'0' + cd as u8) as char })
+        Some(if cd == 10 {
+            'X'
+        } else {
+            (b'0' + cd as u8) as char
+        })
     }
 }
 
@@ -76,14 +84,30 @@ mod tests {
     extern crate std;
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("isbn10_to_13"), &[t("0306406152")]).unwrap(), t("9780306406157"));
-        assert_eq!(Core::dispatch(idx("isbn13_to_10"), &[t("9780306406157")]).unwrap(), t("0306406152"));
-        assert_eq!(Core::dispatch(idx("isbn13_to_10"), &[t("9790306406157")]).unwrap(), NeutralValue::Null);
-        assert_eq!(Core::dispatch(idx("isbn10_to_13"), &[t("123")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("isbn10_to_13"), &[t("0306406152")]).unwrap(),
+            t("9780306406157")
+        );
+        assert_eq!(
+            Core::dispatch(idx("isbn13_to_10"), &[t("9780306406157")]).unwrap(),
+            t("0306406152")
+        );
+        assert_eq!(
+            Core::dispatch(idx("isbn13_to_10"), &[t("9790306406157")]).unwrap(),
+            NeutralValue::Null
+        );
+        assert_eq!(
+            Core::dispatch(idx("isbn10_to_13"), &[t("123")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

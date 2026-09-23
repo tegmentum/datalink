@@ -208,7 +208,11 @@ mod tests {
     #[test]
     fn normalize() {
         assert_eq!(
-            Core::dispatch(idx_arity("sql_normalize", 1), &[t("SELECT * FROM t WHERE name='alice' AND age=30")]).unwrap(),
+            Core::dispatch(
+                idx_arity("sql_normalize", 1),
+                &[t("SELECT * FROM t WHERE name='alice' AND age=30")]
+            )
+            .unwrap(),
             t("select * from t where name=? and age=?")
         );
     }
@@ -218,7 +222,12 @@ mod tests {
         assert_eq!(
             Core::dispatch(
                 idx_arity("insert", 4),
-                &[t("Quadratic"), NeutralValue::Int64(3), NeutralValue::Int64(4), t("What")]
+                &[
+                    t("Quadratic"),
+                    NeutralValue::Int64(3),
+                    NeutralValue::Int64(4),
+                    t("What")
+                ]
             )
             .unwrap(),
             t("QuWhattic")
@@ -232,7 +241,11 @@ mod tests {
             NeutralValue::Int64(4)
         );
         assert_eq!(
-            Core::dispatch(idx_arity("locate", 3), &[t("bar"), t("foobarbar"), NeutralValue::Int64(5)]).unwrap(),
+            Core::dispatch(
+                idx_arity("locate", 3),
+                &[t("bar"), t("foobarbar"), NeutralValue::Int64(5)]
+            )
+            .unwrap(),
             NeutralValue::Int64(7)
         );
         assert_eq!(

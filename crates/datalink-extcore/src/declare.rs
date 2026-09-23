@@ -24,20 +24,36 @@
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __ntype {
-    (boolean) => { $crate::NeutralType::Boolean };
-    (int64)   => { $crate::NeutralType::Int64 };
-    (float64) => { $crate::NeutralType::Float64 };
-    (text)    => { $crate::NeutralType::Text };
-    (blob)    => { $crate::NeutralType::Blob };
-    (complex($e:expr)) => { $crate::NeutralType::Complex(::alloc::string::String::from($e)) };
+    (boolean) => {
+        $crate::NeutralType::Boolean
+    };
+    (int64) => {
+        $crate::NeutralType::Int64
+    };
+    (float64) => {
+        $crate::NeutralType::Float64
+    };
+    (text) => {
+        $crate::NeutralType::Text
+    };
+    (blob) => {
+        $crate::NeutralType::Blob
+    };
+    (complex($e:expr)) => {
+        $crate::NeutralType::Complex(::alloc::string::String::from($e))
+    };
 }
 
 /// Map a null-handling token to a [`NullHandling`](crate::NullHandling).
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __nullh {
-    (propagate) => { $crate::NullHandling::Propagate };
-    (called)    => { $crate::NullHandling::Called };
+    (propagate) => {
+        $crate::NullHandling::Propagate
+    };
+    (called) => {
+        $crate::NullHandling::Called
+    };
 }
 
 /// Declare an extension core: its name/version and a list of scalar,
@@ -609,6 +625,10 @@ macro_rules! declare {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __declare_det {
-    (deterministic) => { true };
-    (nondeterministic) => { false };
+    (deterministic) => {
+        true
+    };
+    (nondeterministic) => {
+        false
+    };
 }

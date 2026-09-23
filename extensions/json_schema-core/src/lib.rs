@@ -62,14 +62,35 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
 
     #[test]
     fn matches_baseline() {
         let schema = "{\"type\":\"object\",\"properties\":{\"age\":{\"type\":\"integer\"}},\"required\":[\"age\"]}";
-        assert_eq!(Core::dispatch(idx("json_schema_valid"), &[t(schema), t("{\"age\":30}")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("json_schema_valid"), &[t(schema), t("{\"age\":\"old\"}")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("json_schema_errors"), &[t("{\"type\":\"integer\"}"), t("5")]).unwrap(), t("[]"));
+        assert_eq!(
+            Core::dispatch(idx("json_schema_valid"), &[t(schema), t("{\"age\":30}")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(
+                idx("json_schema_valid"),
+                &[t(schema), t("{\"age\":\"old\"}")]
+            )
+            .unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(
+                idx("json_schema_errors"),
+                &[t("{\"type\":\"integer\"}"), t("5")]
+            )
+            .unwrap(),
+            t("[]")
+        );
     }
 }

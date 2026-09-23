@@ -168,15 +168,30 @@ mod tests {
 
     #[test]
     fn empty_inner_is_invalid() {
-        assert!(matches!(parse_visualize("VISUALIZE", &DUCKDB), Outcome::Invalid(_)));
-        assert!(matches!(parse_visualize("VISUALIZE ;", &SQLITE), Outcome::Invalid(_)));
-        assert!(matches!(parse_visualize("  visualize   ", &DUCKDB), Outcome::Invalid(_)));
+        assert!(matches!(
+            parse_visualize("VISUALIZE", &DUCKDB),
+            Outcome::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_visualize("VISUALIZE ;", &SQLITE),
+            Outcome::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_visualize("  visualize   ", &DUCKDB),
+            Outcome::Invalid(_)
+        ));
     }
 
     #[test]
     fn multibyte_prefix_does_not_panic() {
-        assert_eq!(parse_visualize("visualizé SELECT 1", &DUCKDB), Outcome::Declined);
-        assert_eq!(parse_visualize("v\u{0131}sualize SELECT 1", &SQLITE), Outcome::Declined);
+        assert_eq!(
+            parse_visualize("visualizé SELECT 1", &DUCKDB),
+            Outcome::Declined
+        );
+        assert_eq!(
+            parse_visualize("v\u{0131}sualize SELECT 1", &SQLITE),
+            Outcome::Declined
+        );
         let _ = parse_visualize("visual\u{2603}ze SELECT 1", &DUCKDB);
         let _ = parse_visualize("\u{1F4A9}\u{1F4A9}\u{1F4A9}\u{1F4A9}\u{1F4A9}", &SQLITE);
     }

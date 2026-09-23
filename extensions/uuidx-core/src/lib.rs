@@ -52,8 +52,8 @@ datalink_extcore::declare! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
     fn t(s: &str) -> NeutralValue {
         NeutralValue::Text(String::from(s))
@@ -75,7 +75,11 @@ mod tests {
     #[test]
     fn version_and_timestamp() {
         assert_eq!(
-            Core::dispatch(idx("uuid_version"), &[t("00000000-0000-4000-8000-000000000000")]).unwrap(),
+            Core::dispatch(
+                idx("uuid_version"),
+                &[t("00000000-0000-4000-8000-000000000000")]
+            )
+            .unwrap(),
             NeutralValue::Int64(4)
         );
         assert_eq!(
@@ -83,11 +87,19 @@ mod tests {
             NeutralValue::Null
         );
         assert_eq!(
-            Core::dispatch(idx("uuid_timestamp"), &[t("017f22e2-79b0-7cc3-98c4-dc0c0c07398f")]).unwrap(),
+            Core::dispatch(
+                idx("uuid_timestamp"),
+                &[t("017f22e2-79b0-7cc3-98c4-dc0c0c07398f")]
+            )
+            .unwrap(),
             NeutralValue::Int64(1645557742000)
         );
         assert_eq!(
-            Core::dispatch(idx("uuid_timestamp"), &[t("00000000-0000-4000-8000-000000000000")]).unwrap(),
+            Core::dispatch(
+                idx("uuid_timestamp"),
+                &[t("00000000-0000-4000-8000-000000000000")]
+            )
+            .unwrap(),
             NeutralValue::Null
         );
     }

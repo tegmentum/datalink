@@ -37,7 +37,10 @@ pub mod logic {
     }
 
     pub fn col(base: u64, row: usize) -> usize {
-        let a = (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1) | 1;
+        let a = (row as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(1)
+            | 1;
         let b = (row as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
         (base.wrapping_mul(a).wrapping_add(b) >> 32) as usize % W
     }
@@ -132,10 +135,16 @@ mod tests {
         NeutralValue::Text(alloc::string::String::from(s))
     }
     fn aidx() -> usize {
-        Core::DECLS.iter().position(|d| d.name == "count_min").unwrap()
+        Core::DECLS
+            .iter()
+            .position(|d| d.name == "count_min")
+            .unwrap()
     }
     fn sidx() -> usize {
-        Core::DECLS.iter().position(|d| d.name == "cms_estimate").unwrap()
+        Core::DECLS
+            .iter()
+            .position(|d| d.name == "cms_estimate")
+            .unwrap()
     }
 
     #[test]

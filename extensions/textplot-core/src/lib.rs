@@ -69,7 +69,11 @@ pub mod logic {
         let span = top - bottom;
         let mut lines = Vec::with_capacity(nums.len());
         for &n in nums {
-            let frac = if span <= 0.0 { 0.0 } else { (n - bottom) / span };
+            let frac = if span <= 0.0 {
+                0.0
+            } else {
+                (n - bottom) / span
+            };
             let count = (frac * w as f64).round() as usize;
             let count = count.min(w);
             lines.push("#".repeat(count));

@@ -122,20 +122,50 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
-    fn blob(b: &[u8]) -> NeutralValue { NeutralValue::Blob(b.to_vec()) }
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
+    fn blob(b: &[u8]) -> NeutralValue {
+        NeutralValue::Blob(b.to_vec())
+    }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("bencode_to_json"), &[blob(b"d3:bar4:spam3:fooi42ee")]).unwrap(), t(r#"{"bar":"spam","foo":42}"#));
-        assert_eq!(Core::dispatch(idx("bencode_to_json"), &[blob(b"l4:spam4:eggse")]).unwrap(), t(r#"["spam","eggs"]"#));
-        assert_eq!(Core::dispatch(idx("bencode_to_json"), &[blob(b"i42e")]).unwrap(), t("42"));
-        assert_eq!(Core::dispatch(idx("bencode_to_json"), &[blob(b"4:spam")]).unwrap(), t(r#""spam""#));
-        assert_eq!(Core::dispatch(idx("bencode_is_valid"), &[blob(b"i42e")]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("bencode_is_valid"), &[blob(b"i42")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("bencode_is_valid"), &[blob(b"xyz")]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("bencode_to_json"), &[blob(b"not-bencode")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("bencode_to_json"), &[blob(b"d3:bar4:spam3:fooi42ee")]).unwrap(),
+            t(r#"{"bar":"spam","foo":42}"#)
+        );
+        assert_eq!(
+            Core::dispatch(idx("bencode_to_json"), &[blob(b"l4:spam4:eggse")]).unwrap(),
+            t(r#"["spam","eggs"]"#)
+        );
+        assert_eq!(
+            Core::dispatch(idx("bencode_to_json"), &[blob(b"i42e")]).unwrap(),
+            t("42")
+        );
+        assert_eq!(
+            Core::dispatch(idx("bencode_to_json"), &[blob(b"4:spam")]).unwrap(),
+            t(r#""spam""#)
+        );
+        assert_eq!(
+            Core::dispatch(idx("bencode_is_valid"), &[blob(b"i42e")]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("bencode_is_valid"), &[blob(b"i42")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("bencode_is_valid"), &[blob(b"xyz")]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(idx("bencode_to_json"), &[blob(b"not-bencode")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 
     // Carried-over fuzz regressions (never-panic on untrusted bytes).
@@ -147,6 +177,9 @@ mod tests {
         assert_eq!(decode_to_json(b"99999999999999999999:x"), None);
         assert_eq!(decode_to_json(b"l"), None);
         assert_eq!(decode_to_json(&[0xff, 0xfe, 0xfd]), None);
-        assert_eq!(decode_to_json(b"2:\xff\xfe"), Some(String::from(r#""fffe""#)));
+        assert_eq!(
+            decode_to_json(b"2:\xff\xfe"),
+            Some(String::from(r#""fffe""#))
+        );
     }
 }

@@ -41,17 +41,33 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("natsort_compare"), &[t("img2"), t("img12")]).unwrap(), NeutralValue::Int64(-1));
-        assert_eq!(Core::dispatch(idx("natsort_compare"), &[t("img12"), t("img2")]).unwrap(), NeutralValue::Int64(1));
-        assert_eq!(Core::dispatch(idx("natsort_compare"), &[t("file10"), t("file10")]).unwrap(), NeutralValue::Int64(0));
-        assert_eq!(Core::dispatch(idx("natsort_compare"), &[t("a100"), t("a99")]).unwrap(), NeutralValue::Int64(1));
+        assert_eq!(
+            Core::dispatch(idx("natsort_compare"), &[t("img2"), t("img12")]).unwrap(),
+            NeutralValue::Int64(-1)
+        );
+        assert_eq!(
+            Core::dispatch(idx("natsort_compare"), &[t("img12"), t("img2")]).unwrap(),
+            NeutralValue::Int64(1)
+        );
+        assert_eq!(
+            Core::dispatch(idx("natsort_compare"), &[t("file10"), t("file10")]).unwrap(),
+            NeutralValue::Int64(0)
+        );
+        assert_eq!(
+            Core::dispatch(idx("natsort_compare"), &[t("a100"), t("a99")]).unwrap(),
+            NeutralValue::Int64(1)
+        );
     }
 }

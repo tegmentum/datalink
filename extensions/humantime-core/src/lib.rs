@@ -38,14 +38,30 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("humantime_parse"), &[t("1h 30m")]).unwrap(), NeutralValue::Int64(5400));
-        assert_eq!(Core::dispatch(idx("humantime_parse"), &[t("2 days")]).unwrap(), NeutralValue::Int64(172800));
-        assert_eq!(Core::dispatch(idx("humantime_format"), &[NeutralValue::Int64(5400)]).unwrap(), t("1h 30m"));
-        assert_eq!(Core::dispatch(idx("humantime_parse"), &[t("not a duration")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("humantime_parse"), &[t("1h 30m")]).unwrap(),
+            NeutralValue::Int64(5400)
+        );
+        assert_eq!(
+            Core::dispatch(idx("humantime_parse"), &[t("2 days")]).unwrap(),
+            NeutralValue::Int64(172800)
+        );
+        assert_eq!(
+            Core::dispatch(idx("humantime_format"), &[NeutralValue::Int64(5400)]).unwrap(),
+            t("1h 30m")
+        );
+        assert_eq!(
+            Core::dispatch(idx("humantime_parse"), &[t("not a duration")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

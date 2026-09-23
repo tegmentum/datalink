@@ -136,11 +136,18 @@ mod tests {
     #[test]
     fn div_and_truncate() {
         assert_eq!(
-            Core::dispatch(idx_arity("div", 2), &[NeutralValue::Int64(17), NeutralValue::Int64(5)])
-                .unwrap(),
+            Core::dispatch(
+                idx_arity("div", 2),
+                &[NeutralValue::Int64(17), NeutralValue::Int64(5)]
+            )
+            .unwrap(),
             NeutralValue::Int64(3)
         );
-        assert!(Core::dispatch(idx_arity("div", 2), &[NeutralValue::Int64(1), NeutralValue::Int64(0)]).is_err());
+        assert!(Core::dispatch(
+            idx_arity("div", 2),
+            &[NeutralValue::Int64(1), NeutralValue::Int64(0)]
+        )
+        .is_err());
         match Core::dispatch(idx_arity("truncate", 1), &[NeutralValue::Float64(3.99)]).unwrap() {
             NeutralValue::Float64(v) => assert!(approx(v, 3.0)),
             other => panic!("{other:?}"),

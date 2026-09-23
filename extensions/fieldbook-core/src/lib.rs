@@ -52,7 +52,6 @@ use datalink_extcore::NeutralValue;
 // `ArgExt` supplies `arg_text` / `arg_int` on `[NeutralValue]`; imported
 // by the `declare!` macro expansion, so there is no explicit `use` here.
 
-
 // ---------------------------------------------------------------------------
 // Nested-exec plumbing
 //
@@ -302,7 +301,9 @@ fn do_add_entry(name: &str, source: &str) -> Result<NeutralValue, String> {
 fn do_drop(name: &str) -> Result<NeutralValue, String> {
     let q = quote(name);
     // Delete runs/entries first (best-effort; mirrors native).
-    let _ = nested_exec(&format!("DELETE FROM __fieldbook_runs WHERE fieldbook = {q}"));
+    let _ = nested_exec(&format!(
+        "DELETE FROM __fieldbook_runs WHERE fieldbook = {q}"
+    ));
     let _ = nested_exec(&format!(
         "DELETE FROM __fieldbook_entries WHERE fieldbook = {q}"
     ));

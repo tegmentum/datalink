@@ -20,32 +20,62 @@ use datalink_extcore::NeutralValue;
 /// mass). Temperature is handled separately because it is affine.
 fn length_factor(u: &str) -> Option<f64> {
     Some(match u {
-        "m" | "metre" | "meter" => 1.0, "km" | "kilometre" | "kilometer" => 1000.0,
-        "cm" | "centimetre" | "centimeter" => 0.01, "mm" | "millimetre" | "millimeter" => 0.001,
-        "um" | "micron" => 1e-6, "mi" | "mile" => 1609.344, "yd" | "yard" => 0.9144,
-        "ft" | "foot" | "feet" => 0.3048, "in" | "inch" => 0.0254, "nmi" => 1852.0,
+        "m" | "metre" | "meter" => 1.0,
+        "km" | "kilometre" | "kilometer" => 1000.0,
+        "cm" | "centimetre" | "centimeter" => 0.01,
+        "mm" | "millimetre" | "millimeter" => 0.001,
+        "um" | "micron" => 1e-6,
+        "mi" | "mile" => 1609.344,
+        "yd" | "yard" => 0.9144,
+        "ft" | "foot" | "feet" => 0.3048,
+        "in" | "inch" => 0.0254,
+        "nmi" => 1852.0,
         _ => return None,
     })
 }
 fn mass_factor(u: &str) -> Option<f64> {
     Some(match u {
-        "kg" | "kilogram" => 1.0, "g" | "gram" => 0.001, "mg" | "milligram" => 1e-6,
-        "t" | "tonne" => 1000.0, "lb" | "pound" => 0.453_592_37, "oz" | "ounce" => 0.028_349_523_125,
-        "st" | "stone" => 6.350_293_18, _ => return None,
+        "kg" | "kilogram" => 1.0,
+        "g" | "gram" => 0.001,
+        "mg" | "milligram" => 1e-6,
+        "t" | "tonne" => 1000.0,
+        "lb" | "pound" => 0.453_592_37,
+        "oz" | "ounce" => 0.028_349_523_125,
+        "st" | "stone" => 6.350_293_18,
+        _ => return None,
     })
 }
 fn temp_to_kelvin(v: f64, u: &str) -> Option<f64> {
-    Some(match u { "c" | "celsius" => v + 273.15, "f" | "fahrenheit" => (v - 32.0) * 5.0 / 9.0 + 273.15, "k" | "kelvin" => v, _ => return None })
+    Some(match u {
+        "c" | "celsius" => v + 273.15,
+        "f" | "fahrenheit" => (v - 32.0) * 5.0 / 9.0 + 273.15,
+        "k" | "kelvin" => v,
+        _ => return None,
+    })
 }
 fn kelvin_to(k: f64, u: &str) -> Option<f64> {
-    Some(match u { "c" | "celsius" => k - 273.15, "f" | "fahrenheit" => (k - 273.15) * 9.0 / 5.0 + 32.0, "k" | "kelvin" => k, _ => return None })
+    Some(match u {
+        "c" | "celsius" => k - 273.15,
+        "f" | "fahrenheit" => (k - 273.15) * 9.0 / 5.0 + 32.0,
+        "k" | "kelvin" => k,
+        _ => return None,
+    })
 }
 
 pub fn convert(value: f64, from: &str, to: &str) -> Option<f64> {
-    let (from, to) = (from.trim().to_ascii_lowercase(), to.trim().to_ascii_lowercase());
-    if let (Some(a), Some(b)) = (length_factor(&from), length_factor(&to)) { return Some(value * a / b); }
-    if let (Some(a), Some(b)) = (mass_factor(&from), mass_factor(&to)) { return Some(value * a / b); }
-    if let Some(k) = temp_to_kelvin(value, &from) { return kelvin_to(k, &to); }
+    let (from, to) = (
+        from.trim().to_ascii_lowercase(),
+        to.trim().to_ascii_lowercase(),
+    );
+    if let (Some(a), Some(b)) = (length_factor(&from), length_factor(&to)) {
+        return Some(value * a / b);
+    }
+    if let (Some(a), Some(b)) = (mass_factor(&from), mass_factor(&to)) {
+        return Some(value * a / b);
+    }
+    if let Some(k) = temp_to_kelvin(value, &from) {
+        return kelvin_to(k, &to);
+    }
     None
 }
 
@@ -69,14 +99,39 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        let r = Core::dispatch(idx("unit_convert"), &[NeutralValue::Int64(1), t("mi"), t("km")]).unwrap();
-        match r { NeutralValue::Float64(v) => assert!((v - 1.609344).abs() < 1e-9), o => panic!("{o:?}") }
-        assert_eq!(Core::dispatch(idx("unit_convert"), &[NeutralValue::Int64(1), t("kg"), t("m")]).unwrap(), NeutralValue::Null);
-        assert_eq!(Core::dispatch(idx("unit_convert"), &[NeutralValue::Int64(1), t("foo"), t("bar")]).unwrap(), NeutralValue::Null);
+        let r = Core::dispatch(
+            idx("unit_convert"),
+            &[NeutralValue::Int64(1), t("mi"), t("km")],
+        )
+        .unwrap();
+        match r {
+            NeutralValue::Float64(v) => assert!((v - 1.609344).abs() < 1e-9),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(
+            Core::dispatch(
+                idx("unit_convert"),
+                &[NeutralValue::Int64(1), t("kg"), t("m")]
+            )
+            .unwrap(),
+            NeutralValue::Null
+        );
+        assert_eq!(
+            Core::dispatch(
+                idx("unit_convert"),
+                &[NeutralValue::Int64(1), t("foo"), t("bar")]
+            )
+            .unwrap(),
+            NeutralValue::Null
+        );
     }
 }

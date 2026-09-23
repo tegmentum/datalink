@@ -74,15 +74,30 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn i(n: i64) -> NeutralValue { NeutralValue::Int64(n) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn i(n: i64) -> NeutralValue {
+        NeutralValue::Int64(n)
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
         let s = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
-        assert_eq!(Core::dispatch(idx("totp"), &[t(s), i(59), i(30), i(8)]).unwrap(), t("94287082"));
-        assert_eq!(Core::dispatch(idx("totp"), &[t(s), i(1111111109), i(30), i(8)]).unwrap(), t("07081804"));
-        assert_eq!(Core::dispatch(idx("totp"), &[t("!!notbase32!!"), i(59), i(30), i(6)]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("totp"), &[t(s), i(59), i(30), i(8)]).unwrap(),
+            t("94287082")
+        );
+        assert_eq!(
+            Core::dispatch(idx("totp"), &[t(s), i(1111111109), i(30), i(8)]).unwrap(),
+            t("07081804")
+        );
+        assert_eq!(
+            Core::dispatch(idx("totp"), &[t("!!notbase32!!"), i(59), i(30), i(6)]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

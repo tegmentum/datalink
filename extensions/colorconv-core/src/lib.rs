@@ -95,7 +95,11 @@ pub mod logic {
         let (r, g, b) = if s == 0.0 {
             (l, l, l)
         } else {
-            let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+            let q = if l < 0.5 {
+                l * (1.0 + s)
+            } else {
+                l + s - l * s
+            };
             let p = 2.0 * l - q;
             (
                 hue2rgb(p, q, h + 1.0 / 3.0),
@@ -112,7 +116,12 @@ pub mod logic {
     }
 
     pub fn fmt3(a: f64, b: f64, c: f64) -> String {
-        alloc::format!("{},{},{}", a.round() as i64, b.round() as i64, c.round() as i64)
+        alloc::format!(
+            "{},{},{}",
+            a.round() as i64,
+            b.round() as i64,
+            c.round() as i64
+        )
     }
 }
 

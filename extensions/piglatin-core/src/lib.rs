@@ -26,8 +26,10 @@ pub mod logic {
             .iter()
             .position(|c| is_vowel(*c) || !c.is_ascii_alphabetic())
             .unwrap_or(chars.len());
-        let (lead, rest): (String, String) =
-            (chars[..split].iter().collect(), chars[split..].iter().collect());
+        let (lead, rest): (String, String) = (
+            chars[..split].iter().collect(),
+            chars[split..].iter().collect(),
+        );
         let cap = chars[0].is_ascii_uppercase();
         let mut moved = format!("{}{}ay", rest, lead.to_lowercase());
         if cap {
@@ -69,7 +71,13 @@ mod tests {
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("to_pig_latin"), &[t("hello world")]).unwrap(), t("ellohay orldway"));
-        assert_eq!(Core::dispatch(idx("to_pig_latin"), &[t("Apple")]).unwrap(), t("Appleway"));
+        assert_eq!(
+            Core::dispatch(idx("to_pig_latin"), &[t("hello world")]).unwrap(),
+            t("ellohay orldway")
+        );
+        assert_eq!(
+            Core::dispatch(idx("to_pig_latin"), &[t("Apple")]).unwrap(),
+            t("Appleway")
+        );
     }
 }

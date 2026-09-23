@@ -38,7 +38,12 @@ pub mod logic {
         let factor = 10f64.powi(precision as i32);
         let pairs: Vec<[f64; 2]> = ls
             .coords()
-            .map(|c| [(c.x * factor).round() / factor, (c.y * factor).round() / factor])
+            .map(|c| {
+                [
+                    (c.x * factor).round() / factor,
+                    (c.y * factor).round() / factor,
+                ]
+            })
             .collect();
         serde_json::to_string(&pairs).ok()
     }
@@ -99,13 +104,21 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let enc = Core::dispatch(idx("polyline_encode"), &[t("[[0.0,0.0],[1.0,1.0]]"), NeutralValue::Int64(5)]).unwrap();
+        let enc = Core::dispatch(
+            idx("polyline_encode"),
+            &[t("[[0.0,0.0],[1.0,1.0]]"), NeutralValue::Int64(5)],
+        )
+        .unwrap();
         let s = match enc {
             NeutralValue::Text(s) => s,
             _ => panic!(),
         };
         assert!(matches!(
-            Core::dispatch(idx("polyline_decode"), &[NeutralValue::Text(s), NeutralValue::Int64(5)]).unwrap(),
+            Core::dispatch(
+                idx("polyline_decode"),
+                &[NeutralValue::Text(s), NeutralValue::Int64(5)]
+            )
+            .unwrap(),
             NeutralValue::Text(_)
         ));
     }

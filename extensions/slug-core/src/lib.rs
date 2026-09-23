@@ -34,7 +34,10 @@ mod tests {
 
     #[test]
     fn slugifies() {
-        let i = Core::DECLS.iter().position(|d| d.name == "slugify").unwrap();
+        let i = Core::DECLS
+            .iter()
+            .position(|d| d.name == "slugify")
+            .unwrap();
         assert_eq!(
             Core::dispatch(i, &[NeutralValue::Text("Hello, World!".to_string())]).unwrap(),
             NeutralValue::Text("hello-world".to_string())

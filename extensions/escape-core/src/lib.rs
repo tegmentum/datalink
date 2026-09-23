@@ -69,9 +69,21 @@ mod tests {
 
     #[test]
     fn roundtrips() {
-        assert_eq!(Core::dispatch(idx("html_escape"), &[t("<a>&")]).unwrap(), t("&lt;a&gt;&amp;"));
-        assert_eq!(Core::dispatch(idx("html_unescape"), &[t("&lt;a&gt;&amp;")]).unwrap(), t("<a>&"));
-        assert_eq!(Core::dispatch(idx("url_encode"), &[t("a b/c")]).unwrap(), t("a%20b%2Fc"));
-        assert_eq!(Core::dispatch(idx("url_decode"), &[t("a%20b%2Fc")]).unwrap(), t("a b/c"));
+        assert_eq!(
+            Core::dispatch(idx("html_escape"), &[t("<a>&")]).unwrap(),
+            t("&lt;a&gt;&amp;")
+        );
+        assert_eq!(
+            Core::dispatch(idx("html_unescape"), &[t("&lt;a&gt;&amp;")]).unwrap(),
+            t("<a>&")
+        );
+        assert_eq!(
+            Core::dispatch(idx("url_encode"), &[t("a b/c")]).unwrap(),
+            t("a%20b%2Fc")
+        );
+        assert_eq!(
+            Core::dispatch(idx("url_decode"), &[t("a%20b%2Fc")]).unwrap(),
+            t("a b/c")
+        );
     }
 }

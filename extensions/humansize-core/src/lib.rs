@@ -44,18 +44,37 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
 
-    fn i(n: i64) -> NeutralValue { NeutralValue::Int64(n) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn i(n: i64) -> NeutralValue {
+        NeutralValue::Int64(n)
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("humansize"), &[i(1500000)]).unwrap(), NeutralValue::Text(String::from("1.50 MB")));
-        assert_eq!(Core::dispatch(idx("humansize_binary"), &[i(1048576)]).unwrap(), NeutralValue::Text(String::from("1 MiB")));
-        assert_eq!(Core::dispatch(idx("humansize"), &[i(0)]).unwrap(), NeutralValue::Text(String::from("0 B")));
-        assert_eq!(Core::dispatch(idx("humansize"), &[i(999)]).unwrap(), NeutralValue::Text(String::from("999 B")));
-        assert_eq!(Core::dispatch(idx("humansize"), &[i(-5)]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("humansize"), &[i(1500000)]).unwrap(),
+            NeutralValue::Text(String::from("1.50 MB"))
+        );
+        assert_eq!(
+            Core::dispatch(idx("humansize_binary"), &[i(1048576)]).unwrap(),
+            NeutralValue::Text(String::from("1 MiB"))
+        );
+        assert_eq!(
+            Core::dispatch(idx("humansize"), &[i(0)]).unwrap(),
+            NeutralValue::Text(String::from("0 B"))
+        );
+        assert_eq!(
+            Core::dispatch(idx("humansize"), &[i(999)]).unwrap(),
+            NeutralValue::Text(String::from("999 B"))
+        );
+        assert_eq!(
+            Core::dispatch(idx("humansize"), &[i(-5)]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }

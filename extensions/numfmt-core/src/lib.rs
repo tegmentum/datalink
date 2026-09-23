@@ -149,14 +149,18 @@ datalink_extcore::declare! {
 mod tests {
     extern crate std;
     use super::*;
-    use datalink_extcore::ExtCore;
     use alloc::string::String;
+    use datalink_extcore::ExtCore;
     use std::vec;
 
     #[test]
     fn group_and_si() {
         assert_eq!(
-            Core::dispatch(0, &[NeutralValue::Float64(1234567.5), NeutralValue::Int64(2)]).unwrap(),
+            Core::dispatch(
+                0,
+                &[NeutralValue::Float64(1234567.5), NeutralValue::Int64(2)]
+            )
+            .unwrap(),
             NeutralValue::Text(String::from("1,234,567.50"))
         );
         assert_eq!(

@@ -62,7 +62,9 @@ pub mod logic {
 
     /// Whole-string validate (digits + checksum).
     pub fn validate(routing: &str) -> bool {
-        digits(routing).map(|d| validate_digits(&d)).unwrap_or(false)
+        digits(routing)
+            .map(|d| validate_digits(&d))
+            .unwrap_or(false)
     }
 
     /// First two digits → Federal Reserve district (with thrift/
@@ -148,7 +150,10 @@ mod tests {
     #[test]
     fn declares_the_reconciled_superset() {
         let names: std::vec::Vec<_> = Core::DECLS.iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["aba_validate", "aba_frb_district", "aba_fed_region"]);
+        assert_eq!(
+            names,
+            vec!["aba_validate", "aba_frb_district", "aba_fed_region"]
+        );
     }
 
     #[test]

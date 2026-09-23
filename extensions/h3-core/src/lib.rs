@@ -102,16 +102,41 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
 
     #[test]
     fn matches_baseline() {
-        let cell = match Core::dispatch(idx("h3_latlng_to_cell"), &[NeutralValue::Float64(37.775), NeutralValue::Float64(-122.418), NeutralValue::Int64(9)]).unwrap() {
-            NeutralValue::Int64(c) => c, o => panic!("{o:?}"),
+        let cell = match Core::dispatch(
+            idx("h3_latlng_to_cell"),
+            &[
+                NeutralValue::Float64(37.775),
+                NeutralValue::Float64(-122.418),
+                NeutralValue::Int64(9),
+            ],
+        )
+        .unwrap()
+        {
+            NeutralValue::Int64(c) => c,
+            o => panic!("{o:?}"),
         };
         assert_eq!(cell, 617700169957507071);
-        assert_eq!(Core::dispatch(idx("h3_is_valid_cell"), &[NeutralValue::Int64(cell)]).unwrap(), NeutralValue::Boolean(true));
-        assert_eq!(Core::dispatch(idx("h3_is_valid_cell"), &[NeutralValue::Int64(123)]).unwrap(), NeutralValue::Boolean(false));
-        assert_eq!(Core::dispatch(idx("h3_grid_distance"), &[NeutralValue::Int64(cell), NeutralValue::Int64(cell)]).unwrap(), NeutralValue::Int64(0));
+        assert_eq!(
+            Core::dispatch(idx("h3_is_valid_cell"), &[NeutralValue::Int64(cell)]).unwrap(),
+            NeutralValue::Boolean(true)
+        );
+        assert_eq!(
+            Core::dispatch(idx("h3_is_valid_cell"), &[NeutralValue::Int64(123)]).unwrap(),
+            NeutralValue::Boolean(false)
+        );
+        assert_eq!(
+            Core::dispatch(
+                idx("h3_grid_distance"),
+                &[NeutralValue::Int64(cell), NeutralValue::Int64(cell)]
+            )
+            .unwrap(),
+            NeutralValue::Int64(0)
+        );
     }
 }

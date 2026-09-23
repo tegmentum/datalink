@@ -271,10 +271,7 @@ fn split_top(s: &str, sep: &str) -> Vec<String> {
             }
             _ => {}
         }
-        if depth == 0
-            && i + sb.len() <= bytes.len()
-            && &bytes[i..i + sb.len()] == sb
-        {
+        if depth == 0 && i + sb.len() <= bytes.len() && &bytes[i..i + sb.len()] == sb {
             out.push(s[start..i].to_string());
             i += sb.len();
             start = i;
@@ -328,11 +325,8 @@ fn split_assign(s: &str) -> Option<(String, String)> {
         if bytes[i] == b'=' {
             let prev = if i > 0 { bytes[i - 1] } else { 0 };
             let next = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
-            let is_cmp = next == b'='
-                || prev == b'='
-                || prev == b'<'
-                || prev == b'>'
-                || prev == b'!';
+            let is_cmp =
+                next == b'=' || prev == b'=' || prev == b'<' || prev == b'>' || prev == b'!';
             if !is_cmp {
                 let name = s[..i].trim().to_string();
                 let rhs = s[i + 1..].trim().to_string();
@@ -504,8 +498,14 @@ mod tests {
 
     #[test]
     fn malformed_is_invalid_not_panic() {
-        assert!(matches!(parse_dplyr("dplyr(", &DUCKDB), Outcome::Invalid(_)));
-        assert!(matches!(parse_dplyr("dplyr()", &DUCKDB), Outcome::Invalid(_)));
+        assert!(matches!(
+            parse_dplyr("dplyr(", &DUCKDB),
+            Outcome::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_dplyr("dplyr()", &DUCKDB),
+            Outcome::Invalid(_)
+        ));
         assert!(matches!(
             parse_dplyr("dplyr( t |> bogus(x) )", &DUCKDB),
             Outcome::Invalid(_)

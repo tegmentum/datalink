@@ -44,7 +44,13 @@ mod tests {
 
     #[test]
     fn inflects() {
-        assert_eq!(Core::dispatch(idx("pluralize"), &[t("cat")]).unwrap(), t("cats"));
-        assert_eq!(Core::dispatch(idx("singularize"), &[t("cats")]).unwrap(), t("cat"));
+        assert_eq!(
+            Core::dispatch(idx("pluralize"), &[t("cat")]).unwrap(),
+            t("cats")
+        );
+        assert_eq!(
+            Core::dispatch(idx("singularize"), &[t("cats")]).unwrap(),
+            t("cat")
+        );
     }
 }

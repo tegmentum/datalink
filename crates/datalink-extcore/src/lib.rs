@@ -168,7 +168,10 @@ enum OutColumn {
     Float64(Vec<f64>),
     Text(Vec<String>),
     Blob(Vec<Vec<u8>>),
-    Complex { type_expr: String, json: Vec<String> },
+    Complex {
+        type_expr: String,
+        json: Vec<String>,
+    },
 }
 
 impl OutColumn {
@@ -213,9 +216,7 @@ impl OutColumn {
             OutColumn::Float64(b) => NeutralColumn::Float64(b),
             OutColumn::Text(b) => NeutralColumn::Text(b),
             OutColumn::Blob(b) => NeutralColumn::Blob(b),
-            OutColumn::Complex { type_expr, json } => {
-                NeutralColumn::Complex { type_expr, json }
-            }
+            OutColumn::Complex { type_expr, json } => NeutralColumn::Complex { type_expr, json },
         }
     }
 }
@@ -230,7 +231,10 @@ struct ValidityBuilder {
 
 impl ValidityBuilder {
     fn new(rows: usize) -> Self {
-        ValidityBuilder { rows, bits: Vec::new() }
+        ValidityBuilder {
+            rows,
+            bits: Vec::new(),
+        }
     }
 
     #[inline]
@@ -282,10 +286,7 @@ pub trait ExtCore {
     /// The default returns an error so scalar-only cores need not
     /// implement it; [`declare!`](crate::declare) overrides it for any
     /// core that declares an `aggregate`.
-    fn dispatch_aggregate(
-        idx: usize,
-        rows: &[&[NeutralValue]],
-    ) -> Result<NeutralValue, String> {
+    fn dispatch_aggregate(idx: usize, rows: &[&[NeutralValue]]) -> Result<NeutralValue, String> {
         let _ = rows;
         Err(alloc::format!(
             "{}: function index {} is not an aggregate",
@@ -308,10 +309,7 @@ pub trait ExtCore {
     /// The default returns an error so scalar-only / scalar+aggregate
     /// cores need not implement it; [`declare!`](crate::declare) overrides
     /// it whenever a `table` capability is declared.
-    fn dispatch_table(
-        idx: usize,
-        args: &[NeutralValue],
-    ) -> Result<Vec<Vec<NeutralValue>>, String> {
+    fn dispatch_table(idx: usize, args: &[NeutralValue]) -> Result<Vec<Vec<NeutralValue>>, String> {
         let _ = args;
         Err(alloc::format!(
             "{}: function index {} is not a table",
@@ -358,7 +356,9 @@ impl ArgExt for [NeutralValue] {
     fn arg_int(&self, i: usize, fname: &str) -> Result<i64, String> {
         match self.get(i) {
             Some(NeutralValue::Int64(n)) => Ok(*n),
-            _ => Err(alloc::format!("{fname}: expected INTEGER arg at position {i}")),
+            _ => Err(alloc::format!(
+                "{fname}: expected INTEGER arg at position {i}"
+            )),
         }
     }
 
@@ -374,7 +374,9 @@ impl ArgExt for [NeutralValue] {
         match self.get(i) {
             Some(NeutralValue::Float64(f)) => Ok(*f),
             Some(NeutralValue::Int64(n)) => Ok(*n as f64),
-            _ => Err(alloc::format!("{fname}: expected FLOAT arg at position {i}")),
+            _ => Err(alloc::format!(
+                "{fname}: expected FLOAT arg at position {i}"
+            )),
         }
     }
 }

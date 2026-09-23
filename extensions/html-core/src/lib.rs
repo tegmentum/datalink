@@ -20,7 +20,10 @@ use scraper::{Html, Selector};
 /// Collapse an element's descendant text nodes into a single trimmed string.
 fn element_text(el: scraper::ElementRef) -> String {
     let joined: String = el.text().collect::<String>();
-    joined.split_whitespace().collect::<alloc::vec::Vec<_>>().join(" ")
+    joined
+        .split_whitespace()
+        .collect::<alloc::vec::Vec<_>>()
+        .join(" ")
 }
 
 /// Minimal JSON string escaping for the `html_extract_all` array output.
@@ -89,15 +92,31 @@ datalink_extcore::declare! {
 mod tests {
     use super::*;
     use datalink_extcore::ExtCore;
-    fn t(s: &str) -> NeutralValue { NeutralValue::Text(String::from(s)) }
-    fn idx(n: &str) -> usize { Core::DECLS.iter().position(|d| d.name == n).unwrap() }
+    fn t(s: &str) -> NeutralValue {
+        NeutralValue::Text(String::from(s))
+    }
+    fn idx(n: &str) -> usize {
+        Core::DECLS.iter().position(|d| d.name == n).unwrap()
+    }
     const DOC: &str = r#"<ul><li class="x">one</li><li>two</li></ul><a href="/h">link</a>"#;
 
     #[test]
     fn matches_baseline() {
-        assert_eq!(Core::dispatch(idx("html_extract"), &[t(DOC), t("li.x")]).unwrap(), t("one"));
-        assert_eq!(Core::dispatch(idx("html_extract_all"), &[t(DOC), t("li")]).unwrap(), t(r#"["one","two"]"#));
-        assert_eq!(Core::dispatch(idx("html_attr"), &[t(DOC), t("a"), t("href")]).unwrap(), t("/h"));
-        assert_eq!(Core::dispatch(idx("html_extract"), &[t(DOC), t("p.none")]).unwrap(), NeutralValue::Null);
+        assert_eq!(
+            Core::dispatch(idx("html_extract"), &[t(DOC), t("li.x")]).unwrap(),
+            t("one")
+        );
+        assert_eq!(
+            Core::dispatch(idx("html_extract_all"), &[t(DOC), t("li")]).unwrap(),
+            t(r#"["one","two"]"#)
+        );
+        assert_eq!(
+            Core::dispatch(idx("html_attr"), &[t(DOC), t("a"), t("href")]).unwrap(),
+            t("/h")
+        );
+        assert_eq!(
+            Core::dispatch(idx("html_extract"), &[t(DOC), t("p.none")]).unwrap(),
+            NeutralValue::Null
+        );
     }
 }
