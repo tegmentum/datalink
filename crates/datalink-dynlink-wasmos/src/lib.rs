@@ -50,6 +50,29 @@
 //!
 //! See `docs/design/runtime-abstraction/phase-6-2-datalink-dynlink-disposition.md`
 //! in the wasmos repo for the full migration plan.
+//!
+//! # sync_dispatch contract
+//!
+//! This crate registers [`DynLinkBridge`] via
+//! [`HostImports::register_sync`] (see [`install_host_imports`]);
+//! under wasmos's `RuntimeConfig::sync_dispatch(true)` the wasmtime
+//! adapter polls host handlers via `now_or_never` — no executor is
+//! entered on the caller's thread, so a handler MUST resolve on the
+//! first poll or the adapter panics loudly rather than deadlocking.
+//! `SyncHostCallAdapter` (wasmos-side) wraps the `SyncHostCall`
+//! `call` body into a future that satisfies that invariant.
+//!
+//! The sync-body migration assumes providers are pre-registered via
+//! [`ProviderRegistry::register_provider`] so
+//! [`ProviderBackend::invoke`] does not lazily compile at
+//! first-invoke; a compile fired from inside the polled handler
+//! would need an executor and would trip the `now_or_never` panic.
+//!
+//! See wasmos's `docs/design/runtime-abstraction/state-of-the-abstraction.md`
+//! "sync_dispatch — finishing the story" subsection and the
+//! [`HostImports::register`] docstring for the full contract; the
+//! aligning commits landed as `0032272` (migration) plus `03aee3b4`
+//! (regression tests at `tests/sync_dispatch_contract.rs`).
 
 #![deny(missing_docs)]
 #![warn(rust_2018_idioms)]
