@@ -37,6 +37,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pin-project-lite"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -116,6 +122,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio"
+version = "1.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+dependencies = [
+ "pin-project-lite",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -124,19 +139,20 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "wasmos-runtime-api"
 version = "0.1.0"
-source = "git+https://github.com/tegmentum/wasmos.git?tag=v0.3.2#082d80f01ba3eae6d6e98bde0ca239bc44581121"
+source = "git+https://github.com/tegmentum/wasmos.git?rev=a1625d70#a1625d70a9095e6b854fdda9af2b90471ac3635c"
 dependencies = [
  "async-trait",
  "bytes",
  "serde",
  "thiserror",
+ "tokio",
  "wasmos-runtime-api-macros",
 ]
 
 [[package]]
 name = "wasmos-runtime-api-macros"
 version = "0.1.0"
-source = "git+https://github.com/tegmentum/wasmos.git?tag=v0.3.2#082d80f01ba3eae6d6e98bde0ca239bc44581121"
+source = "git+https://github.com/tegmentum/wasmos.git?rev=a1625d70#a1625d70a9095e6b854fdda9af2b90471ac3635c"
 dependencies = [
  "proc-macro2",
  "quote",
